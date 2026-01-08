@@ -227,7 +227,8 @@ class PlacedMesh(
     val texture: Image? = null,
     val faceTextures: Map<Int, Image> = emptyMap(),
     val collision: Boolean = true,
-    var collisionPos: Vector3d = Vector3d(0.0, 0.0, 0.0)
+    var collisionPos: Vector3d = Vector3d(0.0, 0.0, 0.0),
+    val alwaysRender: Boolean = false
 ) {
     fun getTransformedVertices(): List<Vector3d> =
         mesh.vertices.map { transformMatrix.transform(it) }

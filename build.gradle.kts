@@ -1,5 +1,5 @@
 plugins {
-    kotlin("jvm") version "2.1.20"
+    kotlin("jvm") version "2.3.0"
     id("com.github.johnrengelman.shadow") version "8.1.1"
     id("java")
     id("org.openjfx.javafxplugin") version "0.1.0"
@@ -35,28 +35,19 @@ tasks {
         archiveBaseName.set("FileZero")
         archiveClassifier.set("")
         archiveVersion.set("")
+        mergeServiceFiles()
     }
 }
 
 tasks.withType<Jar> {
     manifest {
         attributes["Main-Class"] = MainClass
+        attributes["JVM-Options"] = "-Xmx1024m -Xms512m -XX:+UseZGC -XX:+ZGenerational"
     }
 }
 
 tasks.jar {
-    archiveBaseName.set("FileZero_POCO_X6_PRO_5G")
+    archiveBaseName.set("FileZero_RAW")
     archiveVersion.set("")
     archiveClassifier.set("")
-
-    manifest {
-        attributes(
-            "Main-Class" to MainClass,
-            "JVM-Options" to "-Xmx1024m -Xms512m"
-        )
-    }
-
-    from(configurations.runtimeClasspath.get().map { if (it.isDirectory) it else zipTree(it) })
-    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
-    exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA")
 }

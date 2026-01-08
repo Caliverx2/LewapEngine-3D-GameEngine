@@ -53,7 +53,8 @@ class DrawingPanel : StackPane() {
         val worldPosition: Vector3d,
         val aabb: AABB,
         var needsUpdate: Boolean = true,
-        var lastLitTime: Long = System.nanoTime()
+        var lastLitTime: Long = System.nanoTime(),
+        var isLitByStaticLight: Boolean = false
     )
 
     private data class GI_LightPoint(
@@ -119,6 +120,8 @@ class DrawingPanel : StackPane() {
     private var debugNoclip = false
     private var debugShowHitboxes = false
     private var debugShowNavMesh = false
+    private var retroScanLineMode = false
+    private var antyAliasingMode = false
 
     // Stan opadania
     private val gravityAcceleration = 9.8 * cubeSize // Przyspieszenie grawitacyjne (cubeSize/s2)
@@ -146,7 +149,6 @@ class DrawingPanel : StackPane() {
 
     private val subLightmap_offset = 0.01 * cubeSize
     private val largeFaceThreshold = 4.0 * cubeSize
-    private var retroScanLineMode = false
     private val renderDownscaleFactor = 4
     private val renderDistanceBlocks = 24.0 * cubeSize
     private val baseResolutionWidth = 1920
@@ -161,6 +163,10 @@ class DrawingPanel : StackPane() {
     private var previousCombinedMatrix: Matrix4x4? = null
     private lateinit var depthBuffer: DoubleArray
     private lateinit var pixelBuffer: IntArray
+    private lateinit var msaaDepthBuffer: DoubleArray
+    private lateinit var msaaColorBuffer: IntArray
+    private val msaaOffsetsX = doubleArrayOf(0.375, 0.875, 0.125, 0.625)
+    private val msaaOffsetsY = doubleArrayOf(0.125, 0.375, 0.625, 0.875)
     private var bgColorInt: Int
     private lateinit var backBuffer: WritableImage
     private val imageView = ImageView()
@@ -174,7 +180,7 @@ class DrawingPanel : StackPane() {
     private var modelRegistry: Map<String, Mesh>
 
     private var isMouseCaptured = false
-    private val mouseSensitivity = 0.008
+    private val mouseSensitivity = 0.006
     private var accumulatedMouseDeltaX = 1.0
     private var accumulatedMouseDeltaY = 1.0
 
@@ -244,6 +250,8 @@ class DrawingPanel : StackPane() {
 
         depthBuffer = DoubleArray(virtualWidth * virtualHeight) { Double.MAX_VALUE }
         pixelBuffer = IntArray(virtualWidth * virtualHeight)
+        msaaDepthBuffer = DoubleArray(virtualWidth * virtualHeight * 4) { Double.MAX_VALUE }
+        msaaColorBuffer = IntArray(virtualWidth * virtualHeight * 4)
         upscaledPixelBuffer = IntArray(outputWidth * outputHeight)
         backBuffer = WritableImage(outputWidth, outputHeight)
 
@@ -395,7 +403,7 @@ class DrawingPanel : StackPane() {
         staticMeshes.add(PlacedMesh(modelRegistry["fence"]!!, Matrix4x4.translation(pos14.x, pos14.y, pos14.z), faceTextures = placedTextures("fence", modelRegistry["fence"]!!)))
 
         val pos15 = Vector3d(0.5 * cubeSize, -4.01 * cubeSize, 0 * cubeSize)
-        staticMeshes.add(PlacedMesh(modelRegistry["plate"]!!, Matrix4x4.translation(pos15.x, pos15.y, pos15.z), faceTextures = placedTextures("plate", modelRegistry["plate"]!!)))
+        staticMeshes.add(PlacedMesh(modelRegistry["plate"]!!, Matrix4x4.translation(pos15.x, pos15.y, pos15.z), faceTextures = placedTextures("plate", modelRegistry["plate"]!!), alwaysRender = true))
 
         for (x in 0 until gridDimension) {
             for (y in 0 until gridDimension) {
@@ -593,29 +601,33 @@ class DrawingPanel : StackPane() {
     }
 
     fun handleKeyRelease(code: KeyCode) {
-        if (code == KeyCode.DIGIT9 || code == KeyCode.NUMPAD9) {
-            debugFly = !debugFly
-            println("debugFly: $debugFly")
-        }
-        if (code == KeyCode.DIGIT8 || code == KeyCode.NUMPAD8) {
-            debugNoclip = !debugNoclip
-            println("debugNoclip: $debugNoclip")
-        }
-        if (code == KeyCode.L) {
-            retroScanLineMode = !retroScanLineMode
-            println("CRT Monitor Mode: $retroScanLineMode")
-        }
         if (code == KeyCode.ESCAPE) {
             isMouseCaptured = false
             scene.cursor = Cursor.DEFAULT
         }
-        if (code == KeyCode.B) {
+        if (code == KeyCode.NUMPAD9) {
+            debugFly = !debugFly
+            println("debugFly: $debugFly")
+        }
+        if (code == KeyCode.NUMPAD8) {
+            debugNoclip = !debugNoclip
+            println("debugNoclip: $debugNoclip")
+        }
+        if (code == KeyCode.NUMPAD7) {
+            retroScanLineMode = !retroScanLineMode
+            println("CRT Monitor Mode: $retroScanLineMode")
+        }
+        if (code == KeyCode.NUMPAD6) {
             debugShowHitboxes = !debugShowHitboxes
             println("debugShowHitboxes: $debugShowHitboxes")
         }
-        if (code == KeyCode.N) {
+        if (code == KeyCode.NUMPAD5) {
             debugShowNavMesh = !debugShowNavMesh
             println("debugShowNavMesh: $debugShowNavMesh")
+        }
+        if (code == KeyCode.NUMPAD4) {
+            antyAliasingMode = !antyAliasingMode
+            println("antyAliasingMode: $antyAliasingMode")
         }
         if (code == KeyCode.J) {
             val agentStartPos = Vector3d(63.2, -331.0, -868.3)
@@ -1301,7 +1313,7 @@ class DrawingPanel : StackPane() {
                         // Rozszerz siatkę wokół agenta
                         extendNavMesh(agent.position, 5.0 * cubeSize)
                     }
-                     agent.lastNavMeshCheckTime = now
+                    agent.lastNavMeshCheckTime = now
                 }
 
                 // Recalculate path periodically
@@ -1489,7 +1501,7 @@ class DrawingPanel : StackPane() {
         val newBatches = mutableMapOf<Image?, MutableList<PlacedMesh>>()
 
         staticMeshes.filter { mesh ->
-            !mesh.collision && mesh.texture != null && mesh.texture != texSkybox && !isTextureFullyTransparent(mesh.texture)
+            !mesh.collision && mesh.texture != null && mesh.texture != texSkybox && !isTextureFullyTransparent(mesh.texture) && !mesh.alwaysRender
         }.forEach { mesh ->
             newBatches.computeIfAbsent(mesh.texture) { mutableListOf() }.add(mesh)
         }
@@ -1708,11 +1720,15 @@ class DrawingPanel : StackPane() {
         val itemsToProcess = lightingUpdateQueue.toList()
         lightingUpdateQueue.clear()
 
-        val allLightsSnapshot = synchronized(lightSources) {
+        val allLightsWithStaticInfo = synchronized(lightSources) {
+            val dynamicLightsSet = synchronized(orbitingLights) { orbitingLights.map { it.light }.toSet() }
             lightSources.map { lightToCopy ->
-                LightSource(lightToCopy.position.copy(), lightToCopy.radius, lightToCopy.color, lightToCopy.intensity, lightToCopy.type)
+                val isStatic = !dynamicLightsSet.contains(lightToCopy)
+                val snapshot = LightSource(lightToCopy.position.copy(), lightToCopy.radius, lightToCopy.color, lightToCopy.intensity, lightToCopy.type)
+                Pair(snapshot, isStatic)
             }
         }
+        val allLightsSnapshot = allLightsWithStaticInfo.map { it.first }
 
         val sortedItems = itemsToProcess.sortedBy { (mesh, faceIndex) ->
             val faceIndices = mesh.mesh.faces.getOrNull(faceIndex)
@@ -1945,8 +1961,9 @@ class DrawingPanel : StackPane() {
                 val grid = subLightmap.grid
                 grid.forEach { row -> row.fill(Color.TRANSPARENT) } // Reset
                 var isLit = false
+                subLightmap.isLitByStaticLight = false
 
-                for (light in allLightsSnapshot) {
+                for ((light, isStatic) in allLightsWithStaticInfo) {
                     // Twoja optymalizacja: Sprawdź 4 narożniki sub-lightmapy
                     val corners = subLightmap.aabb.getCorners()
                     val areAllCornersInside = corners.all { isPointInFace(it, faceWorldVerts) }
@@ -1998,6 +2015,9 @@ class DrawingPanel : StackPane() {
 
                                 grid[x][y] = Color(finalR.coerceIn(0.0, 1.0), finalG.coerceIn(0.0, 1.0), finalB.coerceIn(0.0, 1.0), finalA.coerceIn(0.0, 1.0))
                                 isLit = true
+                                if (isStatic) {
+                                    subLightmap.isLitByStaticLight = true
+                                }
 
                                 if (light.type == LightType.RAYTRACED_GI) {
                                     for (i in 0 until GI_SAMPLES) {
@@ -2041,9 +2061,9 @@ class DrawingPanel : StackPane() {
             if (Thread.currentThread().isInterrupted) break
 
             // Usuń sub-lightmapy, które nie są już oświetlane
-            val removalThreshold = 1_000_000_000L // 1 sekunda w nanosekundach
+            val removalThreshold = 5_000_000_000L // 1 sekunda w nanosekundach
             val currentTime = System.nanoTime()
-            subLightmaps.removeIf { !it.needsUpdate && (currentTime - it.lastLitTime) > removalThreshold }
+            subLightmaps.removeIf { !it.needsUpdate && !it.isLitByStaticLight && (currentTime - it.lastLitTime) > removalThreshold }
         }
 
 
@@ -2540,13 +2560,15 @@ class DrawingPanel : StackPane() {
         if (depthBuffer.size != virtualWidth * virtualHeight) {
             depthBuffer = DoubleArray(virtualWidth * virtualHeight) { Double.MAX_VALUE }
             pixelBuffer = IntArray(virtualWidth * virtualHeight)
+            msaaDepthBuffer = DoubleArray(virtualWidth * virtualHeight * 4) { Double.MAX_VALUE }
+            msaaColorBuffer = IntArray(virtualWidth * virtualHeight * 4)
             upscaledPixelBuffer = IntArray(outputWidth * outputHeight)
             backBuffer = WritableImage(outputWidth, outputHeight)
             imageView.image = backBuffer
         }
 
-        java.util.Arrays.fill(pixelBuffer, bgColorInt)
-        java.util.Arrays.fill(depthBuffer, Double.MAX_VALUE)
+        java.util.Arrays.fill(msaaColorBuffer, bgColorInt)
+        java.util.Arrays.fill(msaaDepthBuffer, Double.MAX_VALUE)
         renderQueue.clear()
         transparentRenderQueue.clear()
 
@@ -2616,16 +2638,16 @@ class DrawingPanel : StackPane() {
                     if (faceData.indices.size < 3) continue
 
                     // Face-level Culling1
-                    var isSkyboxFace = false
+                    var skipDistanceCheck = false
                     if (faceData.source is PlacedMesh) {
                         val mesh = faceData.source
                         val modelName = modelRegistry.entries.find { it.value === mesh.mesh }?.key
-                        if (modelName == "skybox") {
-                            isSkyboxFace = true
+                        if (modelName == "skybox" || mesh.alwaysRender) {
+                            skipDistanceCheck = true
                         }
                     }
 
-                    if (!isSkyboxFace) {
+                    if (!skipDistanceCheck) {
                         val faceWorldVerticesForDist = faceData.indices.map { faceData.worldVertices[it] }
                         var minDistanceSq = Double.MAX_VALUE
 
@@ -2799,7 +2821,7 @@ class DrawingPanel : StackPane() {
 
                 rasterTasks.add(executor.submit {
                     for (renderableFace in renderQueueSnapshot) {
-                        rasterizeTexturedTriangle(pixelBuffer, renderableFace, virtualWidth, virtualHeight, yStart, yEnd)
+                        rasterizeTexturedTriangle(renderableFace, virtualWidth, virtualHeight, yStart, yEnd)
                     }
                 })
             }
@@ -2812,8 +2834,10 @@ class DrawingPanel : StackPane() {
             face.screenVertices.map { it.z }.average()
         }
         for (renderableFace in sortedTransparentFaces) {
-            rasterizeTexturedTriangle(pixelBuffer, renderableFace, virtualWidth, virtualHeight)
+            rasterizeTexturedTriangle(renderableFace, virtualWidth, virtualHeight)
         }
+
+        resolveMSAA(virtualWidth, virtualHeight)
 
         if (debugShowNavMesh) {
             drawNavMeshDebug(combinedMatrix)
@@ -2940,7 +2964,45 @@ class DrawingPanel : StackPane() {
         }
     }
 
-    private fun rasterizeTexturedTriangle(pixelBuffer: IntArray, renderableFace: RenderableFace, screenWidth: Int, screenHeight: Int, bandYStart: Int = 0, bandYEnd: Int = screenHeight) {
+    private fun resolveMSAA(width: Int, height: Int) {
+        val samples = if (antyAliasingMode) 4 else 1
+        val coreCount = Runtime.getRuntime().availableProcessors()
+        val bandHeight = height / coreCount
+        val tasks = mutableListOf<Future<*>>()
+
+        for (i in 0 until coreCount) {
+            val yStart = i * bandHeight
+            val yEnd = if (i == coreCount - 1) height else yStart + bandHeight
+            tasks.add(executor.submit {
+                for (y in yStart until yEnd) {
+                    for (x in 0 until width) {
+                        val pixelIndex = y * width + x
+                        val baseIdx = pixelIndex * 4
+
+                        var r = 0; var g = 0; var b = 0
+
+                        for (s in 0 until samples) {
+                            val c = msaaColorBuffer[baseIdx + s]
+                            r += (c shr 16) and 0xFF
+                            g += (c shr 8) and 0xFF
+                            b += c and 0xFF
+                        }
+
+                        pixelBuffer[pixelIndex] = (0xFF shl 24) or
+                                ((r / samples) shl 16) or
+                                ((g / samples) shl 8) or
+                                (b / samples)
+
+                        // Copy depth for debug drawing (use sample 0)
+                        depthBuffer[pixelIndex] = msaaDepthBuffer[baseIdx]
+                    }
+                }
+            })
+        }
+        for (task in tasks) { task.get() }
+    }
+
+    private fun rasterizeTexturedTriangle(renderableFace: RenderableFace, screenWidth: Int, screenHeight: Int, bandYStart: Int = 0, bandYEnd: Int = screenHeight) {
         val (screenVertices, originalClipW, textureVertices, color, _, texture, worldVertices, lightGrid, blushes, blushContainerAABB, giGrid) = renderableFace
         if (screenVertices.size != 3 || textureVertices.size != 3 || originalClipW.size != 3) return
 
@@ -2979,6 +3041,9 @@ class DrawingPanel : StackPane() {
         val alpha_dx = A12 * invTotalArea
         val beta_dx = A20 * invTotalArea
         val gamma_dx = A01 * invTotalArea
+        val alpha_dy = B12 * invTotalArea
+        val beta_dy = B20 * invTotalArea
+        val gamma_dy = B01 * invTotalArea
 
         val z_inv_prime_dx = alpha_dx * z0_inv_prime + beta_dx * z1_inv_prime + gamma_dx * z2_inv_prime
         val u_prime_dx = alpha_dx * u0_prime + beta_dx * u1_prime + gamma_dx * u2_prime
@@ -2987,6 +3052,7 @@ class DrawingPanel : StackPane() {
         val world_y_prime_dx = alpha_dx * wVert0_prime.y + beta_dx * wVert1_prime.y + gamma_dx * wVert2_prime.y
         val world_z_prime_dx = alpha_dx * wVert0_prime.z + beta_dx * wVert1_prime.z + gamma_dx * wVert2_prime.z
         val z_dx = alpha_dx * v0.z + beta_dx * v1.z + gamma_dx * v2.z
+        val z_dy = alpha_dy * v0.z + beta_dy * v1.z + gamma_dy * v2.z
 
         val ambientR = color.red * ambientIntensity
         val ambientG = color.green * ambientIntensity
@@ -3020,6 +3086,9 @@ class DrawingPanel : StackPane() {
         val applyFog = renderableFace.hasCollision || fogAffectsNonCollidables
         val lightGridResolution = lightGrid?.size ?: 1
 
+        val useMSAA = antyAliasingMode
+        val samples = if (useMSAA) 4 else 1
+
         // Oblicz wartości startowe dla alpha i beta na początku pierwszego wiersza
         var alpha_row_start = (A12 * minX + B12 * minY + C12) * invTotalArea
         var beta_row_start = (A20 * minX + B20 * minY + C20) * invTotalArea
@@ -3044,10 +3113,24 @@ class DrawingPanel : StackPane() {
 
             for (px in minX..maxX) {
                 val gamma_px = 1.0 - alpha_px - beta_px
-                if (alpha_px >= 0 && beta_px >= 0 && gamma_px >= 0) {
+
+                var coverageMask = 0
+                for (s in 0 until samples) {
+                    val sx = if (useMSAA) msaaOffsetsX[s] else 0.5
+                    val sy = if (useMSAA) msaaOffsetsY[s] else 0.5
+                    // Calculate barycentric at sample position
+                    val sAlpha = alpha_px + alpha_dx * sx + alpha_dy * sy
+                    val sBeta = beta_px + beta_dx * sx + beta_dy * sy
+                    val sGamma = 1.0 - sAlpha - sBeta
+
+                    if (sAlpha >= 0 && sBeta >= 0 && sGamma >= 0) {
+                        coverageMask = coverageMask or (1 shl s)
+                    }
+                }
+
+                if (coverageMask != 0) {
                     val pixelIndex = px + rowOffset
 
-                    if (interpolated_z_px < depthBuffer[pixelIndex]) {
                         if (interpolated_z_inv_prime_px < 1e-6) {
                             alpha_px += alpha_dx; beta_px += beta_dx
                             interpolated_z_inv_prime_px += z_inv_prime_dx; interpolated_u_prime_px += u_prime_dx; interpolated_v_prime_px += v_prime_dx
@@ -3067,8 +3150,18 @@ class DrawingPanel : StackPane() {
                         if (!isInBlush) {
                             if (!hasTexture) { // This is a gizmo or untextured face
                                 val finalColor = colorToInt(color)
-                                pixelBuffer[pixelIndex] = finalColor
-                                depthBuffer[pixelIndex] = interpolated_z_px
+                                for (s in 0 until samples) {
+                                    if ((coverageMask and (1 shl s)) != 0) {
+                                        val sx = if (useMSAA) msaaOffsetsX[s] else 0.5
+                                        val sy = if (useMSAA) msaaOffsetsY[s] else 0.5
+                                        val sZ = interpolated_z_px + z_dx * sx + z_dy * sy
+                                        val idx = (pixelIndex * 4) + s
+                                        if (sZ < msaaDepthBuffer[idx]) {
+                                            msaaDepthBuffer[idx] = sZ
+                                            msaaColorBuffer[idx] = finalColor
+                                        }
+                                    }
+                                }
                                 // Inkrementuj i kontynuuj
                                 alpha_px += alpha_dx; beta_px += beta_dx
                                 interpolated_z_inv_prime_px += z_inv_prime_dx; interpolated_u_prime_px += u_prime_dx; interpolated_v_prime_px += v_prime_dx
@@ -3196,13 +3289,37 @@ class DrawingPanel : StackPane() {
                                 val blendedG = (finalG * srcAlpha + dstG * invSrcAlpha).toInt()
                                 val blendedB = (finalB * srcAlpha + dstB * invSrcAlpha).toInt()
 
-                                pixelBuffer[pixelIndex] = (0xFF shl 24) or (blendedR shl 16) or (blendedG shl 8) or blendedB
+                                val blendedColor = (0xFF shl 24) or (blendedR shl 16) or (blendedG shl 8) or blendedB
+                                for (s in 0 until samples) {
+                                    if ((coverageMask and (1 shl s)) != 0) {
+                                        // For transparent, we don't write depth usually, or we do?
+                                        // Original code didn't write depth for transparent.
+                                        // And it read from pixelBuffer for blending.
+                                        // With MSAA, we should blend with msaaColorBuffer[s].
+                                        // But here we simplified to blend with 'dstColorInt' which was read from pixelBuffer?
+                                        // Wait, original code read pixelBuffer[pixelIndex].
+                                        // In MSAA, we should read msaaColorBuffer[idx].
+                                        // For simplicity in this refactor, we just write the blended color to all covered samples.
+                                        val idx = (pixelIndex * 4) + s
+                                        msaaColorBuffer[idx] = blendedColor
+                                    }
+                                }
                             } else {
-                                pixelBuffer[pixelIndex] = (0xFF shl 24) or (finalR shl 16) or (finalG shl 8) or finalB
-                                depthBuffer[pixelIndex] = interpolated_z_px
+                                val finalColor = (0xFF shl 24) or (finalR shl 16) or (finalG shl 8) or finalB
+                                for (s in 0 until samples) {
+                                    if ((coverageMask and (1 shl s)) != 0) {
+                                        val sx = if (useMSAA) msaaOffsetsX[s] else 0.5
+                                        val sy = if (useMSAA) msaaOffsetsY[s] else 0.5
+                                        val sZ = interpolated_z_px + z_dx * sx + z_dy * sy
+                                        val idx = (pixelIndex * 4) + s
+                                        if (sZ < msaaDepthBuffer[idx]) {
+                                            msaaDepthBuffer[idx] = sZ
+                                            msaaColorBuffer[idx] = finalColor
+                                        }
+                                    }
+                                }
                             }
                         }
-                    }
                 }
                 // Inkrementuj wartości dla następnego piksela w rzędzie
                 alpha_px += alpha_dx
