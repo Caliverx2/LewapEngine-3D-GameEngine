@@ -2046,6 +2046,7 @@ class DrawingPanel : StackPane() {
 
                 // Wypal siatkę kolorów na teksturę WritableImage
                 val pixelWriter = subLightmap.texture.pixelWriter
+                val newPixels = IntArray(resolution * resolution)
                 for (y in 0 until resolution) {
                     for (x in 0 until resolution) {
                         val color = grid[x][y]
@@ -2053,10 +2054,13 @@ class DrawingPanel : StackPane() {
                         val g = (color.green * 255).toInt().coerceIn(0, 255)
                         val b = (color.blue * 255).toInt().coerceIn(0, 255)
                         val a = (color.opacity * 255).toInt().coerceIn(0, 255)
-                        pixelWriter.setArgb(x, y, (a shl 24) or (r shl 16) or (g shl 8) or b)
+                        val argb = (a shl 24) or (r shl 16) or (g shl 8) or b
+                        pixelWriter.setArgb(x, y, argb)
+                        newPixels[x + y * resolution] = argb
                     }
                 }
-                textureCache.remove(subLightmap.texture)
+                textureCache[subLightmap.texture] = newPixels
+                textureDimensions[subLightmap.texture] = resolution to resolution
             }
             if (Thread.currentThread().isInterrupted) break
 
@@ -3061,24 +3065,8 @@ class DrawingPanel : StackPane() {
         val fogR = fogColor.red; val fogG = fogColor.green; val fogB = fogColor.blue
         val fogRange = fogEndDistance - fogStartDistance
 
-        val texPixels: IntArray?
-        val texDim: Pair<Int, Int>?
-        if (texture != null && texture is WritableImage) {
-            // cache for WritableImage, as their content may change dynamically (e.g. SubLightmap)
-            val width = texture.width.toInt()
-            val height = texture.height.toInt()
-            if (width > 0 && height > 0) {
-                texDim = width to height
-                texPixels = IntArray(width * height)
-                texture.pixelReader.getPixels(0, 0, width, height, PixelFormat.getIntArgbInstance(), texPixels, 0, width)
-            } else {
-                texDim = null
-                texPixels = null
-            }
-        } else {
-            texPixels = if (texture != null) getTexturePixels(texture) else null
-            texDim = if (texture != null) textureDimensions[texture] else null
-        }
+        val texPixels: IntArray? = if (texture != null) getTexturePixels(texture) else null
+        val texDim: Pair<Int, Int>? = if (texture != null) textureDimensions[texture] else null
 
         val hasLightGrid = lightGrid != null
         val hasGiGrid = giGrid != null
@@ -3280,28 +3268,26 @@ class DrawingPanel : StackPane() {
                                 val srcAlpha = texOpacity
                                 val invSrcAlpha = 1.0 - srcAlpha
 
-                                val dstColorInt = pixelBuffer[pixelIndex]
-                                val dstR = (dstColorInt shr 16) and 0xFF
-                                val dstG = (dstColorInt shr 8) and 0xFF
-                                val dstB = dstColorInt and 0xFF
-
-                                val blendedR = (finalR * srcAlpha + dstR * invSrcAlpha).toInt()
-                                val blendedG = (finalG * srcAlpha + dstG * invSrcAlpha).toInt()
-                                val blendedB = (finalB * srcAlpha + dstB * invSrcAlpha).toInt()
-
-                                val blendedColor = (0xFF shl 24) or (blendedR shl 16) or (blendedG shl 8) or blendedB
                                 for (s in 0 until samples) {
                                     if ((coverageMask and (1 shl s)) != 0) {
-                                        // For transparent, we don't write depth usually, or we do?
-                                        // Original code didn't write depth for transparent.
-                                        // And it read from pixelBuffer for blending.
-                                        // With MSAA, we should blend with msaaColorBuffer[s].
-                                        // But here we simplified to blend with 'dstColorInt' which was read from pixelBuffer?
-                                        // Wait, original code read pixelBuffer[pixelIndex].
-                                        // In MSAA, we should read msaaColorBuffer[idx].
-                                        // For simplicity in this refactor, we just write the blended color to all covered samples.
+                                        val sx = if (useMSAA) msaaOffsetsX[s] else 0.5
+                                        val sy = if (useMSAA) msaaOffsetsY[s] else 0.5
+                                        val sZ = interpolated_z_px + z_dx * sx + z_dy * sy
                                         val idx = (pixelIndex * 4) + s
-                                        msaaColorBuffer[idx] = blendedColor
+
+                                        if (sZ < msaaDepthBuffer[idx]) {
+                                            val dstColorInt = msaaColorBuffer[idx]
+                                            val dstR = (dstColorInt shr 16) and 0xFF
+                                            val dstG = (dstColorInt shr 8) and 0xFF
+                                            val dstB = dstColorInt and 0xFF
+
+                                            val blendedR = (finalR * srcAlpha + dstR * invSrcAlpha).toInt()
+                                            val blendedG = (finalG * srcAlpha + dstG * invSrcAlpha).toInt()
+                                            val blendedB = (finalB * srcAlpha + dstB * invSrcAlpha).toInt()
+
+                                            val blendedColor = (0xFF shl 24) or (blendedR shl 16) or (blendedG shl 8) or blendedB
+                                            msaaColorBuffer[idx] = blendedColor
+                                        }
                                     }
                                 }
                             } else {
