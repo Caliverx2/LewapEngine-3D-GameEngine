@@ -14,6 +14,7 @@ import kotlin.math.pow
 import kotlin.math.sin
 import kotlin.math.sqrt
 import kotlin.math.tan
+import java.util.PriorityQueue
 
 data class Vector3d(var x: Double, var y: Double, var z: Double) {
     operator fun plus(other: Vector3d) = Vector3d(x + other.x, y + other.y, z + other.z)
@@ -447,16 +448,21 @@ class NavMesh(
     }
 
     fun findPath(startNode: NavMeshNode, endNode: NavMeshNode): List<Vector3d>? {
-        val openSet = mutableListOf(startNode)
-        val cameFrom = mutableMapOf<NavMeshNode, NavMeshNode>()
         val gScore = mutableMapOf<NavMeshNode, Double>().withDefault { Double.POSITIVE_INFINITY }
         gScore[startNode] = 0.0
 
         val fScore = mutableMapOf<NavMeshNode, Double>().withDefault { Double.POSITIVE_INFINITY }
         fScore[startNode] = startNode.position.distanceSquared(endNode.position)
 
+        val openSet = PriorityQueue<NavMeshNode> { n1, n2 ->
+            fScore.getValue(n1).compareTo(fScore.getValue(n2))
+        }
+        openSet.add(startNode)
+        val cameFrom = mutableMapOf<NavMeshNode, NavMeshNode>()
+        val processed = mutableSetOf<NavMeshNode>()
+
         while (openSet.isNotEmpty()) {
-            val current = openSet.minByOrNull { fScore.getValue(it) }!!
+            val current = openSet.poll()
 
             if (current == endNode) {
                 val path = mutableListOf<Vector3d>()
@@ -469,16 +475,15 @@ class NavMesh(
                 return path.reversed()
             }
 
-            openSet.remove(current)
+            if (!processed.add(current)) continue
+
             for (neighbor in current.neighbors) {
                 val tentativeGScore = gScore.getValue(current) + current.position.distanceSquared(neighbor.position)
                 if (tentativeGScore < gScore.getValue(neighbor)) {
                     cameFrom[neighbor] = current
                     gScore[neighbor] = tentativeGScore
                     fScore[neighbor] = tentativeGScore + neighbor.position.distanceSquared(endNode.position)
-                    if (neighbor !in openSet) {
-                        openSet.add(neighbor)
-                    }
+                    openSet.add(neighbor)
                 }
             }
         }

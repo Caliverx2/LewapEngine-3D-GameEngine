@@ -1317,7 +1317,7 @@ class DrawingPanel : StackPane() {
                 }
 
                 // Recalculate path periodically
-                if (agent.path == null || now - agent.lastPathUpdateTime > 1_000_000_000) { // Update path every second
+                if (now - agent.lastPathUpdateTime > 1_000_000_000) { // Update path every second
                     agent.lastPathUpdateTime = now
                     val currentNavMesh = navMesh
                     if (currentNavMesh != null) {
