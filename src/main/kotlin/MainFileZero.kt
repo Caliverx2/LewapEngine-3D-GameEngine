@@ -447,7 +447,7 @@ class NavMesh(
         return nodes.count { it.position.distanceSquared(center) <= radiusSq }
     }
 
-    fun findPath(startNode: NavMeshNode, endNode: NavMeshNode): List<Vector3d>? {
+    fun findPath(startNode: NavMeshNode, endNode: NavMeshNode, dynamicObstacles: List<Vector3d> = emptyList(), obstacleRadius: Double = 0.0): List<Vector3d>? {
         val gScore = mutableMapOf<NavMeshNode, Double>().withDefault { Double.POSITIVE_INFINITY }
         gScore[startNode] = 0.0
 
@@ -478,6 +478,12 @@ class NavMesh(
             if (!processed.add(current)) continue
 
             for (neighbor in current.neighbors) {
+                // Sprawdź, czy sąsiad nie jest blokowany przez dynamiczną przeszkodę
+                val obstacleRadiusSq = obstacleRadius * obstacleRadius
+                if (dynamicObstacles.any { it.distanceSquared(neighbor.position) < obstacleRadiusSq }) {
+                    continue // Pomiń tego sąsiada, jest zablokowany
+                }
+
                 val tentativeGScore = gScore.getValue(current) + current.position.distanceSquared(neighbor.position)
                 if (tentativeGScore < gScore.getValue(neighbor)) {
                     cameFrom[neighbor] = current

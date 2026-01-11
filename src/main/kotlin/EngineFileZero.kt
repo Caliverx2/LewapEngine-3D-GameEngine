@@ -116,6 +116,7 @@ class DrawingPanel : StackPane() {
     private val floorLevel = -3.4075 * cubeSize
     private val dynamicFov = (baseFov / sqrt(playerHitboxScale / baseHitboxScale).coerceAtLeast(0.5)).coerceIn(60.0..120.0)
 
+    private var fogMode = true
     private var debugFly = false
     private var debugNoclip = false
     private var debugShowHitboxes = false
@@ -628,6 +629,10 @@ class DrawingPanel : StackPane() {
         if (code == KeyCode.NUMPAD4) {
             antyAliasingMode = !antyAliasingMode
             println("antyAliasingMode: $antyAliasingMode")
+        }
+        if (code == KeyCode.NUMPAD3) {
+            fogMode = !fogMode
+            println("fogMode: $fogMode")
         }
         if (code == KeyCode.J) {
             val agentStartPos = Vector3d(63.2, -331.0, -868.3)
@@ -1296,12 +1301,21 @@ class DrawingPanel : StackPane() {
 
         // Update pathfinding agents
         synchronized(pathfindingAgents) {
+            val allAgentPositions = pathfindingAgents.map { it.position }
             val agentsToRemove = mutableListOf<PathfindingAgent>()
             for (agent in pathfindingAgents) {
                 agent.targetPosition = cameraPosition.copy()
                 val distSq = agent.position.distanceSquared(agent.targetPosition)
                 val activationDist = 20.0 * cubeSize
-                if (distSq > activationDist * activationDist) {
+
+                // Zatrzymaj agenta, jeśli jest wystarczająco blisko gracza
+                val minApproachDistance = 1.5 * cubeSize
+                if (distSq < minApproachDistance * minApproachDistance) {
+                    agent.path = null // Wyczyść ścieżkę, aby się zatrzymał
+                    continue // Przejdź do następnego agenta, nie wykonuj logiki ruchu
+                }
+
+                if (distSq > activationDist * activationDist) { // Nie aktywuj agenta, jeśli jest za daleko
                     continue
                 }
                 val now = System.nanoTime()
@@ -1325,7 +1339,11 @@ class DrawingPanel : StackPane() {
                         val endNode = currentNavMesh.findClosestNode(agent.targetPosition)
 
                         if (startNode != null && endNode != null) {
-                            agent.path = currentNavMesh.findPath(startNode, endNode)
+                            // Znajdź ścieżkę, omijając innych agentów
+                            val otherAgentPositions = allAgentPositions.filter { it != agent.position }
+                            val agentAvoidanceRadius = cubeSize // Promień unikania innych agentów
+
+                            agent.path = currentNavMesh.findPath(startNode, endNode, otherAgentPositions, agentAvoidanceRadius)
                             agent.currentPathIndex = 0
                         } else {
                             agent.path = null
@@ -1371,8 +1389,27 @@ class DrawingPanel : StackPane() {
                     }
                 } ?: run {
                     // Fallback: No path found. Move towards target and generate mesh.
-                    val direction = (agent.targetPosition - agent.position).normalize()
-                    val proposedPos = agent.position + direction * agent.speed * deltaTime
+                    val targetDirection = (agent.targetPosition - agent.position).normalize()
+                    var moveDirection = targetDirection
+
+                    // Dodatkowa separacja w trybie "bez ścieżki", aby agenci nie wchodzili w siebie
+                    var separation = Vector3d(0.0, 0.0, 0.0)
+                    var neighbors = 0
+                    val separationRadius = cubeSize * 1.2 // Nieco więcej niż 1 blok odstępu
+
+                    for (otherPos in allAgentPositions) {
+                        val distSq = agent.position.distanceSquared(otherPos)
+                        if (distSq > 0.001 && distSq < separationRadius * separationRadius) {
+                            separation += (agent.position - otherPos).normalize()
+                            neighbors++
+                        }
+                    }
+                    if (neighbors > 0) {
+                        // Mieszamy chęć pójścia do gracza z silnym odpychaniem od innych (waga 2.0)
+                        moveDirection = (moveDirection + separation.normalize() * 2.0).normalize()
+                    }
+
+                    val proposedPos = agent.position + moveDirection * agent.speed * deltaTime
 
                     // Fizyka dla ruchu "mimowolnego" - pozwala wejść na rampę, ale blokuje ściany
                     val rayOrigin = Vector3d(proposedPos.x, agent.position.y + 1.9 * cubeSize, proposedPos.z)
@@ -1389,7 +1426,7 @@ class DrawingPanel : StackPane() {
                         }
                     }
                     // Update mesh position and rotation
-                    val agentYaw = atan2(direction.x, direction.z) + PI
+                    val agentYaw = atan2(targetDirection.x, targetDirection.z) + PI
                     agent.mesh.transformMatrix = Matrix4x4.translation(agent.position.x, agent.position.y, agent.position.z) * Matrix4x4.rotationY(agentYaw) * Matrix4x4.scale(0.3, 0.3, 0.3)
                     meshAABBs[agent.mesh] = AABB.fromCube(agent.mesh.getTransformedVertices())
                 }
@@ -3215,7 +3252,7 @@ class DrawingPanel : StackPane() {
                             var g = ambientLitG + dynamicLightG / 4 + giLightG * GI_LightIntensity * 2.0
                             var b = ambientLitB + dynamicLightB / 4 + giLightB * GI_LightIntensity * 2.0
 
-                            if (applyFog) {
+                            if (applyFog and fogMode) {
                                 val distance = inv_z_prime
                                 val fogFactor = ((distance - fogStartDistance) / fogRange).coerceIn(0.0, 1.0) * fogDensity
 
