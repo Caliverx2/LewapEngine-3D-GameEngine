@@ -3156,193 +3156,203 @@ class DrawingPanel : StackPane() {
                 if (coverageMask != 0) {
                     val pixelIndex = px + rowOffset
 
-                        if (interpolated_z_inv_prime_px < 1e-6) {
+                    if (interpolated_z_inv_prime_px < 1e-6) {
+                        alpha_px += alpha_dx; beta_px += beta_dx
+                        interpolated_z_inv_prime_px += z_inv_prime_dx; interpolated_u_prime_px += u_prime_dx; interpolated_v_prime_px += v_prime_dx
+                        interpolated_world_x_prime_px += world_x_prime_dx; interpolated_world_y_prime_px += world_y_prime_dx; interpolated_world_z_prime_px += world_z_prime_dx
+                        interpolated_z_px += z_dx
+                        continue
+                    }
+                    val inv_z_prime = 1.0 / interpolated_z_inv_prime_px
+
+                    // OPTYMALIZACJA: Rozpakowanie Vector3d na prymitywy, aby uniknąć alokacji w pętli
+                    val iWorldX = interpolated_world_x_prime_px * inv_z_prime
+                    val iWorldY = interpolated_world_y_prime_px * inv_z_prime
+                    val iWorldZ = interpolated_world_z_prime_px * inv_z_prime
+
+                    // Sprawdzenie AABB ręcznie na prymitywach (zakładając, że AABB ma metody lub można to rozwinąć)
+                    // Tutaj musimy sprawdzić czy blushContainerAABB zawiera punkt (x,y,z) bez tworzenia wektora
+                    val isInBlush = blushContainerAABB?.let {
+                        iWorldX >= it.min.x && iWorldX <= it.max.x &&
+                                iWorldY >= it.min.y && iWorldY <= it.max.y &&
+                                iWorldZ >= it.min.z && iWorldZ <= it.max.z
+                    } == true && blushes.any { blush ->
+                        iWorldX >= blush.min.x && iWorldX <= blush.max.x &&
+                                iWorldY >= blush.min.y && iWorldY <= blush.max.y &&
+                                iWorldZ >= blush.min.z && iWorldZ <= blush.max.z
+                    }
+
+                    if (!isInBlush) {
+                        if (!hasTexture) { // This is a gizmo or untextured face
+                            val finalColor = colorToInt(color)
+                            for (s in 0 until samples) {
+                                if ((coverageMask and (1 shl s)) != 0) {
+                                    val sx = if (useMSAA) msaaOffsetsX[s] else 0.5
+                                    val sy = if (useMSAA) msaaOffsetsY[s] else 0.5
+                                    val sZ = interpolated_z_px + z_dx * sx + z_dy * sy
+                                    val idx = (pixelIndex * 4) + s
+                                    if (sZ < msaaDepthBuffer[idx]) {
+                                        msaaDepthBuffer[idx] = sZ
+                                        msaaColorBuffer[idx] = finalColor
+                                    }
+                                }
+                            }
+                            // Inkrementuj i kontynuuj
                             alpha_px += alpha_dx; beta_px += beta_dx
                             interpolated_z_inv_prime_px += z_inv_prime_dx; interpolated_u_prime_px += u_prime_dx; interpolated_v_prime_px += v_prime_dx
                             interpolated_world_x_prime_px += world_x_prime_dx; interpolated_world_y_prime_px += world_y_prime_dx; interpolated_world_z_prime_px += world_z_prime_dx
                             interpolated_z_px += z_dx
                             continue
                         }
-                        val inv_z_prime = 1.0 / interpolated_z_inv_prime_px
-                        val interpolatedWorldPos = Vector3d(
-                            interpolated_world_x_prime_px * inv_z_prime,
-                            interpolated_world_y_prime_px * inv_z_prime,
-                            interpolated_world_z_prime_px * inv_z_prime
-                        )
 
-                        val isInBlush = blushContainerAABB?.contains(interpolatedWorldPos) == true && blushes.any { it.contains(interpolatedWorldPos) }
+                        val (texWidth, texHeight) = texDim
+                        val u = interpolated_u_prime_px * inv_z_prime
+                        val v = interpolated_v_prime_px * inv_z_prime
+                        val texX = (u * texWidth).toInt().coerceIn(0, texWidth - 1)
+                        val texY = (v * texHeight).toInt().coerceIn(0, texHeight - 1)
 
-                        if (!isInBlush) {
-                            if (!hasTexture) { // This is a gizmo or untextured face
-                                val finalColor = colorToInt(color)
-                                for (s in 0 until samples) {
-                                    if ((coverageMask and (1 shl s)) != 0) {
-                                        val sx = if (useMSAA) msaaOffsetsX[s] else 0.5
-                                        val sy = if (useMSAA) msaaOffsetsY[s] else 0.5
-                                        val sZ = interpolated_z_px + z_dx * sx + z_dy * sy
-                                        val idx = (pixelIndex * 4) + s
-                                        if (sZ < msaaDepthBuffer[idx]) {
-                                            msaaDepthBuffer[idx] = sZ
-                                            msaaColorBuffer[idx] = finalColor
-                                        }
+                        val texColorArgb = texPixels[texX + texY * texWidth]
+                        val texOpacity = (texColorArgb ushr 24) / 255.0
+
+                        if (texOpacity < 0.01) {
+                            // Inkrementuj i kontynuuj
+                            alpha_px += alpha_dx; beta_px += beta_dx
+                            interpolated_z_inv_prime_px += z_inv_prime_dx; interpolated_u_prime_px += u_prime_dx; interpolated_v_prime_px += v_prime_dx
+                            interpolated_world_x_prime_px += world_x_prime_dx; interpolated_world_y_prime_px += world_y_prime_dx; interpolated_world_z_prime_px += world_z_prime_dx
+                            interpolated_z_px += z_dx
+                            continue
+                        }
+
+                        val texR = ((texColorArgb ushr 16) and 0xFF) / 255.0
+                        val texG = ((texColorArgb ushr 8) and 0xFF) / 255.0
+                        val texB = (texColorArgb and 0xFF) / 255.0
+
+                        val dynamicLight = if (hasLightGrid) {
+                            val gridX = (u * lightGridResolution).toInt().coerceIn(0, lightGridResolution - 1)
+                            val gridY = ((1.0 - v) * lightGridResolution).toInt().coerceIn(0, lightGridResolution - 1)
+                            lightGrid!![gridX][gridY]
+                        } else {
+                            Color.BLACK
+                        }
+
+                        val giLight = if (hasGiGrid) {
+                            val gridX = (u * lightGridResolution).toInt().coerceIn(0, lightGridResolution - 1)
+                            val gridY = ((1.0 - v) * lightGridResolution).toInt().coerceIn(0, lightGridResolution - 1)
+                            giGrid!![gridX][gridY]
+                        } else {
+                            Color.BLACK
+                        }
+
+                        val ambientLitR = texR * (ambientR * 2)
+                        val ambientLitG = texG * (ambientG * 2)
+                        val ambientLitB = texB * (ambientB * 2)
+
+                        val dynamicLightR = dynamicLight.red * (ambientIntensity * globalLightIntensity)
+                        val dynamicLightG = dynamicLight.green * (ambientIntensity * globalLightIntensity)
+                        val dynamicLightB = dynamicLight.blue * (ambientIntensity * globalLightIntensity)
+
+                        val directLightLuminance = (dynamicLight.red + dynamicLight.green + dynamicLight.blue) / 3.0
+                        val giModulationFactor = (1.0 - directLightLuminance).coerceIn(0.0, 1.0)
+
+                        val giLightR = giLight.red * (ambientIntensity * globalLightIntensity) * giModulationFactor
+                        val giLightG = giLight.green * (ambientIntensity * globalLightIntensity) * giModulationFactor
+                        val giLightB = giLight.blue * (ambientIntensity * globalLightIntensity) * giModulationFactor
+
+                        var r = ambientLitR + dynamicLightR / 4 + giLightR * GI_LightIntensity * 2.0
+                        var g = ambientLitG + dynamicLightG / 4 + giLightG * GI_LightIntensity * 2.0
+                        var b = ambientLitB + dynamicLightB / 4 + giLightB * GI_LightIntensity * 2.0
+
+                        if (applyFog and fogMode) {
+                            val distance = inv_z_prime
+                            val fogFactor = ((distance - fogStartDistance) / fogRange).coerceIn(0.0, 1.0) * fogDensity
+
+                            r = r * (1 - fogFactor) + fogR * fogFactor
+                            g = g * (1 - fogFactor) + fogG * fogFactor
+                            b = b * (1 - fogFactor) + fogB * fogFactor
+                        }
+
+                        if (retroScanLineMode) {
+                            val screenCenterY = screenHeight / 2.0
+                            val screenCenterX = screenWidth / 2.0
+                            val distFromCenterY = (py - screenCenterY) / screenCenterY
+                            val distFromCenterX = (px - screenCenterX) / screenCenterX
+                            val distSquared = distFromCenterX * distFromCenterX + distFromCenterY * distFromCenterY
+                            val vignetteFactor = 1.0 - distSquared * 0.15
+
+                            r *= vignetteFactor
+                            g *= vignetteFactor
+                            b *= vignetteFactor
+
+                            val rShiftFactor = 1.0 + distSquared * 0.05
+                            val bShiftFactor = 1.0 + distSquared * 0.05
+                            val tempR = r * rShiftFactor
+                            val tempB = b * bShiftFactor
+                            val scanlineFactor = 0.80
+                            val bloomFactor = 1.05
+
+                            when (py % 3) {
+                                0 -> {
+                                    r *= scanlineFactor; g *= scanlineFactor; b *= scanlineFactor
+                                }
+                                1 -> {
+                                    r *= bloomFactor; g *= bloomFactor; b *= bloomFactor
+                                }
+                            }
+
+                            val noise = (Math.random() * 0.05) - 0.025
+                            r += noise; g += noise; b += noise
+
+                            r = tempR
+                            b = tempB
+                        }
+
+                        val finalR = (r * 255).toInt().coerceIn(0, 255)
+                        val finalG = (g * 255).toInt().coerceIn(0, 255)
+                        val finalB = (b * 255).toInt().coerceIn(0, 255)
+
+                        val isOpaque = texOpacity >= 1.0
+                        if (!isOpaque) {
+                            val srcAlpha = texOpacity
+                            val invSrcAlpha = 1.0 - srcAlpha
+
+                            for (s in 0 until samples) {
+                                if ((coverageMask and (1 shl s)) != 0) {
+                                    val sx = if (useMSAA) msaaOffsetsX[s] else 0.5
+                                    val sy = if (useMSAA) msaaOffsetsY[s] else 0.5
+                                    val sZ = interpolated_z_px + z_dx * sx + z_dy * sy
+                                    val idx = (pixelIndex * 4) + s
+
+                                    if (sZ < msaaDepthBuffer[idx]) {
+                                        val dstColorInt = msaaColorBuffer[idx]
+                                        val dstR = (dstColorInt shr 16) and 0xFF
+                                        val dstG = (dstColorInt shr 8) and 0xFF
+                                        val dstB = dstColorInt and 0xFF
+
+                                        val blendedR = (finalR * srcAlpha + dstR * invSrcAlpha).toInt()
+                                        val blendedG = (finalG * srcAlpha + dstG * invSrcAlpha).toInt()
+                                        val blendedB = (finalB * srcAlpha + dstB * invSrcAlpha).toInt()
+
+                                        val blendedColor = (0xFF shl 24) or (blendedR shl 16) or (blendedG shl 8) or blendedB
+                                        msaaColorBuffer[idx] = blendedColor
                                     }
                                 }
-                                // Inkrementuj i kontynuuj
-                                alpha_px += alpha_dx; beta_px += beta_dx
-                                interpolated_z_inv_prime_px += z_inv_prime_dx; interpolated_u_prime_px += u_prime_dx; interpolated_v_prime_px += v_prime_dx
-                                interpolated_world_x_prime_px += world_x_prime_dx; interpolated_world_y_prime_px += world_y_prime_dx; interpolated_world_z_prime_px += world_z_prime_dx
-                                interpolated_z_px += z_dx
-                                continue
                             }
-
-                            val (texWidth, texHeight) = texDim
-                            val u = interpolated_u_prime_px * inv_z_prime
-                            val v = interpolated_v_prime_px * inv_z_prime
-                            val texX = (u * texWidth).toInt().coerceIn(0, texWidth - 1)
-                            val texY = (v * texHeight).toInt().coerceIn(0, texHeight - 1)
-
-                            val texColorArgb = texPixels[texX + texY * texWidth]
-                            val texOpacity = (texColorArgb ushr 24) / 255.0
-
-                            if (texOpacity < 0.01) {
-                                // Inkrementuj i kontynuuj
-                                alpha_px += alpha_dx; beta_px += beta_dx
-                                interpolated_z_inv_prime_px += z_inv_prime_dx; interpolated_u_prime_px += u_prime_dx; interpolated_v_prime_px += v_prime_dx
-                                interpolated_world_x_prime_px += world_x_prime_dx; interpolated_world_y_prime_px += world_y_prime_dx; interpolated_world_z_prime_px += world_z_prime_dx
-                                interpolated_z_px += z_dx
-                                continue
-                            }
-
-                            val texR = ((texColorArgb ushr 16) and 0xFF) / 255.0
-                            val texG = ((texColorArgb ushr 8) and 0xFF) / 255.0
-                            val texB = (texColorArgb and 0xFF) / 255.0
-
-                            val dynamicLight = if (hasLightGrid) {
-                                val gridX = (u * lightGridResolution).toInt().coerceIn(0, lightGridResolution - 1)
-                                val gridY = ((1.0 - v) * lightGridResolution).toInt().coerceIn(0, lightGridResolution - 1)
-                                lightGrid!![gridX][gridY]
-                            } else {
-                                Color.BLACK
-                            }
-
-                            val giLight = if (hasGiGrid) {
-                                val gridX = (u * lightGridResolution).toInt().coerceIn(0, lightGridResolution - 1)
-                                val gridY = ((1.0 - v) * lightGridResolution).toInt().coerceIn(0, lightGridResolution - 1)
-                                giGrid!![gridX][gridY]
-                            } else {
-                                Color.BLACK
-                            }
-
-                            val ambientLitR = texR * (ambientR * 2)
-                            val ambientLitG = texG * (ambientG * 2)
-                            val ambientLitB = texB * (ambientB * 2)
-
-                            val dynamicLightR = dynamicLight.red * (ambientIntensity * globalLightIntensity)
-                            val dynamicLightG = dynamicLight.green * (ambientIntensity * globalLightIntensity)
-                            val dynamicLightB = dynamicLight.blue * (ambientIntensity * globalLightIntensity)
-
-                            val directLightLuminance = (dynamicLight.red + dynamicLight.green + dynamicLight.blue) / 3.0
-                            val giModulationFactor = (1.0 - directLightLuminance).coerceIn(0.0, 1.0)
-
-                            val giLightR = giLight.red * (ambientIntensity * globalLightIntensity) * giModulationFactor
-                            val giLightG = giLight.green * (ambientIntensity * globalLightIntensity) * giModulationFactor
-                            val giLightB = giLight.blue * (ambientIntensity * globalLightIntensity) * giModulationFactor
-
-                            var r = ambientLitR + dynamicLightR / 4 + giLightR * GI_LightIntensity * 2.0
-                            var g = ambientLitG + dynamicLightG / 4 + giLightG * GI_LightIntensity * 2.0
-                            var b = ambientLitB + dynamicLightB / 4 + giLightB * GI_LightIntensity * 2.0
-
-                            if (applyFog and fogMode) {
-                                val distance = inv_z_prime
-                                val fogFactor = ((distance - fogStartDistance) / fogRange).coerceIn(0.0, 1.0) * fogDensity
-
-                                r = r * (1 - fogFactor) + fogR * fogFactor
-                                g = g * (1 - fogFactor) + fogG * fogFactor
-                                b = b * (1 - fogFactor) + fogB * fogFactor
-                            }
-
-                            if (retroScanLineMode) {
-                                val screenCenterY = screenHeight / 2.0
-                                val screenCenterX = screenWidth / 2.0
-                                val distFromCenterY = (py - screenCenterY) / screenCenterY
-                                val distFromCenterX = (px - screenCenterX) / screenCenterX
-                                val distSquared = distFromCenterX * distFromCenterX + distFromCenterY * distFromCenterY
-                                val vignetteFactor = 1.0 - distSquared * 0.15
-
-                                r *= vignetteFactor
-                                g *= vignetteFactor
-                                b *= vignetteFactor
-
-                                val rShiftFactor = 1.0 + distSquared * 0.05
-                                val bShiftFactor = 1.0 + distSquared * 0.05
-                                val tempR = r * rShiftFactor
-                                val tempB = b * bShiftFactor
-                                val scanlineFactor = 0.80
-                                val bloomFactor = 1.05
-
-                                when (py % 3) {
-                                    0 -> {
-                                        r *= scanlineFactor; g *= scanlineFactor; b *= scanlineFactor
-                                    }
-                                    1 -> {
-                                        r *= bloomFactor; g *= bloomFactor; b *= bloomFactor
-                                    }
-                                }
-
-                                val noise = (Math.random() * 0.05) - 0.025
-                                r += noise; g += noise; b += noise
-
-                                r = tempR
-                                b = tempB
-                            }
-
-                            val finalR = (r * 255).toInt().coerceIn(0, 255)
-                            val finalG = (g * 255).toInt().coerceIn(0, 255)
-                            val finalB = (b * 255).toInt().coerceIn(0, 255)
-
-                            val isOpaque = texOpacity >= 1.0
-                            if (!isOpaque) {
-                                val srcAlpha = texOpacity
-                                val invSrcAlpha = 1.0 - srcAlpha
-
-                                for (s in 0 until samples) {
-                                    if ((coverageMask and (1 shl s)) != 0) {
-                                        val sx = if (useMSAA) msaaOffsetsX[s] else 0.5
-                                        val sy = if (useMSAA) msaaOffsetsY[s] else 0.5
-                                        val sZ = interpolated_z_px + z_dx * sx + z_dy * sy
-                                        val idx = (pixelIndex * 4) + s
-
-                                        if (sZ < msaaDepthBuffer[idx]) {
-                                            val dstColorInt = msaaColorBuffer[idx]
-                                            val dstR = (dstColorInt shr 16) and 0xFF
-                                            val dstG = (dstColorInt shr 8) and 0xFF
-                                            val dstB = dstColorInt and 0xFF
-
-                                            val blendedR = (finalR * srcAlpha + dstR * invSrcAlpha).toInt()
-                                            val blendedG = (finalG * srcAlpha + dstG * invSrcAlpha).toInt()
-                                            val blendedB = (finalB * srcAlpha + dstB * invSrcAlpha).toInt()
-
-                                            val blendedColor = (0xFF shl 24) or (blendedR shl 16) or (blendedG shl 8) or blendedB
-                                            msaaColorBuffer[idx] = blendedColor
-                                        }
-                                    }
-                                }
-                            } else {
-                                val finalColor = (0xFF shl 24) or (finalR shl 16) or (finalG shl 8) or finalB
-                                for (s in 0 until samples) {
-                                    if ((coverageMask and (1 shl s)) != 0) {
-                                        val sx = if (useMSAA) msaaOffsetsX[s] else 0.5
-                                        val sy = if (useMSAA) msaaOffsetsY[s] else 0.5
-                                        val sZ = interpolated_z_px + z_dx * sx + z_dy * sy
-                                        val idx = (pixelIndex * 4) + s
-                                        if (sZ < msaaDepthBuffer[idx]) {
-                                            msaaDepthBuffer[idx] = sZ
-                                            msaaColorBuffer[idx] = finalColor
-                                        }
+                        } else {
+                            val finalColor = (0xFF shl 24) or (finalR shl 16) or (finalG shl 8) or finalB
+                            for (s in 0 until samples) {
+                                if ((coverageMask and (1 shl s)) != 0) {
+                                    val sx = if (useMSAA) msaaOffsetsX[s] else 0.5
+                                    val sy = if (useMSAA) msaaOffsetsY[s] else 0.5
+                                    val sZ = interpolated_z_px + z_dx * sx + z_dy * sy
+                                    val idx = (pixelIndex * 4) + s
+                                    if (sZ < msaaDepthBuffer[idx]) {
+                                        msaaDepthBuffer[idx] = sZ
+                                        msaaColorBuffer[idx] = finalColor
                                     }
                                 }
                             }
                         }
+                    }
                 }
                 // Inkrementuj wartości dla następnego piksela w rzędzie
                 alpha_px += alpha_dx
@@ -3449,7 +3459,10 @@ class DrawingPanel : StackPane() {
             mesh.texture?.let { allKnownTextures.add(it) }
             allKnownTextures.addAll(mesh.faceTextures.values)
         }
-        allKnownTextures.forEach { getTexturePixels(it) }
+        allKnownTextures.forEach {
+            getTexturePixels(it)
+            isTextureTransparent(it)
+        }
         println("Texture cache warmed up for ${allKnownTextures.size} textures.")
     }
 
@@ -3488,6 +3501,13 @@ class DrawingPanel : StackPane() {
     private fun isTextureTransparent(texture: Image?): Boolean {
         if (texture == null) return false
         return textureTransparencyCache.computeIfAbsent(texture) {
+            val pixels = getTexturePixels(it)
+            if (pixels != null) {
+                for (pixel in pixels) {
+                    if ((pixel ushr 24) and 0xFF < 255) return@computeIfAbsent true
+                }
+                return@computeIfAbsent false
+            }
             val reader = it.pixelReader ?: return@computeIfAbsent false
             for (y in 0 until it.height.toInt()) {
                 for (x in 0 until it.width.toInt()) {
@@ -3500,6 +3520,13 @@ class DrawingPanel : StackPane() {
 
     private fun isTextureFullyTransparent(texture: Image?): Boolean {
         if (texture == null) return false
+        val pixels = getTexturePixels(texture)
+        if (pixels != null) {
+            for (pixel in pixels) {
+                if ((pixel ushr 24) and 0xFF >= 128) return false
+            }
+            return true
+        }
         val reader = texture.pixelReader ?: return false
         for (y in 0 until texture.height.toInt()) {
             for (x in 0 until texture.width.toInt()) {
