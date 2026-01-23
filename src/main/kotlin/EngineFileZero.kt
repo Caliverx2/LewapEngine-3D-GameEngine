@@ -996,10 +996,30 @@ class DrawingPanel : StackPane() {
 
         val isMovingHorizontally = pressedKeys.contains(KeyCode.W) || pressedKeys.contains(KeyCode.A) || pressedKeys.contains(KeyCode.S) || pressedKeys.contains(KeyCode.D)
 
-        // Zaawansowany system kolizji 3D z rampami i ścianami
-        val (resolvedPos, groundHit) = resolveCollisions(cameraPosition, newCameraPosition)
+        // Zaawansowany system kolizji 3D z rampami i ścianami (z sub-steppingiem)
+        val movementVector = newCameraPosition - cameraPosition
+        val movementLength = movementVector.length()
+        val collisionStepSize = playerVertexRadius * 0.5
 
-        cameraPosition = resolvedPos
+        var groundHit = false
+
+        if (movementLength > collisionStepSize) {
+            val steps = ceil(movementLength / collisionStepSize).toInt()
+            val stepIncrement = movementVector / steps.toDouble()
+            var currentPos = cameraPosition
+
+            for (i in 0 until steps) {
+                val nextTarget = currentPos + stepIncrement
+                val (resolved, ground) = resolveCollisions(currentPos, nextTarget)
+                currentPos = resolved
+                if (ground) groundHit = true
+            }
+            cameraPosition = currentPos
+        } else {
+            val (resolved, ground) = resolveCollisions(cameraPosition, newCameraPosition)
+            cameraPosition = resolved
+            groundHit = ground
+        }
 
         if (!debugFly && !isInGravityZone) {
             // Dodatkowe ograniczenie nieskończonej płaszczyzny „floorLevel”
