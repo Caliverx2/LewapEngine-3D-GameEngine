@@ -293,6 +293,11 @@ class MazePathfindingPanel : JPanel() {
         }
 
         path?.let {
+            for ((r, c) in it) {
+                g2d.color = Color(100, 70, 255, 150)
+                g2d.fillRect(c * cellSize, r * cellSize, cellSize, cellSize)
+            }
+
             for (i in 0 until agentPositionIndex.coerceAtMost(it.size)) {
                 val (r, c) = it[i]
                 g2d.color = Color(0, 150, 0, 150)
