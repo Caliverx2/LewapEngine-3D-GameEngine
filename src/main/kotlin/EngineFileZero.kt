@@ -109,11 +109,12 @@ class DrawingPanel : StackPane() {
     private val playerVertexRadius = 0.1 * cubeSize * (playerHitboxScale / baseHitboxScale)
     private lateinit var playerHitboxMesh: PlacedMesh
 
+    private val floorLevel = -3.4075 * cubeSize
+    private var cameraSpawnpoint = Vector3d(-2.5 * cubeSize, floorLevel + cubeSize, 1.5 * cubeSize)
     private var cameraPosition = Vector3d(0.0, 0.0, 0.0)
     private var cameraYaw = 2.4
     private var cameraPitch = 0.0
     private val baseFov = 90.0
-    private val floorLevel = -3.4075 * cubeSize
     private val dynamicFov = (baseFov / sqrt(playerHitboxScale / baseHitboxScale).coerceAtLeast(0.5)).coerceIn(60.0..120.0)
 
     private var fogMode = true
@@ -304,7 +305,7 @@ class DrawingPanel : StackPane() {
 
         children.addAll(imageView, overlayCanvas)
 
-        cameraPosition = Vector3d(-2.5 * cubeSize, floorLevel + cubeSize, 1.5 * cubeSize)
+        cameraPosition = cameraSpawnpoint
 
         val grids = listOf(GRID_1, GRID_2, GRID_3, GRID_4)
         for (x in 0 until gridDimension) {
