@@ -1,4 +1,4 @@
-package org.lewapnoob.JFrame
+package org.lewapnoob.FileZeroVoxelEditor
 
 import java.awt.AWTException
 import java.awt.BorderLayout
