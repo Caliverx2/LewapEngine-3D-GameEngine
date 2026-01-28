@@ -23,11 +23,14 @@ import java.awt.image.BufferedImage
 import javax.swing.BorderFactory
 import javax.swing.BoxLayout
 import javax.swing.JButton
+import javax.swing.JLabel
 import javax.swing.JFrame
 import javax.swing.JOptionPane
 import javax.swing.JPanel
 import javax.swing.JSlider
 import javax.swing.JTextField
+import javax.swing.JTextArea
+import javax.swing.JScrollPane
 import javax.swing.SwingUtilities
 import javax.swing.Timer
 import kotlin.math.cos
@@ -35,6 +38,10 @@ import kotlin.math.sin
 import kotlin.math.sqrt
 import kotlin.math.tan
 import javax.swing.JColorChooser
+import javax.swing.JToggleButton
+import javax.swing.ButtonGroup
+import kotlin.math.min
+import kotlin.math.max
 
 // Data class representing a 3D Voxel coordinate
 data class Voxel(val x: Int, val y: Int, val z: Int, val color: Int = Color.GREEN.rgb) {
@@ -178,12 +185,18 @@ class DemoDisplay : JPanel() {
     private fun handleSinglePress(keyCode: Int) {
         // Export
         if (keyCode == KeyEvent.VK_E) {
-            val data = voxels.joinToString(";") { "${it.x},${it.y},${it.z},${it.color};" }
-            println("=== EXPORTED MODEL ===")
-            println()
-            println(data)
-            println()
-            println("======================")
+            val data = voxels.joinToString("") {
+                val hex = String.format("#%06X", (0xFFFFFF and it.color))
+                ";${it.x},${it.y},${it.z},$hex;"
+            }
+            val textArea = JTextArea(data)
+            textArea.isEditable = false
+            textArea.lineWrap = true
+            textArea.wrapStyleWord = true
+            textArea.rows = 15
+            textArea.columns = 50
+            val scrollPane = JScrollPane(textArea)
+            JOptionPane.showMessageDialog(this, scrollPane, "Eksport Modelu", JOptionPane.INFORMATION_MESSAGE)
         }
         // Import
         if (keyCode == KeyEvent.VK_I) {
@@ -192,12 +205,19 @@ class DemoDisplay : JPanel() {
                 try {
                     voxels.clear()
                     input.split(";").forEach { part ->
+                        if (part.isBlank()) return@forEach
                         val coords = part.split(",")
                         if (coords.size >= 3) {
                             val x = coords[0].toInt()
                             val y = coords[1].toInt()
                             val z = coords[2].toInt()
-                            val c = if (coords.size > 3) coords[3].toInt() else Color.WHITE.rgb
+                            val c = if (coords.size > 3) {
+                                try {
+                                    Color.decode(coords[3]).rgb
+                                } catch (e: Exception) {
+                                    coords[3].toIntOrNull() ?: Color.WHITE.rgb
+                                }
+                            } else Color.WHITE.rgb
                             voxels.add(Voxel(x, y, z, c))
                         }
                     }
@@ -494,6 +514,12 @@ class DemoDisplay : JPanel() {
 class PaletteWindow(private val display: DemoDisplay) : JFrame("Paleta Barw") {
     private val historyPanel = JPanel(FlowLayout(FlowLayout.LEFT))
     private val historyColors = HashSet<Int>()
+    private val hexField = JTextField("#FFFFFF", 7)
+    
+    private enum class Tool { PENCIL, RECT_OUTLINE, RECT_FILLED }
+    private var currentTool = Tool.PENCIL
+    private var dragStart: Point? = null
+    private var dragEnd: Point? = null
 
     init {
         layout = BorderLayout()
@@ -523,17 +549,47 @@ class PaletteWindow(private val display: DemoDisplay) : JFrame("Paleta Barw") {
             val newColor = JColorChooser.showDialog(this, "Wybierz kolor voxela", Color(display.currentColor))
             if (newColor != null) {
                 display.currentColor = newColor.rgb
+                updateHexField(newColor.rgb)
             }
         }
 
+        val hexPanel = JPanel(FlowLayout(FlowLayout.CENTER))
+        hexPanel.add(JLabel("HEX:"))
+        hexPanel.add(hexField)
+        hexField.addActionListener {
+            try {
+                val c = Color.decode(hexField.text)
+                display.currentColor = c.rgb
+            } catch (e: Exception) {
+                JOptionPane.showMessageDialog(this, "Błędny format HEX!")
+            }
+        }
+
+        val selectionPanel = JPanel(GridLayout(2, 1))
+        selectionPanel.add(pickerBtn)
+        selectionPanel.add(hexPanel)
+
         val colorsContainer = JPanel(BorderLayout())
         colorsContainer.add(basicColorsPanel, BorderLayout.CENTER)
-        colorsContainer.add(pickerBtn, BorderLayout.SOUTH)
+        colorsContainer.add(selectionPanel, BorderLayout.SOUTH)
         colorsContainer.maximumSize = Dimension(340, 160)
 
         // 2.5 Grid Map Editor
         val gridPanel = JPanel(BorderLayout())
         gridPanel.border = BorderFactory.createTitledBorder("Mapa 2D (Edytor)")
+
+        val toolsPanel = JPanel(GridLayout(0, 1, 2, 2))
+        val toolGroup = ButtonGroup()
+        fun addTool(name: String, tool: Tool, selected: Boolean = false) {
+            val btn = JToggleButton(name, selected)
+            btn.addActionListener { currentTool = tool }
+            toolGroup.add(btn)
+            toolsPanel.add(btn)
+        }
+        addTool("Pędzel", Tool.PENCIL, true)
+        addTool("Ramka", Tool.RECT_OUTLINE)
+        addTool("Pełny", Tool.RECT_FILLED)
+        gridPanel.add(toolsPanel, BorderLayout.WEST)
 
         val ySlider = JSlider(JSlider.VERTICAL, -25, 25, 0)
         val yField = JTextField("0", 3)
@@ -543,29 +599,80 @@ class PaletteWindow(private val display: DemoDisplay) : JFrame("Paleta Barw") {
                 preferredSize = Dimension(220, 220)
                 background = Color.BLACK
                 val mouseHandler = object : MouseAdapter() {
-                    override fun mousePressed(e: MouseEvent) = handleInput(e)
-                    override fun mouseDragged(e: MouseEvent) = handleInput(e)
-                    private fun handleInput(e: MouseEvent) {
+                    override fun mousePressed(e: MouseEvent) {
                         val gridSize = 21
                         val cellW = width.toDouble() / gridSize
                         val cellH = height.toDouble() / gridSize
                         val col = (e.x / cellW).toInt()
                         val row = (e.y / cellH).toInt()
                         if (col in 0 until gridSize && row in 0 until gridSize) {
-                            val vx = 10 - col // Odwrócenie osi X
-                            val vz = row - 10
-                            val vy = ySlider.value
-                            val targetVoxel = Voxel(vx, vy, vz, display.currentColor)
-
-                            if (SwingUtilities.isLeftMouseButton(e)) { // Lewy przycisk (lub przeciągnięcie) - stawiaj/maluj
-                                display.voxels.remove(targetVoxel) // Usuń stary, jeśli istnieje, by zaktualizować kolor
-                                display.voxels.add(targetVoxel)    // Dodaj nowy z aktualnym kolorem
-                                display.onVoxelPlaced?.invoke(display.currentColor)
-                            } else if (SwingUtilities.isRightMouseButton(e)) { // Prawy przycisk (lub przeciągnięcie) - usuwaj
-                                display.voxels.remove(targetVoxel)
+                            dragStart = Point(col, row)
+                            dragEnd = Point(col, row)
+                            if (currentTool == Tool.PENCIL) {
+                                handlePencil(e, col, row)
                             }
                             repaint()
                         }
+                    }
+                    override fun mouseDragged(e: MouseEvent) {
+                        val gridSize = 21
+                        val cellW = width.toDouble() / gridSize
+                        val cellH = height.toDouble() / gridSize
+                        val col = (e.x / cellW).toInt().coerceIn(0, gridSize - 1)
+                        val row = (e.y / cellH).toInt().coerceIn(0, gridSize - 1)
+                        dragEnd = Point(col, row)
+                        if (currentTool == Tool.PENCIL) {
+                            handlePencil(e, col, row)
+                        }
+                        repaint()
+                    }
+                    override fun mouseReleased(e: MouseEvent) {
+                        if (currentTool != Tool.PENCIL && dragStart != null && dragEnd != null) {
+                            applyShape(e)
+                        }
+                        dragStart = null
+                        dragEnd = null
+                        repaint()
+                    }
+                    private fun handlePencil(e: MouseEvent, col: Int, row: Int) {
+                        val vx = 10 - col
+                        val vz = row - 10
+                        val vy = ySlider.value
+                        val targetVoxel = Voxel(vx, vy, vz, display.currentColor)
+                        if (SwingUtilities.isLeftMouseButton(e)) {
+                            display.voxels.remove(targetVoxel)
+                            display.voxels.add(targetVoxel)
+                            display.onVoxelPlaced?.invoke(display.currentColor)
+                        } else if (SwingUtilities.isRightMouseButton(e)) {
+                            display.voxels.remove(targetVoxel)
+                        }
+                    }
+                    private fun applyShape(e: MouseEvent) {
+                        val start = dragStart ?: return
+                        val end = dragEnd ?: return
+                        val minCol = min(start.x, end.x)
+                        val maxCol = max(start.x, end.x)
+                        val minRow = min(start.y, end.y)
+                        val maxRow = max(start.y, end.y)
+                        val vy = ySlider.value
+                        val isLeft = SwingUtilities.isLeftMouseButton(e)
+                        for (c in minCol..maxCol) {
+                            for (r in minRow..maxRow) {
+                                val isEdge = c == minCol || c == maxCol || r == minRow || r == maxRow
+                                if (currentTool == Tool.RECT_FILLED || (currentTool == Tool.RECT_OUTLINE && isEdge)) {
+                                    val vx = 10 - c
+                                    val vz = r - 10
+                                    val targetVoxel = Voxel(vx, vy, vz, display.currentColor)
+                                    if (isLeft) {
+                                        display.voxels.remove(targetVoxel)
+                                        display.voxels.add(targetVoxel)
+                                    } else {
+                                        display.voxels.remove(targetVoxel)
+                                    }
+                                }
+                            }
+                        }
+                        if (isLeft) display.onVoxelPlaced?.invoke(display.currentColor)
                     }
                 }
                 addMouseListener(mouseHandler)
@@ -594,6 +701,25 @@ class PaletteWindow(private val display: DemoDisplay) : JFrame("Paleta Barw") {
                 }
                 g.color = Color.WHITE
                 g.drawRect((10 * cellW).toInt(), (10 * cellH).toInt(), cellW.toInt(), cellH.toInt())
+                
+                if (currentTool != Tool.PENCIL && dragStart != null && dragEnd != null) {
+                    val start = dragStart!!
+                    val end = dragEnd!!
+                    val minCol = min(start.x, end.x)
+                    val maxCol = max(start.x, end.x)
+                    val minRow = min(start.y, end.y)
+                    val maxRow = max(start.y, end.y)
+                    val c = Color(display.currentColor)
+                    g.color = Color(c.red, c.green, c.blue, 128)
+                    for (col in minCol..maxCol) {
+                        for (row in minRow..maxRow) {
+                            val isEdge = col == minCol || col == maxCol || row == minRow || row == maxRow
+                            if (currentTool == Tool.RECT_FILLED || (currentTool == Tool.RECT_OUTLINE && isEdge)) {
+                                g.fillRect((col * cellW).toInt() + 1, (row * cellH).toInt() + 1, cellW.toInt() - 1, cellH.toInt() - 1)
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -633,6 +759,10 @@ class PaletteWindow(private val display: DemoDisplay) : JFrame("Paleta Barw") {
         pack()
     }
 
+    private fun updateHexField(rgb: Int) {
+        hexField.text = String.format("#%06X", (0xFFFFFF and rgb))
+    }
+
     fun addToHistory(rgb: Int) {
         if (!historyColors.contains(rgb)) {
             historyColors.add(rgb)
@@ -651,6 +781,7 @@ class PaletteWindow(private val display: DemoDisplay) : JFrame("Paleta Barw") {
         btn.isOpaque = true
         btn.addActionListener {
             display.currentColor = rgb
+            updateHexField(rgb)
         }
         return btn
     }
