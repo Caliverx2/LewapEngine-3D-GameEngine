@@ -25,6 +25,13 @@ class gridMap : JPanel() {
     private val radiusCollision = 0.3
     private val playerHeight = 1.8
 
+    private var debugNoclip = false
+    private var debugFly = false
+    private var velocityY = 0.0
+    private var isOnGround = false
+    private val gravity = 0.08
+    private val jumpStrength = 0.8
+
     private val gridMap = Array(baseCols + 1) { Array(baseRows + 1) { null as Color? } }
     private val zBuffer = Array(baseRows + 1) { DoubleArray(baseCols + 1) { Double.MAX_VALUE } }
 
@@ -922,7 +929,6 @@ class gridMap : JPanel() {
 
         var dx = 0.0
         var dz = 0.0
-        var dy = 0.0
 
         if (KeyEvent.VK_W in keys) {
             dx += speed * sin(yaw)
@@ -941,17 +947,76 @@ class gridMap : JPanel() {
             dz -= speed * sin(yaw)
         }
 
-        if (KeyEvent.VK_SPACE in keys) dy += speed
-        if (KeyEvent.VK_SHIFT in keys) dy -= speed
-
-        moveWithCollision(dx, dy, dz)
-
         if (KeyEvent.VK_LEFT in keys) yaw -= rotSpeed
         if (KeyEvent.VK_RIGHT in keys) yaw += rotSpeed
         if (KeyEvent.VK_UP in keys) pitch += rotSpeed
         if (KeyEvent.VK_DOWN in keys) pitch -= rotSpeed
 
         if (KeyEvent.VK_G in keys) println("camX: $camX, camY: $camY, camZ: $camZ, yaw: $yaw, pitch: $pitch, speed: $speed")
+
+        if (debugFly) {
+            // --- Tryb latania (Debug Fly) ---
+            // Wyłączamy grawitację, zachowujemy stare sterowanie Y
+            moveWithCollision(dx, 0.0, dz)
+
+            var dy = 0.0
+            if (KeyEvent.VK_SPACE in keys) dy += speed
+            if (KeyEvent.VK_SHIFT in keys) dy -= speed
+
+            // W trybie fly ignorujemy kolizje (proste przesuwanie)
+            camX += dx
+            camY += dy
+            camZ += dz
+            
+            // Resetujemy prędkość fizyczną, żeby nie "wystrzelić" po wyłączeniu trybu
+            velocityY = 0.0
+        } else {
+            // --- Tryb chodzenia (Grawitacja) ---
+            
+            // 1. Ruch poziomy z kolizjami (X i Z)
+            moveWithCollision(dx, 0.0, dz)
+
+            // 2. Skakanie (tylko gdy na ziemi)
+            if (KeyEvent.VK_SPACE in keys && isOnGround) {
+                velocityY = jumpStrength
+                isOnGround = false
+            }
+
+            // 3. Grawitacja
+            velocityY -= gravity
+            // Ograniczenie prędkości spadania (terminal velocity)
+            if (velocityY < -1.5) velocityY = -1.5
+
+            // 4. Aplikowanie ruchu pionowego z fizyką
+            val nextY = camY + velocityY
+            if (checkCollision(camX, nextY, camZ)) {
+                // Wykryto kolizję (podłoga lub sufit)
+                
+                // Przesuwamy się tak blisko przeszkody, jak to możliwe
+                var tempDy = 0.0
+                val sign = sign(velocityY)
+                val step = 0.05 // Precyzja dociągania do podłogi
+                
+                // Prosta pętla dociągająca
+                for (i in 0..20) { // Limit iteracji dla bezpieczeństwa
+                    if (!checkCollision(camX, camY + tempDy + sign * step, camZ)) {
+                        tempDy += sign * step
+                    } else {
+                        break
+                    }
+                }
+                camY += tempDy
+
+                // Jeśli spadaliśmy (velocityY < 0), to znaczy, że uderzyliśmy w podłogę
+                if (velocityY < 0) {
+                    isOnGround = true
+                }
+                velocityY = 0.0
+            } else {
+                camY += velocityY
+                isOnGround = false
+            }
+        }
     }
 
     private fun moveWithCollision(dx: Double, dy: Double, dz: Double) {
@@ -1033,6 +1098,7 @@ class gridMap : JPanel() {
     }
 
     private fun checkCollision(x: Double, y: Double, z: Double): Boolean {
+        if (debugNoclip) return false
         // Przeliczamy bounding box gracza na współrzędne bloków
         val minX = floor((x - radiusCollision) / cubeSize + 0.5).toInt()
         val maxX = floor((x + radiusCollision) / cubeSize + 0.5).toInt()
@@ -1066,6 +1132,15 @@ class gridMap : JPanel() {
             if (e?.keyCode == KeyEvent.VK_ESCAPE) {
                 isMouseCaptured = false
                 cursor = Cursor.getDefaultCursor()
+            }
+            
+            if (e?.keyCode == KeyEvent.VK_F) {
+                debugFly = !debugFly
+                println("DebugFly: $debugFly")
+            }
+            if (e?.keyCode == KeyEvent.VK_N) {
+                debugNoclip = !debugNoclip
+                println("debugNoclip: $debugNoclip")
             }
         }
 
