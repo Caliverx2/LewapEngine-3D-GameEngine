@@ -29,8 +29,8 @@ class gridMap : JPanel() {
     private var debugFly = false
     private var velocityY = 0.0
     private var isOnGround = false
-    private val gravity = 0.08
-    private val jumpStrength = 0.8
+    private val gravity = 0.2
+    private val jumpStrength = 1.2
 
     private val gridMap = Array(baseCols + 1) { Array(baseRows + 1) { null as Color? } }
     private val zBuffer = Array(baseRows + 1) { DoubleArray(baseCols + 1) { Double.MAX_VALUE } }
@@ -852,7 +852,7 @@ class gridMap : JPanel() {
         super.paintComponent(g)
         val g2d = g as Graphics2D
 
-        drawLine(0, 0, 4, 8)
+        //drawLine(0, 0, 4, 8)
 
         // Rysowanie zawartości gridMap (naszego ekranu)
         for (x in 0..baseCols) {
@@ -954,19 +954,16 @@ class gridMap : JPanel() {
 
         if (KeyEvent.VK_G in keys) println("camX: $camX, camY: $camY, camZ: $camZ, yaw: $yaw, pitch: $pitch, speed: $speed")
 
-        if (debugFly) {
-            // --- Tryb latania (Debug Fly) ---
+        if (debugFly || debugNoclip) {
+            // --- Tryb latania (Debug Fly / Noclip) ---
             // Wyłączamy grawitację, zachowujemy stare sterowanie Y
-            moveWithCollision(dx, 0.0, dz)
 
             var dy = 0.0
             if (KeyEvent.VK_SPACE in keys) dy += speed
             if (KeyEvent.VK_SHIFT in keys) dy -= speed
 
-            // W trybie fly ignorujemy kolizje (proste przesuwanie)
-            camX += dx
-            camY += dy
-            camZ += dz
+            // W trybie fly używamy kolizji (chyba że debugNoclip wyłączy je w checkCollision)
+            moveWithCollision(dx, dy, dz)
             
             // Resetujemy prędkość fizyczną, żeby nie "wystrzelić" po wyłączeniu trybu
             velocityY = 0.0
