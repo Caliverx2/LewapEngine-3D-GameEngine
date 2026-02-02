@@ -1,11 +1,16 @@
 package org.lewapnoob.gridMap
 
 import java.awt.*
+import java.awt.event.ComponentAdapter
+import java.awt.event.ComponentEvent
 import java.awt.event.KeyAdapter
 import java.awt.event.KeyEvent
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import java.awt.image.BufferedImage
+import java.awt.image.DataBufferInt
+import java.util.Arrays
+import java.util.Collections
 import javax.swing.*
 import kotlin.math.cos
 import kotlin.math.sin
@@ -16,7 +21,7 @@ import kotlin.math.sign
 import java.util.Random
 
 class gridMap : JPanel() {
-    private val downscale = 8
+    private val downscale = 10
     private val baseCols = 1920 / downscale
     private val baseRows = 1080 / downscale
     private val cellSize = downscale/2
@@ -29,10 +34,13 @@ class gridMap : JPanel() {
     private var debugFly = false
     private var velocityY = 0.0
     private var isOnGround = false
-    private val gravity = 0.2
-    private val jumpStrength = 1.2
+    private val gravity = 0.1
+    private val jumpStrength = 0.8
 
-    private val gridMap = Array(baseCols + 1) { Array(baseRows + 1) { null as Color? } }
+    private val imageWidth = baseCols + 1
+    private val displayImage = BufferedImage(imageWidth, baseRows + 1, BufferedImage.TYPE_INT_RGB)
+    private val pixels = (displayImage.raster.dataBuffer as DataBufferInt).data
+    private val backBuffer = IntArray(pixels.size)
     private val zBuffer = Array(baseRows + 1) { DoubleArray(baseCols + 1) { Double.MAX_VALUE } }
 
     // Odległość płaszczyzny przycinającej (near plane)
@@ -40,6 +48,7 @@ class gridMap : JPanel() {
 
     // --- 3D Structures ---
     data class Vector3d(var x: Double, var y: Double, var z: Double, var ao: Double = 1.0)
+    private fun Vector3d.copy(): Vector3d = Vector3d(x, y, z, ao)
     data class BlockPos(val x: Int, val y: Int, val z: Int)
 
     data class Triangle3d(
@@ -70,7 +79,6 @@ class gridMap : JPanel() {
         val width = 16
         val height = 64
         val depth = 16
-        // Przechowuje kolor kostki lub null (powietrze)
         val blocks = Array(width) { Array(height) { Array(depth) { null as Color? } } }
     }
 
@@ -78,11 +86,12 @@ class gridMap : JPanel() {
     private var renderDistance = 5
     private var seed = 6767
     private lateinit var noise: PerlinNoise
-    private var treeDensity = 0.004 // 2% szansy na drzewo na kratkę
+    private var treeDensity = 0.004 //procent na pojawienie sie drzewa
     private var lastChunkX = Int.MAX_VALUE
     private var lastChunkZ = Int.MAX_VALUE
 
     // Kamera
+    private val fov = 90.0
     private var camX = 0.0
     private var camY = 0.0
     private var camZ = 0.0
@@ -93,18 +102,25 @@ class gridMap : JPanel() {
         }
 
     // Zbiór aktualnie wciśniętych klawiszy
-    private val keys = mutableSetOf<Int>()
+    private val keys = Collections.synchronizedSet(mutableSetOf<Int>())
 
     // Obsługa myszki
     private var isMouseCaptured = false
+    private var isLeftMouseDown = false
+    private var isRightMouseDown = false
+    private var lastActionTime = 0L
+    private val actionDelay = 150 // Opóźnienie w ms (szybkość niszczenia)
     private val robot = try { Robot() } catch (e: AWTException) { null }
+    private var windowPos = Point(0, 0)
+    @Volatile private var running = true
 
-    var runTime: Timer? = null
+    // Cache dla obliczeń trygonometrycznych
+    private var cosYaw = 0.0
+    private var sinYaw = 0.0
+    private var cosPitch = 0.0
+    private var sinPitch = 0.0
 
-    // --- Tree Model ---
     private data class TreeVoxel(val x: Int, val y: Int, val z: Int, val color: Color)
-
-    // Model drzewa przekonwertowany do jednej linii
     private val treeModelData = ";2,4,2,#00FF00;;0,0,0,#5D2F0A;;-2,4,2,#00FF00;;-2,4,1,#00FF00;;-2,4,0,#00FF00;;-1,6,0,#00FF00;;-2,4,-1,#00FF00;;-2,4,-2,#00FF00;;0,5,-1,#00FF00;;0,5,0,#5D2F0A;;1,3,-2,#00FF00;;0,5,1,#00FF00;;1,3,-1,#00FF00;;1,3,0,#00FF00;;0,1,0,#5D2F0A;;1,3,1,#00FF00;;1,3,2,#00FF00;;-2,3,2,#00FF00;;-2,3,1,#00FF00;;-2,3,0,#00FF00;;-1,5,1,#00FF00;;-2,3,-1,#00FF00;;-1,5,0,#00FF00;;-2,3,-2,#00FF00;;-1,5,-1,#00FF00;;0,6,-1,#00FF00;;0,6,0,#00FF00;;0,6,1,#00FF00;;1,4,-2,#00FF00;;1,4,-1,#00FF00;;1,4,0,#00FF00;;0,2,0,#5D2F0A;;1,4,1,#00FF00;;1,4,2,#00FF00;;-1,4,2,#00FF00;;-1,4,1,#00FF00;;-1,4,0,#00FF00;;-1,4,-1,#00FF00;;-1,4,-2,#00FF00;;0,3,-2,#00FF00;;1,5,-1,#00FF00;;0,3,-1,#00FF00;;1,5,0,#00FF00;;0,3,0,#5D2F0A;;2,3,-2,#00FF00;;1,5,1,#00FF00;;2,3,-1,#00FF00;;0,3,1,#00FF00;;0,3,2,#00FF00;;2,3,0,#00FF00;;2,3,1,#00FF00;;-1,3,2,#00FF00;;2,3,2,#00FF00;;-1,3,1,#00FF00;;-1,3,0,#00FF00;;-1,3,-1,#00FF00;;-1,3,-2,#00FF00;;0,4,-2,#00FF00;;0,4,-1,#00FF00;;1,6,0,#00FF00;;0,4,0,#5D2F0A;;2,4,-2,#00FF00;;0,4,1,#00FF00;;2,4,-1,#00FF00;;2,4,0,#00FF00;;0,4,2,#00FF00;;2,4,1,#00FF00;"
     private val treeModel = parseTreeModel(treeModelData)
 
@@ -134,11 +150,16 @@ class gridMap : JPanel() {
         addMouseMotionListener(GridMouseMotionListener())
         isFocusable = true
 
+        addComponentListener(object : ComponentAdapter() {
+            override fun componentMoved(e: ComponentEvent?) {
+                if (isShowing) windowPos = locationOnScreen
+            }
+        })
+
         noise = PerlinNoise(seed)
 
         // Ustawiamy gracza na powierzchni (pobieramy wysokość terenu w punkcie 0,0)
         val spawnH = getTerrainHeight(0, 0)
-        // Ustawiamy kamerę tak, by była nad ziemią (index trawy + 2 bloki ~ wysokość głowy)
         camY = (spawnH + 2) * cubeSize - 10.0
 
         updateWorld()
@@ -384,22 +405,29 @@ class gridMap : JPanel() {
             }
 
             if (getBlock(x, y, z) != null) {
+                var updateX = x
+                var updateZ = z
+
                 if (place) {
                     if (!isPlayerInsideBlock(lastX, lastY, lastZ)) {
                         setBlock(lastX, lastY, lastZ, Color(0x6c3c0c)) // Kolor ziemi
+                        updateX = lastX
+                        updateZ = lastZ
+                    } else {
+                        return
                     }
                 } else {
                     setBlock(x, y, z, null)
                 }
 
-                // Optymalizacja: Aktualizujemy tylko chunk, w którym zaszła zmiana
-                val cx = if (lastX >= 0) lastX / 16 else (lastX + 1) / 16 - 1
-                val cz = if (lastZ >= 0) lastZ / 16 else (lastZ + 1) / 16 - 1
+                // Aktualizujemy tylko chunk, w którym zaszła zmiana
+                val cx = if (updateX >= 0) updateX / 16 else (updateX + 1) / 16 - 1
+                val cz = if (updateZ >= 0) updateZ / 16 else (updateZ + 1) / 16 - 1
                 updateChunkMesh(cx, cz)
 
                 // Jeśli blok jest na krawędzi chunka, aktualizujemy też sąsiada
-                val lx = lastX - cx * 16
-                val lz = lastZ - cz * 16
+                val lx = updateX - cx * 16
+                val lz = updateZ - cz * 16
                 if (lx == 0) updateChunkMesh(cx - 1, cz)
                 if (lx == 15) updateChunkMesh(cx + 1, cz)
                 if (lz == 0) updateChunkMesh(cx, cz - 1)
@@ -550,31 +578,52 @@ class gridMap : JPanel() {
         }
     }
 
-    private fun Vector3d.copy(): Vector3d = Vector3d(x, y, z, ao)
-
-    // Czyści gridMap (ekran)
+    // Czyści ekran
     private fun clearGrid() {
-        for (y in 0..baseRows) {
-            for (x in 0..baseCols) {
-                gridMap[x][y] = null
-                zBuffer[y][x] = Double.MAX_VALUE
-            }
+        val bgColor = Color(113, 144, 225).rgb
+        Arrays.fill(backBuffer, bgColor)
+        for (row in zBuffer) {
+            Arrays.fill(row, Double.MAX_VALUE)
         }
     }
 
     fun loop() {
-        runTime = Timer(33) { // ~30 FPS
-            clearGrid()
-            processInput() // Obsługa klawiatury w każdej klatce
-            updateWorld()
-            render3D()
-            repaint()
-        }
-        runTime?.start()
+        Thread {
+            var lastTime = System.nanoTime()
+            val nsPerTick = 1000000000.0 / 30.0 // TPS (Ticki fizyki na sekundę)
+            var delta = 0.0
+
+            while (running) {
+                val now = System.nanoTime()
+                delta += (now - lastTime) / nsPerTick
+                lastTime = now
+
+                if (delta > 10) delta = 10.0 // Zabezpieczenie przed "spiralą śmierci" przy dużym lagu
+
+                while (delta >= 1) {
+                    processInput()
+                    updateWorld()
+                    delta--
+                }
+
+                clearGrid()
+                render3D()
+
+                // Kopiujemy bufor renderowania do bufora wyświetlania (Double Buffering)
+                System.arraycopy(backBuffer, 0, pixels, 0, pixels.size)
+                repaint()
+            }
+        }.start()
     }
 
     private fun render3D() {
         val trianglesToRaster = mutableListOf<Triangle3d>()
+
+        // Obliczamy sin/cos raz na klatkę, zamiast dla każdego wierzchołka!
+        cosYaw = cos(yaw)
+        sinYaw = sin(yaw)
+        cosPitch = cos(pitch)
+        sinPitch = sin(pitch)
 
         val currentChunkX = floor(camX / 32.0).toInt()
         val currentChunkZ = floor(camZ / 32.0).toInt()
@@ -642,18 +691,14 @@ class gridMap : JPanel() {
         var z = v.z - camZ
 
         // Obrót Y (Yaw)
-        val cosY = cos(yaw)
-        val sinY = sin(yaw)
-        val x2 = x * cosY - z * sinY
-        val z2 = z * cosY + x * sinY
+        val x2 = x * cosYaw - z * sinYaw
+        val z2 = z * cosYaw + x * sinYaw
         x = x2
         z = z2
 
         // Obrót X (Pitch)
-        val cosP = cos(pitch)
-        val sinP = sin(pitch)
-        val y2 = y * cosP - z * sinP
-        val z3 = z * cosP + y * sinP
+        val y2 = y * cosPitch - z * sinPitch
+        val z3 = z * cosPitch + y * sinPitch
         y = y2
         z = z3
 
@@ -702,20 +747,20 @@ class gridMap : JPanel() {
         return Vector3d(x, y, z, ao)
     }
 
-    private fun project(v: Vector3d): Point {
-        val fov = 90.0 // Field of View / Focal Length
+    private fun project(v: Vector3d): Vector3d {
+        val localLenght = (baseCols / 2.0) / Math.tan(Math.toRadians(fov / 2.0))
         val zSafe = if (v.z == 0.0) 0.001 else v.z // Unikamy dzielenia przez 0
 
         // Perspektywa: x' = x / z
-        val px = (v.x * fov) / zSafe
+        val px = (v.x * localLenght) / zSafe
         // Odwracamy oś Y, ponieważ na ekranie Y rośnie w dół, a w świecie 3D w górę
-        val py = -(v.y * fov) / zSafe
+        val py = -(v.y * localLenght) / zSafe
 
         // Przesunięcie na środek ekranu (gridMapy)
         val screenX = px + (baseCols / 2)
         val screenY = py + (baseRows / 2)
 
-        return Point(screenX.toInt(), screenY.toInt())
+        return Vector3d(screenX, screenY, v.z)
     }
 
     private fun drawSelectionBox(block: BlockPos) {
@@ -764,24 +809,24 @@ class gridMap : JPanel() {
         rasterizeLine(proj1, proj2, v1.z, v2.z, color)
     }
 
-    private fun rasterizeLine(p1: Point, p2: Point, z1: Double, z2: Double, color: Color) {
-        var x0 = p1.x; var y0 = p1.y
-        val x1 = p2.x; val y1 = p2.y
+    private fun rasterizeLine(p1: Vector3d, p2: Vector3d, z1: Double, z2: Double, color: Color) {
+        var x0 = p1.x.toInt(); var y0 = p1.y.toInt()
+        val x1 = p2.x.toInt(); val y1 = p2.y.toInt()
         val dx = abs(x1 - x0); val dy = abs(y1 - y0)
         val sx = if (x0 < x1) 1 else -1
         val sy = if (y0 < y1) 1 else -1
         var err = dx - dy
 
-        val totalDist = sqrt(((x1 - p1.x) * (x1 - p1.x) + (y1 - p1.y) * (y1 - p1.y)).toDouble())
+        val totalDist = sqrt(((x1 - x0).toDouble() * (x1 - x0) + (y1 - y0).toDouble() * (y1 - y0)))
 
         while (true) {
             if (x0 in 0..baseCols && y0 in 0..baseRows) {
-                val currDist = sqrt(((x0 - p1.x) * (x0 - p1.x) + (y0 - p1.y) * (y0 - p1.y)).toDouble())
+                val currDist = sqrt(((x0 - p1.x.toInt()).toDouble() * (x0 - p1.x.toInt()) + (y0 - p1.y.toInt()).toDouble() * (y0 - p1.y.toInt())))
                 val t = if (totalDist == 0.0) 0.0 else currDist / totalDist
                 val z = z1 + t * (z2 - z1)
 
                 if (z < zBuffer[y0][x0]) {
-                    gridMap[x0][y0] = color
+                    backBuffer[y0 * imageWidth + x0] = color.rgb
                     zBuffer[y0][x0] = z
                 }
             }
@@ -793,18 +838,18 @@ class gridMap : JPanel() {
     }
 
     // Rasteryzacja trójkąta bezpośrednio do gridMap
-    private fun fillTriangle(p1: Point, p2: Point, p3: Point, v1: Vector3d, v2: Vector3d, v3: Vector3d, color: Color) {
+    private fun fillTriangle(p1: Vector3d, p2: Vector3d, p3: Vector3d, v1: Vector3d, v2: Vector3d, v3: Vector3d, color: Color) {
         // Bounding box
-        val minX = minOf(p1.x, p2.x, p3.x).coerceIn(0, baseCols)
-        val maxX = maxOf(p1.x, p2.x, p3.x).coerceIn(0, baseCols)
-        val minY = minOf(p1.y, p2.y, p3.y).coerceIn(0, baseRows)
-        val maxY = maxOf(p1.y, p2.y, p3.y).coerceIn(0, baseRows)
+        val minX = minOf(p1.x, p2.x, p3.x).toInt().coerceIn(0, baseCols)
+        val maxX = maxOf(p1.x, p2.x, p3.x).toInt().coerceIn(0, baseCols)
+        val minY = minOf(p1.y, p2.y, p3.y).toInt().coerceIn(0, baseRows)
+        val maxY = maxOf(p1.y, p2.y, p3.y).toInt().coerceIn(0, baseRows)
 
         // Optymalizacja: Obliczenia stałych dla trójkąta przed pętlą (unikamy liczenia tego per piksel)
-        val v0x = (p2.x - p1.x).toDouble()
-        val v0y = (p2.y - p1.y).toDouble()
-        val v1x = (p3.x - p1.x).toDouble()
-        val v1y = (p3.y - p1.y).toDouble()
+        val v0x = p2.x - p1.x
+        val v0y = p2.y - p1.y
+        val v1x = p3.x - p1.x
+        val v1y = p3.y - p1.y
 
         val d00 = v0x * v0x + v0y * v0y
         val d01 = v0x * v1x + v0y * v1y
@@ -817,8 +862,8 @@ class gridMap : JPanel() {
 
         for (y in minY..maxY) {
             for (x in minX..maxX) {
-                val v2x = (x - p1.x).toDouble()
-                val v2y = (y - p1.y).toDouble()
+                val v2x = (x + 0.5) - p1.x
+                val v2y = (y + 0.5) - p1.y
                 val d20 = v2x * v0x + v2y * v0y
                 val d21 = v2x * v1x + v2y * v1y
 
@@ -837,11 +882,11 @@ class gridMap : JPanel() {
                     // Z-Buffer Test: Rysujemy tylko jeśli nowy piksel jest bliżej niż obecny
                     if (depth < zBuffer[y][x]) {
                         zBuffer[y][x] = depth
-                        val finalColor = Color(
-                                (color.red * ao).toInt().coerceIn(0, 255),
-                                (color.green * ao).toInt().coerceIn(0, 255),
-                                (color.blue * ao).toInt().coerceIn(0, 255))
-                        gridMap[x][y] = finalColor
+                        val r = (color.red * ao).toInt().coerceIn(0, 255)
+                        val g = (color.green * ao).toInt().coerceIn(0, 255)
+                        val b = (color.blue * ao).toInt().coerceIn(0, 255)
+                        val rgb = (r shl 16) or (g shl 8) or b
+                        backBuffer[y * imageWidth + x] = rgb
                     }
                 }
             }
@@ -852,26 +897,8 @@ class gridMap : JPanel() {
         super.paintComponent(g)
         val g2d = g as Graphics2D
 
-        //drawLine(0, 0, 4, 8)
-
-        // Rysowanie zawartości gridMap (naszego ekranu)
-        for (x in 0..baseCols) {
-            for (y in 0..baseRows) {
-                val color = gridMap[x][y]
-                if (color != null) {
-                    g2d.color = color
-                    g2d.fillRect(x * cellSize, y * cellSize, cellSize, cellSize)
-                }
-            }
-        }
-
-        // Siatka (opcjonalnie, można wyłączyć dla lepszego efektu 3D)
-        for (x in 0..baseCols) {
-            for (y in 0..baseRows) {
-                g2d.color = Color(50, 50, 50) // Ciemniejsza siatka
-                g2d.drawRect(x * cellSize, y * cellSize, cellSize, cellSize)
-            }
-        }
+        // Rysowanie całego bufora obrazu naraz (skalowanie do rozmiaru okna)
+        g2d.drawImage(displayImage, 0, 0, width, height, null)
 
         g2d.color = Color.WHITE
         val crossSize = 5
@@ -910,7 +937,7 @@ class gridMap : JPanel() {
 
         while (true) {
             if (curX in 0..baseCols && curY in 0..baseRows) {
-                gridMap[curX][curY] = Color.RED
+                backBuffer[curY * imageWidth + curX] = Color.RED.rgb
             }
             if (curX == x1 && curY == y1) break
 
@@ -922,7 +949,7 @@ class gridMap : JPanel() {
 
     // Logika poruszania się na podstawie wciśniętych klawiszy
     private fun processInput() {
-        var speed = 0.8
+        var speed = 0.4
         val rotSpeed = 0.1
 
         if (KeyEvent.VK_CONTROL in keys) speed *= 2
@@ -952,7 +979,19 @@ class gridMap : JPanel() {
         if (KeyEvent.VK_UP in keys) pitch += rotSpeed
         if (KeyEvent.VK_DOWN in keys) pitch -= rotSpeed
 
-        if (KeyEvent.VK_G in keys) println("camX: $camX, camY: $camY, camZ: $camZ, yaw: $yaw, pitch: $pitch, speed: $speed")
+        if (KeyEvent.VK_G in keys) println("camX: ${(camX*10).toInt()/10.0}, camY: ${(camY*10).toInt()/10.0}, camZ: ${(camZ*10).toInt()/10.0}, yaw: ${(yaw*10).toInt()/10.0}, pitch: ${(pitch*10).toInt()/10.0}, speed: $speed")
+
+        // Obsługa ciągłego niszczenia/stawiania bloków
+        val currentTime = System.currentTimeMillis()
+        if (currentTime - lastActionTime > actionDelay) {
+            if (isLeftMouseDown) {
+                raycastAction(false)
+                lastActionTime = currentTime
+            } else if (isRightMouseDown) {
+                raycastAction(true)
+                lastActionTime = currentTime
+            }
+        }
 
         if (debugFly || debugNoclip) {
             // --- Tryb latania (Debug Fly / Noclip) ---
@@ -1131,11 +1170,11 @@ class gridMap : JPanel() {
                 cursor = Cursor.getDefaultCursor()
             }
             
-            if (e?.keyCode == KeyEvent.VK_F) {
+            if (e?.keyCode == KeyEvent.VK_NUMPAD9) {
                 debugFly = !debugFly
                 println("DebugFly: $debugFly")
             }
-            if (e?.keyCode == KeyEvent.VK_N) {
+            if (e?.keyCode == KeyEvent.VK_NUMPAD8) {
                 debugNoclip = !debugNoclip
                 println("debugNoclip: $debugNoclip")
             }
@@ -1154,18 +1193,32 @@ class gridMap : JPanel() {
                 val blankImage = BufferedImage(1, 1, BufferedImage.TYPE_INT_ARGB)
                 val blankCursor = Toolkit.getDefaultToolkit().createCustomCursor(blankImage, Point(0, 0), "blank")
                 cursor = blankCursor
+                if (isShowing) windowPos = locationOnScreen
             } else {
                 if (SwingUtilities.isLeftMouseButton(e)) {
-                    raycastAction(false)
+                    isLeftMouseDown = true
                 } else if (SwingUtilities.isRightMouseButton(e)) {
-                    raycastAction(true)
+                    isRightMouseDown = true
                 }
             }
+        }
+
+        override fun mouseReleased(e: MouseEvent) {
+            if (SwingUtilities.isLeftMouseButton(e)) isLeftMouseDown = false
+            if (SwingUtilities.isRightMouseButton(e)) isRightMouseDown = false
         }
     }
 
     private inner class GridMouseMotionListener : MouseAdapter() {
         override fun mouseMoved(e: MouseEvent) {
+            handleCameraLook(e)
+        }
+
+        override fun mouseDragged(e: MouseEvent) {
+            handleCameraLook(e)
+        }
+
+        private fun handleCameraLook(e: MouseEvent) {
             if (isMouseCaptured && isShowing) {
                 val centerX = width / 2
                 val centerY = height / 2
@@ -1181,8 +1234,7 @@ class gridMap : JPanel() {
                 pitch -= dy * sensitivity // Odwracamy oś Y dla naturalnego sterowania
 
                 // Centrujemy myszkę z powrotem
-                val loc = locationOnScreen
-                robot?.mouseMove(loc.x + centerX, loc.y + centerY)
+                robot?.mouseMove(windowPos.x + centerX, windowPos.y + centerY)
             }
         }
     }
@@ -1201,7 +1253,6 @@ class gridMap : JPanel() {
         }
 
         fun noise(x: Double, y: Double): Double {
-            // Poprawka: używamy floor() aby poprawnie obsługiwać ujemne współrzędne
             val xi = floor(x).toInt()
             val yi = floor(y).toInt()
 
