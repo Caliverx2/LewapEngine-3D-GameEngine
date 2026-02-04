@@ -31,6 +31,22 @@ class gridMap : JPanel() {
     private val radiusCollision = 0.3
     private val playerHeight = 1.8
 
+    // Kamera
+    private val fov = 90.0
+    private var camX = 0.0
+    private var camY = 0.0
+    private var camZ = 0.0
+    private var yaw = 0.0
+    private var pitch = 0.0
+        set(value) {
+            field = value.coerceIn(-Math.PI / 2, Math.PI / 2)
+        }
+    private var renderDistance = 5
+    private val radiusChunkRender = 1
+    private val speed = 0.3
+    private val rotationalSpeed = 0.1
+    private val sensitivity = 0.003
+
     private var debugNoclip = false
     private var debugFly = false
     private var showChunkBorders = false
@@ -59,9 +75,26 @@ class gridMap : JPanel() {
 
     // Scena 3D
     private val chunkMeshes = mutableMapOf<Point, Array<MutableList<Triangle3d>>>()
-    // Mapa przechowująca informację, czy dany segment (index 0-63) jest w pełni zabudowany (512 bloków)
-    private val chunkOcclusion = mutableMapOf<Point, BooleanArray>()
+    // Mapa przechowująca maskę bitową okluzji dla każdego segmentu (index 0-63)
+    // Bity: 1=West(X-), 2=East(X+), 4=Down(Y-), 8=Up(Y+), 16=North(Z-), 32=South(Z+)
+    private val chunkOcclusion = mutableMapOf<Point, ByteArray>()
+    
+    private val FACE_WEST = 1
+    private val FACE_EAST = 2
+    private val FACE_DOWN = 4
+    private val FACE_UP = 8
+    private val FACE_NORTH = 16
+    private val FACE_SOUTH = 32
+    private val SEGMENT_FULL = 63 // Wszystkie 6 ścian
+
     private val trianglesToRaster = mutableListOf<Triangle3d>()
+
+    // Cache widoczności (BFS)
+    private val cachedVisibleSegments = java.util.ArrayList<Triple<Int, Int, Int>>()
+    private var lastCamSecX = Int.MIN_VALUE
+    private var lastCamSecY = Int.MIN_VALUE
+    private var lastCamSecZ = Int.MIN_VALUE
+    private var visibilityGraphDirty = true
 
     // FPS Counter
     private var lastFpsTime = System.currentTimeMillis()
@@ -98,32 +131,16 @@ class gridMap : JPanel() {
     }
 
     private val chunks = mutableMapOf<Point, Chunk>()
-    private var renderDistance = 5
-    private val radiusChunkRender = 1
     private var seed = 6767
     private lateinit var caveNoise: PerlinNoise
     private lateinit var noise: PerlinNoise
     private var treeDensity = 0.004 //procent na pojawienie sie drzewa
     private var lastChunkX = Int.MAX_VALUE
     private var lastChunkZ = Int.MAX_VALUE
-    private val sensitivity = 0.003
-    private val speed = 0.4
-    private val rotationalSpeed = 0.1
 
     // System zapisu
     private val saveDir = File("saves/world1").apply { mkdirs() }
     private var lastAutoSaveTime = System.currentTimeMillis()
-
-    // Kamera
-    private val fov = 90.0
-    private var camX = 0.0
-    private var camY = 0.0
-    private var camZ = 0.0
-    private var yaw = 0.0
-    private var pitch = 0.0
-        set(value) {
-            field = value.coerceIn(-Math.PI / 2, Math.PI / 2)
-        }
 
     // Zbiór aktualnie wciśniętych klawiszy
     private val keys = Collections.synchronizedSet(mutableSetOf<Int>())
@@ -704,8 +721,69 @@ class gridMap : JPanel() {
             }
         }
         chunkMeshes[Point(cx, cz)] = sections
-        // Segment jest "okluderem" tylko jeśli jest w pełni wypełniony (8*8*8 = 512 bloków)
-        chunkOcclusion[Point(cx, cz)] = BooleanArray(64) { blockCounts[it] == 512 }
+        // Obliczamy maskę okluzji dla każdego segmentu (czy ściany są pełne)
+        chunkOcclusion[Point(cx, cz)] = calculateOcclusionMasks(chunk, blockCounts)
+        visibilityGraphDirty = true
+    }
+
+    private fun calculateOcclusionMasks(chunk: Chunk, blockCounts: IntArray): ByteArray {
+        val occlusion = ByteArray(64)
+
+        for (i in 0 until 64) {
+            // Jeśli segment jest pusty, na pewno nie zasłania nic
+            if (blockCounts[i] == 0) continue
+            // Jeśli segment jest pełny (512), to wszystkie ściany są pełne
+            if (blockCounts[i] == 512) {
+                occlusion[i] = SEGMENT_FULL.toByte()
+                continue
+            }
+
+            // Dekodujemy pozycję sekcji
+            val secY = i / 4
+            val rem = i % 4
+            val secZ = rem / 2
+            val secX = rem % 2
+
+            val baseX = secX * 8
+            val baseY = secY * 8
+            val baseZ = secZ * 8
+
+            var mask = 0
+
+            // Sprawdzamy 6 ścian segmentu 8x8x8
+            // 1. West (X=0)
+            var solid = true
+            for (y in 0..7) for (z in 0..7) if (chunk.getBlock(baseX, baseY + y, baseZ + z) == 0) { solid = false; break }
+            if (solid) mask = mask or FACE_WEST
+
+            // 2. East (X=7)
+            solid = true
+            for (y in 0..7) for (z in 0..7) if (chunk.getBlock(baseX + 7, baseY + y, baseZ + z) == 0) { solid = false; break }
+            if (solid) mask = mask or FACE_EAST
+
+            // 3. Down (Y=0)
+            solid = true
+            for (x in 0..7) for (z in 0..7) if (chunk.getBlock(baseX + x, baseY, baseZ + z) == 0) { solid = false; break }
+            if (solid) mask = mask or FACE_DOWN
+
+            // 4. Up (Y=7)
+            solid = true
+            for (x in 0..7) for (z in 0..7) if (chunk.getBlock(baseX + x, baseY + 7, baseZ + z) == 0) { solid = false; break }
+            if (solid) mask = mask or FACE_UP
+
+            // 5. North (Z=0)
+            solid = true
+            for (x in 0..7) for (y in 0..7) if (chunk.getBlock(baseX + x, baseY + y, baseZ) == 0) { solid = false; break }
+            if (solid) mask = mask or FACE_NORTH
+
+            // 6. South (Z=7)
+            solid = true
+            for (x in 0..7) for (y in 0..7) if (chunk.getBlock(baseX + x, baseY + y, baseZ + 7) == 0) { solid = false; break }
+            if (solid) mask = mask or FACE_SOUTH
+
+            occlusion[i] = mask.toByte()
+        }
+        return occlusion
     }
 
     private fun addFace(target: MutableList<Triangle3d>, wx: Int, wy: Int, wz: Int, x: Double, y: Double, z: Double, faceType: Int, c: Color) {
@@ -847,6 +925,73 @@ class gridMap : JPanel() {
         }.start()
     }
 
+    private fun rebuildVisibilityGraph(startSecX: Int, startSecY: Int, startSecZ: Int) {
+        cachedVisibleSegments.clear()
+
+        val queue = java.util.ArrayDeque<Triple<Int, Int, Int>>()
+        val visited = java.util.HashSet<Triple<Int, Int, Int>>()
+
+        val startNode = Triple(startSecX, startSecY, startSecZ)
+        queue.add(startNode)
+        visited.add(startNode)
+
+        val maxRadius = renderDistance * 2
+        // Kierunki i odpowiadające im bity ścian:
+        // Triple(dx, dy, dz), ExitBit (z obecnego), EntryBit (do sąsiada)
+        val dirs = arrayOf(
+            Triple(Triple(0, 0, -1), FACE_NORTH, FACE_SOUTH), // Z-
+            Triple(Triple(0, 0, 1), FACE_SOUTH, FACE_NORTH),  // Z+
+            Triple(Triple(-1, 0, 0), FACE_WEST, FACE_EAST),   // X-
+            Triple(Triple(1, 0, 0), FACE_EAST, FACE_WEST),    // X+
+            Triple(Triple(0, 1, 0), FACE_UP, FACE_DOWN),      // Y+
+            Triple(Triple(0, -1, 0), FACE_DOWN, FACE_UP)      // Y-
+        )
+
+        while (!queue.isEmpty()) {
+            val current = queue.poll()
+            val (currX, currY, currZ) = current
+
+            // Optymalizacja: Dodajemy do listy renderowania TYLKO jeśli segment ma geometrię.
+            // Puste segmenty (powietrze) są odwiedzane przez BFS, ale nie muszą być rysowane.
+            if (!isSegmentEmptyBySec(currX, currY, currZ)) {
+                cachedVisibleSegments.add(current)
+            }
+
+            // Pobieramy maskę okluzji obecnego segmentu
+            val currMask = getSegmentOcclusionMask(currX, currY, currZ)
+
+            for ((dir, exitBit, entryBit) in dirs) {
+                val nx = currX + dir.first
+                val ny = currY + dir.second
+                val nz = currZ + dir.third
+
+                if (ny < 0 || ny > 15) continue
+                if (abs(nx - startSecX) > maxRadius || abs(nz - startSecZ) > maxRadius) continue
+
+                // 1. Sprawdzamy czy możemy wyjść z obecnego segmentu w tym kierunku
+                // Jeśli ściana wyjściowa jest pełna, a my nie jesteśmy wewnątrz niej (kamera), to nie widzimy przez nią.
+                // Wyjątek: Jesteśmy w segmencie startowym (kamera może być wewnątrz bloku/ściany).
+                if ((currMask.toInt() and exitBit) != 0 && (currX != startSecX || currY != startSecY || currZ != startSecZ)) {
+                    continue
+                }
+
+                // 2. Sprawdzamy czy możemy wejść do sąsiada
+                val neighborMask = getSegmentOcclusionMask(nx, ny, nz)
+                // Jeśli ściana wejściowa sąsiada jest pełna -> Widzimy tę ścianę (dodajemy do kolejki/listy),
+                // ale NIE widzimy nic za nią (nie propagujemy dalej BFS w tym kierunku).
+                // Ale musimy dodać sąsiada do visited/queue, żeby został narysowany.
+                // W BFS "queue" służy do propagacji. Jeśli tu zablokujemy, to sąsiad zostanie dodany,
+                // ale w następnej iteracji pętli while, "currMask" (którym będzie ten sąsiad) zablokuje wyjście (krok 1 powyżej).
+                // Więc po prostu dodajemy do kolejki. Logika "ExitBit" w następnym kroku załatwi sprawę zatrzymania.
+
+                val neighbor = Triple(nx, ny, nz)
+                if (visited.add(neighbor)) {
+                    queue.add(neighbor)
+                }
+            }
+        }
+    }
+
     private fun render3D() {
         trianglesToRaster.clear()
 
@@ -856,97 +1001,58 @@ class gridMap : JPanel() {
         cosPitch = cos(pitch)
         sinPitch = sin(pitch)
 
-        val currentChunkX = floor(camX / 32.0).toInt()
-        val currentChunkZ = floor(camZ / 32.0).toInt()
+        val segmentSize = 8 * cubeSize
+        // Pozycja kamery w koordynatach segmentów
+        val camSecX = floor(camX / segmentSize).toInt()
+        val camSecY = floor((camY + 10.0) / segmentSize).toInt()
+        val camSecZ = floor(camZ / segmentSize).toInt()
 
-        // Iterujemy tylko po widocznych chunkach
-        for (cx in currentChunkX - renderDistance..currentChunkX + renderDistance) {
-            for (cz in currentChunkZ - renderDistance..currentChunkZ + renderDistance) {
-                val mesh = chunkMeshes[Point(cx, cz)] ?: continue
-                // Iterujemy po 64 sekcjach (8x8x8)
-                for (i in 0 until 64) {
-                    val sectionTriangles = mesh[i]
-                    if (sectionTriangles.isEmpty()) continue
+        // Aktualizacja grafu widoczności tylko gdy zmienimy segment lub świat się zmieni
+        if (visibilityGraphDirty || camSecX != lastCamSecX || camSecY != lastCamSecY || camSecZ != lastCamSecZ) {
+            rebuildVisibilityGraph(camSecX, camSecY, camSecZ)
+            lastCamSecX = camSecX
+            lastCamSecY = camSecY
+            lastCamSecZ = camSecZ
+            visibilityGraphDirty = false
+        }
 
-                    // Dekodujemy indeks z powrotem na XYZ
-                    val secY = i / 4
-                    val rem = i % 4
-                    val secZ = rem / 2
-                    val secX = rem % 2
+        // Iterujemy po wcześniej obliczonych widocznych segmentach
+        for (i in cachedVisibleSegments.indices) {
+            val (currX, currY, currZ) = cachedVisibleSegments[i]
 
-                    // Frustum Culling: Sprawdzamy czy sekcja jest widoczna
-                    if (!isSectionVisible(cx, secX, secY, secZ, cz)) continue
+            // Konwersja globalnych współrzędnych segmentu na Chunk + Local Segment
+            val cx = if (currX >= 0) currX / 2 else (currX + 1) / 2 - 1
+            val cz = if (currZ >= 0) currZ / 2 else (currZ + 1) / 2 - 1
+            val secX = abs(currX % 2)
+            val secY = currY
+            val secZ = abs(currZ % 2)
 
-                    // --- OCCLUSION CULLING (Raycast) ---
-                    // Obliczamy środek sekcji w świecie
-                    val centerX = (cx * 16 + secX * 8 + 4) * cubeSize
-                    val centerY = (secY * 8 + 4) * cubeSize - 10.0
-                    val centerZ = (cz * 16 + secZ * 8 + 4) * cubeSize
+            val mesh = chunkMeshes[Point(cx, cz)]
+            if (mesh != null) {
+                val index = secY * 4 + secZ * 2 + secX
+                if (index in 0 until 64) {
+                    val sectionTriangles = mesh[index]
+                    if (sectionTriangles.isNotEmpty()) {
+                        // Sprawdzamy Frustum Culling (czy segment jest w kadrze kamery)
+                        if (isSectionVisible(cx, secX, secY, secZ, cz)) {
+                            for (tri in sectionTriangles) {
+                                val t1 = transform(tri.p1)
+                                val t2 = transform(tri.p2)
+                                val t3 = transform(tri.p3)
 
-                    val vecX = centerX - camX
-                    val vecY = centerY - camY
-                    val vecZ = centerZ - camZ
-                    val distToCenter = sqrt(vecX * vecX + vecY * vecY + vecZ * vecZ)
+                                val line1 = Vector3d(t2.x - t1.x, t2.y - t1.y, t2.z - t1.z)
+                                val line2 = Vector3d(t3.x - t1.x, t3.y - t1.y, t3.z - t1.z)
 
-                    // Sprawdzamy okluzję tylko dla obiektów oddalonych o min. 20 jednostek (żeby nie znikały blisko gracza)
-                    if (distToCenter > 20.0) {
-                        // Strzelamy w środek.
-                        if (fastRaycastHit(camX, camY, camZ, vecX / distToCenter, vecY / distToCenter, vecZ / distToCenter, distToCenter)) {
-                            // Środek jest zasłonięty. Sprawdzamy czy CHOCIAŻ JEDEN z 8 narożników jest widoczny.
-                            // Jeśli tak, renderujemy segment (oznacza to, że wystaje zza przeszkody).
-                            var anyCornerVisible = false
-                            
-                            // Granice segmentu w świecie 3D
-                            val minX = (cx * 16 + secX * 8) * cubeSize
-                            val maxX = (cx * 16 + (secX + 1) * 8) * cubeSize
-                            val minY = (secY * 8) * cubeSize - 10.0
-                            val maxY = ((secY + 1) * 8) * cubeSize - 10.0
-                            val minZ = (cz * 16 + secZ * 8) * cubeSize
-                            val maxZ = (cz * 16 + (secZ + 1) * 8) * cubeSize
+                                val normal = Vector3d(
+                                    line1.y * line2.z - line1.z * line2.y,
+                                    line1.z * line2.x - line1.x * line2.z,
+                                    line1.x * line2.y - line1.y * line2.x
+                                )
 
-                            // Margines na zewnątrz (expansion), aby punkty wychodziły poza obrys segmentu (w powietrze)
-                            val expansion = cubeSize * 0.1
-
-                            // Sprawdzamy 8 rogów
-                            for (k in 0 until 8) {
-                                val px = (if (k % 2 == 0) minX else maxX) + (if (k % 2 == 0) -expansion else expansion)
-                                val py = (if ((k / 2) % 2 == 0) minY else maxY) + (if ((k / 2) % 2 == 0) -expansion else expansion)
-                                val pz = (if (k / 4 == 0) minZ else maxZ) + (if (k / 4 == 0) -expansion else expansion)
-
-                                val vx = px - camX; val vy = py - camY; val vz = pz - camZ
-                                val dist = sqrt(vx * vx + vy * vy + vz * vz)
-
-                                // Używamy pełnego dystansu do punktu w powietrzu
-                                if (!fastRaycastHit(camX, camY, camZ, vx / dist, vy / dist, vz / dist, dist)) {
-                                    anyCornerVisible = true
-                                    break // Znaleźliśmy widoczny fragment, nie musimy szukać dalej!
+                                if (t1.x * normal.x + t1.y * normal.y + t1.z * normal.z > 0) {
+                                    trianglesToRaster.add(Triangle3d(t1, t2, t3, tri.color))
                                 }
                             }
-
-                            // Jeśli żaden róg ani środek nie są widoczne -> pomijamy render
-                            if (!anyCornerVisible) continue
-                        }
-                    }
-
-                    for (tri in sectionTriangles) {
-                        // Kopia wierzchołków do transformacji
-                        val t1 = transform(tri.p1)
-                        val t2 = transform(tri.p2)
-                        val t3 = transform(tri.p3)
-
-                        // Back-face Culling (Odrzucanie tylnych ścianek)
-                        val line1 = Vector3d(t2.x - t1.x, t2.y - t1.y, t2.z - t1.z)
-                        val line2 = Vector3d(t3.x - t1.x, t3.y - t1.y, t3.z - t1.z)
-
-                        val normal = Vector3d(
-                            line1.y * line2.z - line1.z * line2.y,
-                            line1.z * line2.x - line1.x * line2.z,
-                            line1.x * line2.y - line1.y * line2.x
-                        )
-
-                        // Dot product > 0 oznacza, że ściana jest zwrócona do kamery
-                        if (t1.x * normal.x + t1.y * normal.y + t1.z * normal.z > 0) {
-                            trianglesToRaster.add(Triangle3d(t1, t2, t3, tri.color))
                         }
                     }
                 }
@@ -975,6 +1081,12 @@ class gridMap : JPanel() {
         if (target != null) {
             drawSelectionBox(target)
         }
+    }
+
+    private fun checkPointOcclusion(px: Double, py: Double, pz: Double, cx: Double, cy: Double, cz: Double, targetSecX: Int, targetSecY: Int, targetSecZ: Int): Boolean {
+        val vx = px - cx; val vy = py - cy; val vz = pz - cz
+        val dist = sqrt(vx * vx + vy * vy + vz * vz)
+        return fastSegmentRaycast(cx, cy, cz, vx / dist, vy / dist, vz / dist, dist, targetSecX, targetSecY, targetSecZ)
     }
 
     // Szybki Raycast sprawdzający tylko czy trafiliśmy w jakikolwiek blok na drodze
@@ -1032,15 +1144,93 @@ class gridMap : JPanel() {
         }
     }
 
-    private fun isSegmentOccluder(x: Int, y: Int, z: Int): Boolean {
-        if (y < 0 || y >= 128) return false
-        val cx = if (x >= 0) x / 16 else (x + 1) / 16 - 1
-        val cz = if (z >= 0) z / 16 else (z + 1) / 16 - 1
-        
-        val occlusionData = chunkOcclusion[Point(cx, cz)] ?: return false
+    // Bardzo szybki Raycast działający na siatce segmentów (8x8x8), a nie bloków.
+    // Ignoruje drzewa i małe przeszkody. Zatrzymuje się tylko na pełnych segmentach (Occluderach).
+    private fun fastSegmentRaycast(startX: Double, startY: Double, startZ: Double, dirX: Double, dirY: Double, dirZ: Double, maxDist: Double, targetSecX: Int, targetSecY: Int, targetSecZ: Int): Boolean {
+        val segmentSize = 8 * cubeSize // 16.0
 
-        val index = calculateSectionIndex(x, y, z)
+        // Start w przestrzeni segmentów
+        var x = floor(startX / segmentSize).toInt()
+        var y = floor((startY + 10.0) / segmentSize).toInt()
+        var z = floor(startZ / segmentSize).toInt()
+
+        val stepX = if (dirX > 0) 1 else -1
+        val stepY = if (dirY > 0) 1 else -1
+        val stepZ = if (dirZ > 0) 1 else -1
+
+        val tDeltaX = if (dirX == 0.0) Double.MAX_VALUE else abs(1.0 / dirX)
+        val tDeltaY = if (dirY == 0.0) Double.MAX_VALUE else abs(1.0 / dirY)
+        val tDeltaZ = if (dirZ == 0.0) Double.MAX_VALUE else abs(1.0 / dirZ)
+
+        val gridX = startX / segmentSize
+        val gridY = (startY + 10.0) / segmentSize
+        val gridZ = startZ / segmentSize
+
+        val distX = if (stepX > 0) (floor(gridX) + 1.0 - gridX) else (gridX - floor(gridX))
+        val distY = if (stepY > 0) (floor(gridY) + 1.0 - gridY) else (gridY - floor(gridY))
+        val distZ = if (stepZ > 0) (floor(gridZ) + 1.0 - gridZ) else (gridZ - floor(gridZ))
+
+        var tMaxX = if (dirX == 0.0) Double.MAX_VALUE else abs(distX) * tDeltaX
+        var tMaxY = if (dirY == 0.0) Double.MAX_VALUE else abs(distY) * tDeltaY
+        var tMaxZ = if (dirZ == 0.0) Double.MAX_VALUE else abs(distZ) * tDeltaZ
+
+        val maxT = maxDist / segmentSize
+
+        while (true) {
+            if (minOf(tMaxX, tMaxY, tMaxZ) > maxT) return false // Dolatujemy do celu bez przeszkód
+
+            if (tMaxX < tMaxY) {
+                if (tMaxX < tMaxZ) { x += stepX; tMaxX += tDeltaX } else { z += stepZ; tMaxZ += tDeltaZ }
+            } else {
+                if (tMaxY < tMaxZ) { y += stepY; tMaxY += tDeltaY } else { z += stepZ; tMaxZ += tDeltaZ }
+            }
+
+            // Jeśli dotarliśmy do segmentu docelowego -> Widoczny
+            if (x == targetSecX && y == targetSecY && z == targetSecZ) return false
+
+            // Sprawdzamy czy segment jest pełny (Occluder)
+            if (isSegmentEmptyBySec(x, y, z)) {
+                return true // Trafiliśmy w ścianę
+            }
+        }
+    }
+
+    // Pobiera maskę okluzji (Byte)
+    private fun getSegmentOcclusionMask(secX: Int, secY: Int, secZ: Int): Byte {
+        if (secY < 0 || secY > 15) return 0
+        // Konwersja globalnych segmentów na Chunk + Local Segment
+        val cx = if (secX >= 0) secX / 2 else (secX + 1) / 2 - 1
+        val cz = if (secZ >= 0) secZ / 2 else (secZ + 1) / 2 - 1
+
+        val occlusionData = chunkOcclusion[Point(cx, cz)] ?: return 0
+
+        val localSecX = abs(secX % 2) // % 2 może zwrócić -1 dla ujemnych, więc abs
+        val localSecZ = abs(secZ % 2)
+        val index = secY * 4 + localSecZ * 2 + localSecX
         return occlusionData[index]
+    }
+
+    private fun isSegmentOccluder(x: Int, y: Int, z: Int): Boolean {
+        // Używane przez Raycast - uznajemy za okluder tylko jeśli WSZYSTKIE ściany są pełne (lub wewnątrz jest pełno)
+        // Można to ulepszyć, ale dla raycastu "fast skip" wystarczy sprawdzenie flagi FULL (63)
+        val secX = floor(x / 8.0).toInt()
+        val secY = floor((y + 10.0) / 8.0).toInt()
+        val secZ = floor(z / 8.0).toInt()
+        val mask = getSegmentOcclusionMask(secX, secY, secZ)
+        return mask == SEGMENT_FULL.toByte()
+    }
+
+    private fun isSegmentEmptyBySec(secX: Int, secY: Int, secZ: Int): Boolean {
+        if (secY < 0 || secY > 15) return true
+        val cx = if (secX >= 0) secX / 2 else (secX + 1) / 2 - 1
+        val cz = if (secZ >= 0) secZ / 2 else (secZ + 1) / 2 - 1
+
+        val mesh = chunkMeshes[Point(cx, cz)] ?: return true
+
+        val localSecX = abs(secX % 2)
+        val localSecZ = abs(secZ % 2)
+        val index = secY * 4 + localSecZ * 2 + localSecX
+        return mesh[index].isEmpty()
     }
 
     private fun calculateSectionIndex(x: Int, y: Int, z: Int): Int {
@@ -1379,7 +1569,6 @@ class gridMap : JPanel() {
         val minY = minOf(p1.y, p2.y, p3.y).toInt().coerceIn(0, baseRows)
         val maxY = maxOf(p1.y, p2.y, p3.y).toInt().coerceIn(0, baseRows)
 
-        // Optymalizacja: Obliczenia stałych dla trójkąta przed pętlą (unikamy liczenia tego per piksel)
         val v0x = p2.x - p1.x
         val v0y = p2.y - p1.y
         val v1x = p3.x - p1.x
@@ -1390,26 +1579,54 @@ class gridMap : JPanel() {
         val d11 = v1x * v1x + v1y * v1y
 
         val denom = d00 * d11 - d01 * d01
-        if (denom == 0.0) return
+        if (abs(denom) < 1e-9) return
 
         val invDenom = 1.0 / denom
 
+        // Funkcja pomocnicza do obliczenia V i W w konkretnym punkcie
+        fun getBarycentric(px: Double, py: Double): Pair<Double, Double> {
+            val v2x = px - p1.x
+            val v2y = py - p1.y
+            val d20 = v2x * v0x + v2y * v0y
+            val d21 = v2x * v1x + v2y * v1y
+            val v = (d11 * d20 - d01 * d21) * invDenom
+            val w = (d00 * d21 - d01 * d20) * invDenom
+            return Pair(v, w)
+        }
+
+        // 1. Obliczamy wartości początkowe dla lewego górnego rogu (minX, minY) + 0.5 (środek piksela)
+        val startX = minX + 0.5
+        val startY = minY + 0.5
+        val (vStart, wStart) = getBarycentric(startX, startY)
+
+        // 2. Obliczamy o ile zmieniają się V i W przy ruchu o 1 piksel w prawo (DX) i w dół (DY)
+        // Dzięki liniowości barycentrycznej, te wartości są stałe dla całego trójkąta!
+        val (vNextX, wNextX) = getBarycentric(startX + 1.0, startY)
+        val (vNextY, wNextY) = getBarycentric(startX, startY + 1.0)
+
+        val dvdx = vNextX - vStart
+        val dwdx = wNextX - wStart
+        val dvdy = vNextY - vStart
+        val dwdy = wNextY - wStart
+
+        // Zmienne robocze dla wierszy
+        var rowV = vStart
+        var rowW = wStart
+
         for (y in minY..maxY) {
+            var v = rowV
+            var w = rowW
+            
+            // Indeks w tablicy pikseli (optymalizacja dostępu do tablicy)
+            var pixelIndex = y * imageWidth + minX
+
             for (x in minX..maxX) {
-                val v2x = (x + 0.5) - p1.x
-                val v2y = (y + 0.5) - p1.y
-                val d20 = v2x * v0x + v2y * v0y
-                val d21 = v2x * v1x + v2y * v1y
-
-                val v = (d11 * d20 - d01 * d21) * invDenom
-                val w = (d00 * d21 - d01 * d20) * invDenom
-                val u = 1.0 - v - w
-
                 // Dodajemy mały margines błędu (epsilon), aby uniknąć "dziur" na łączeniach trójkątów
-                if (u >= -0.001 && v >= -0.001 && w >= -0.001) {
+                // u = 1 - v - w, więc warunek u >= 0 to v + w <= 1
+                if (v >= -0.001 && w >= -0.001 && (v + w) <= 1.001) {
+                    val u = 1.0 - v - w
+                    
                     // Interpolacja głębokości (Z) i AO dla danego piksela
-                    // UWAGA: To jest interpolacja liniowa w przestrzeni ekranu, a nie z korekcją perspektywy.
-                    // Dla prostego silnika jest to wystarczające, ale może powodować artefakty.
                     val depth = u * v1.z + v * v2.z + w * v3.z
                     val ao = u * v1.ao + v * v2.ao + w * v3.ao
 
@@ -1420,10 +1637,17 @@ class gridMap : JPanel() {
                         val g = (color.green * ao).toInt().coerceIn(0, 255)
                         val b = (color.blue * ao).toInt().coerceIn(0, 255)
                         val rgb = (r shl 16) or (g shl 8) or b
-                        backBuffer[y * imageWidth + x] = rgb
+                        backBuffer[pixelIndex] = rgb
                     }
                 }
+                // Krok w prawo: dodajemy gradienty X
+                v += dvdx
+                w += dwdx
+                pixelIndex++
             }
+            // Krok w dół: dodajemy gradienty Y do wartości startowych wiersza
+            rowV += dvdy
+            rowW += dwdy
         }
     }
 
@@ -1523,7 +1747,7 @@ class gridMap : JPanel() {
         if (KeyEvent.VK_UP in keys) pitch += rotationalSpeed
         if (KeyEvent.VK_DOWN in keys) pitch -= rotationalSpeed
 
-        if (KeyEvent.VK_G in keys) println("camX: ${(camX*10).toInt()/10.0}, camY: ${(camY*10).toInt()/10.0}, camZ: ${(camZ*10).toInt()/10.0}, yaw: ${(yaw*10).toInt()/10.0}, pitch: ${(pitch*10).toInt()/10.0}, speed: $tempSpeed")
+        if (KeyEvent.VK_G in keys) println("camX: ${camX.toSmartString()}, camY: ${camY.toSmartString()}, camZ: ${camZ.toSmartString()}, yaw: ${yaw.toSmartString()}, pitch: ${pitch.toSmartString()}, speed: $tempSpeed")
 
         // Obsługa ciągłego niszczenia/stawiania bloków
         val currentTime = System.currentTimeMillis()
@@ -1861,6 +2085,17 @@ class gridMap : JPanel() {
             val u = if (h < 8) x else y
             val v = if (h < 4) y else if (h == 12 || h == 14) x else z
             return (if (h and 1 != 0) -u else u) + if (h and 2 != 0) -v else v
+        }
+    }
+
+    fun Double.toSmartString(): String {
+        val rawValue = (this / 2.0) + 0.5
+        val rounded = Math.round(rawValue * 10.0) / 10.0
+
+        return if (rounded % 1.0 == 0.0) {
+            rounded.toInt().toString()
+        } else {
+            rounded.toString()
         }
     }
 }
