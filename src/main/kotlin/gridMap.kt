@@ -74,6 +74,7 @@ class gridMap : JPanel() {
     )
 
     // Scena 3D
+    private val BlockAir = 0
     private val chunkMeshes = mutableMapOf<Point, Array<MutableList<Triangle3d>>>()
     // Mapa przechowująca maskę bitową okluzji dla każdego segmentu (index 0-63)
     // Bity: 1=West(X-), 2=East(X+), 4=Down(Y-), 8=Up(Y+), 16=North(Z-), 32=South(Z+)
@@ -134,7 +135,6 @@ class gridMap : JPanel() {
     private var seed = 6767
     private lateinit var caveNoise: PerlinNoise
     private lateinit var noise: PerlinNoise
-    private var treeDensity = 0.004 //procent na pojawienie sie drzewa
     private var lastChunkX = Int.MAX_VALUE
     private var lastChunkZ = Int.MAX_VALUE
 
@@ -161,27 +161,12 @@ class gridMap : JPanel() {
     private var cosPitch = 0.0
     private var sinPitch = 0.0
 
-    private data class TreeVoxel(val x: Int, val y: Int, val z: Int, val color: Color)
-    private val treeModelData = ";2,4,2,#00FF00;;0,0,0,#5D2F0A;;-2,4,2,#00FF00;;-2,4,1,#00FF00;;-2,4,0,#00FF00;;-1,6,0,#00FF00;;-2,4,-1,#00FF00;;-2,4,-2,#00FF00;;0,5,-1,#00FF00;;0,5,0,#5D2F0A;;1,3,-2,#00FF00;;0,5,1,#00FF00;;1,3,-1,#00FF00;;1,3,0,#00FF00;;0,1,0,#5D2F0A;;1,3,1,#00FF00;;1,3,2,#00FF00;;-2,3,2,#00FF00;;-2,3,1,#00FF00;;-2,3,0,#00FF00;;-1,5,1,#00FF00;;-2,3,-1,#00FF00;;-1,5,0,#00FF00;;-2,3,-2,#00FF00;;-1,5,-1,#00FF00;;0,6,-1,#00FF00;;0,6,0,#00FF00;;0,6,1,#00FF00;;1,4,-2,#00FF00;;1,4,-1,#00FF00;;1,4,0,#00FF00;;0,2,0,#5D2F0A;;1,4,1,#00FF00;;1,4,2,#00FF00;;-1,4,2,#00FF00;;-1,4,1,#00FF00;;-1,4,0,#00FF00;;-1,4,-1,#00FF00;;-1,4,-2,#00FF00;;0,3,-2,#00FF00;;1,5,-1,#00FF00;;0,3,-1,#00FF00;;1,5,0,#00FF00;;0,3,0,#5D2F0A;;2,3,-2,#00FF00;;1,5,1,#00FF00;;2,3,-1,#00FF00;;0,3,1,#00FF00;;0,3,2,#00FF00;;2,3,0,#00FF00;;2,3,1,#00FF00;;-1,3,2,#00FF00;;2,3,2,#00FF00;;-1,3,1,#00FF00;;-1,3,0,#00FF00;;-1,3,-1,#00FF00;;-1,3,-2,#00FF00;;0,4,-2,#00FF00;;0,4,-1,#00FF00;;1,6,0,#00FF00;;0,4,0,#5D2F0A;;2,4,-2,#00FF00;;0,4,1,#00FF00;;2,4,-1,#00FF00;;2,4,0,#00FF00;;0,4,2,#00FF00;;2,4,1,#00FF00;"
-    private val treeModel = parseTreeModel(treeModelData)
+    data class ModelVoxel(val x: Int, val y: Int, val z: Int, val color: Color, val isVoid: Boolean = false)
 
-    private fun parseTreeModel(data: String): List<TreeVoxel> {
-        return data.split(";")
-            .filter { it.isNotBlank() }
-            .mapNotNull { part ->
-                try {
-                    val tokens = part.trim().split(",")
-                    if (tokens.size == 4) {
-                        val x = tokens[0].toInt()
-                        val y = tokens[1].toInt()
-                        val z = tokens[2].toInt()
-                        val colStr = tokens[3].trim()
-                        val color = if (colStr.startsWith("#")) Color.decode(colStr) else Color(colStr.toInt(), true)
-                        TreeVoxel(x, y, z, color)
-                    } else null
-                } catch (e: Exception) { null }
-            }
-    }
+    private val treeModel = treeModelData
+    private val DungeonModel = DungeonModelData
+    private val AirModel = AirModelData
+    private val IglooModel = IglooModelData
 
     init {
         preferredSize = Dimension((baseCols + 1) * cellSize, (baseRows + 1) * cellSize)
@@ -271,75 +256,36 @@ class gridMap : JPanel() {
         val chunk = Chunk(cx, cz)
         chunks[Point(cx, cz)] = chunk
 
-        // 1. Generowanie terenu
+        // 1. Generowanie terenu i jaskiń (Uniwersalna metoda)
         for (lx in 0 until 16) {
             for (lz in 0 until 16) {
+                // Optymalizacja: Pobieramy wysokość raz dla kolumny, aby ograniczyć pętlę Y
                 val wx = cx * 16 + lx
                 val wz = cz * 16 + lz
                 val h = getTerrainHeight(wx, wz)
-
-                for (y in 0..h) {
-                    val color = when {
-                        y == h -> Color(0x59A608)
-                        y > h - 4 -> Color(0x6c3c0c)
-                        else -> Color(0x8EA3A1)
-                    }
-                    chunk.setBlock(lx, y, lz, color.rgb)
-                }
-            }
-        }
-
-        // 2. Generowanie jaskiń
-        val baseCaveThreshold = 0.65 // Bazowy próg dla jaskiń. 0.6-0.7 to dobry zakres.
-        val surfaceOpeningResistance = 0.2 // Jak bardzo "odporna" jest powierzchnia. Wyższa wartość = mniej wejść.
-        for (lx in 0 until 16) {
-            for (lz in 0 until 16) {
-                for (y in 0 until 128) { // Zmieniono zakres wysokości dla generowania jaskiń
+                
+                for (y in 0..127) {
                     val wx = cx * 16 + lx
                     val wz = cz * 16 + lz
-
-                    val h = getTerrainHeight(wx, wz)
-                    if (y > h) continue
-
-                    // Skalowanie szumu - mniejsze wartości = większe jaskinie
-                    val frequency = 0.07
-                    val noiseVal = caveNoise.noise(wx * frequency, y * frequency * 2, wz * frequency)
-
-                    // Zwiększamy próg blisko powierzchni, aby wejścia były rzadsze i większe
-                    val depth = h - y
-                    val threshold = if (depth < 5) { // Zastosuj opór tylko dla 5 górnych bloków
-                        baseCaveThreshold + surfaceOpeningResistance * (1.0 - depth / 5.0)
-                    } else {
-                        baseCaveThreshold
-                    }
-
-                    if (noiseVal > threshold) {
-                        chunk.setBlock(lx, y, lz, 0) // 0 = powietrze
+                    
+                    // Używamy tej samej funkcji co struktury - spójność 100%
+                    val blockColor = computeWorldBlock(wx, y, wz, h)
+                    if (blockColor != BlockAir) {
+                        chunk.setBlock(lx, y, lz, blockColor)
                     }
                 }
-                chunk.setBlock(lx, 0, lz, Color.BLACK.rgb)
             }
         }
 
         // 3. Generowanie rud
         generateOres(chunk, cx, cz)
 
-        // 2. Generowanie drzew
-        // Sprawdzamy obszar nieco szerszy niż chunk, aby drzewa z sąsiednich kratek mogły wejść na ten chunk
-        // Promień drzewa to ok. 2 kratki, więc sprawdzamy od -3 do 18
-        for (lx in -3..18) {
-            for (lz in -3..18) {
-                val wx = cx * 16 + lx
-                val wz = cz * 16 + lz
-
-                // Deterministyczne losowanie pozycji drzewa na podstawie seeda i współrzędnych
-                if (isTreeAt(wx, wz)) {
-                    val h = getTerrainHeight(wx, wz)
-                    // Rysujemy drzewo, jeśli jego elementy wpadają w ten chunk
-                    placeTree(chunk, lx, h + 1, lz)
-                }
-            }
-        }
+        // 4. Generowanie struktur
+        // Drzewa: density=0.004, minH=0, maxH=128, target=Grass, offset=1
+        generateStructureType(chunk, cx, cz, treeModel, 0.004, 50, 128, Color(0x59A608).rgb, 1)
+        generateStructureType(chunk, cx, cz, AirModel, 0.001, 80, 128, BlockAir, 1, true, listOf(0, 90, 180, 270))
+        generateStructureType(chunk, cx, cz, DungeonModel, 0.001, 0, 30, Color(0x8EA3A1).rgb, 1, true, listOf(0, 90, 180, 270))
+        generateStructureType(chunk, cx, cz, IglooModel, 0.00001, 50, 80, Color(0x59A608).rgb, 0, false, listOf(0, 90, 180, 270))
 
         // Resetujemy flagę modified, bo to jest stan początkowy (naturalny)
         chunk.modified = false
@@ -461,27 +407,162 @@ class gridMap : JPanel() {
         return (58 + n * 6).toInt().coerceIn(0, 127) // Zmieniono bazową wysokość i zakres szumu, oraz górną granicę
     }
 
-    private fun isTreeAt(wx: Int, wz: Int): Boolean {
-        // Prosty hash współrzędnych i seeda
-        val hash = (wx * 73856093 xor wz * 19349663 xor seed).toString().hashCode()
-        val random = Random(hash.toLong())
-        return random.nextDouble() < treeDensity
+    // --- UNIWERSALNA LOGIKA GENEROWANIA BLOKU ---
+    // To jest jedyne miejsce definiujące wygląd świata (poza rudami).
+    // Struktury używają tego do "patrzenia" w sąsiednie chunki.
+    private fun computeWorldBlock(wx: Int, wy: Int, wz: Int, precalcHeight: Int? = null): Int {
+        if (wy < 0) return BlockAir
+        if (wy == 0) return Color.BLACK.rgb // Bedrock
+
+        val h = precalcHeight ?: getTerrainHeight(wx, wz)
+        if (wy > h) return BlockAir // Powietrze nad terenem
+
+        // 1. Logika Biomów / Warstw (Tu zmieniasz kolory trawy, ziemi itp.)
+        val baseColor = when {
+            wy == h -> Color(0x59A608).rgb
+            wy > h - 4 -> Color(0x6c3c0c).rgb
+            else -> Color(0x8EA3A1).rgb
+        }
+
+        // 2. Logika Jaskiń (Wycinanie w terenie)
+        val baseCaveThreshold = 0.65
+        val surfaceOpeningResistance = 0.2
+        val frequency = 0.07
+        val noiseVal = caveNoise.noise(wx * frequency, wy * frequency * 2, wz * frequency)
+
+        val depth = h - wy
+        val threshold = if (depth < 5) {
+            baseCaveThreshold + surfaceOpeningResistance * (1.0 - depth / 5.0)
+        } else {
+            baseCaveThreshold
+        }
+
+        if (noiseVal > threshold) return BlockAir // Jaskinia (powietrze)
+        
+        return baseColor
     }
 
-    private fun placeTree(chunk: Chunk, rootLx: Int, rootY: Int, rootLz: Int) {
-        for (voxel in treeModel) {
-            val tx = rootLx + voxel.x
-            val ty = rootY + voxel.y
-            val tz = rootLz + voxel.z
+    private fun generateStructureType(chunk: Chunk, cx: Int, cz: Int, model: List<ModelVoxel>, density: Double, minH: Int, maxH: Int, targetBlock: Int, yOffset: Int, clearSpace: Boolean = false, allowedRotations: List<Int> = listOf(0)) {
+        val margin = 10 // Margines dla struktur wychodzących poza chunk (np. korona drzewa)
+        
+        // Cache dla obróconych modeli, aby nie tworzyć nowych obiektów dla każdego drzewa
+        val modelCache = mutableMapOf<Int, List<ModelVoxel>>()
 
-            // Sprawdzamy czy voxel mieści się w aktualnym chunku (zmieniono zakres wysokości)
-            if (tx in 0 until 16 && tz in 0 until 16 && ty in 0 until 128) {
-                // Nadpisujemy tylko powietrze (0), opcjonalnie można nadpisywać wszystko
-                if (chunk.getBlock(tx, ty, tz) == 0) {
-                    chunk.setBlock(tx, ty, tz, voxel.color.rgb)
+        for (lx in -margin..16 + margin) {
+            for (lz in -margin..16 + margin) {
+                val wx = cx * 16 + lx
+                val wz = cz * 16 + lz
+
+                // Unikalny seed dla typu struktury (bazując na hashcode modelu)
+                if (isStructureAt(wx, wz, density, model.hashCode())) {
+                        // Zbieramy wszystkie pasujące wysokości w kolumnie
+                        val validYs = mutableListOf<Int>()
+
+                        val startY = maxOf(minH, 0)
+                        val endY = minOf(maxH, 127)
+                        
+                        for (y in startY..endY) {
+                            // Sprawdzamy blok na dole i blok powyżej (czy jest miejsce)
+                            // computeWorldBlock zwraca ID bloku matematycznie, niezależnie od chunka
+                            if (computeWorldBlock(wx, y, wz) == targetBlock && computeWorldBlock(wx, y + 1, wz) == BlockAir) {
+                                validYs.add(y)
+                            }
+                        }
+                        
+                        if (validYs.isNotEmpty()) {
+                            // Wybieramy losową wysokość z dostępnych (deterministycznie)
+                            val hash = (wx * 73856093 xor wz * 19349663 xor seed xor model.hashCode()).toString().hashCode()
+                            val random = Random(hash.toLong())
+                            random.nextDouble() // Przesuwamy stan RNG (to samo wywołanie co w isStructureAt)
+                            
+                            val selectedY = validYs[random.nextInt(validYs.size)]
+
+                            // Zabezpieczenie przed pustą listą rotacji
+                            val rotation = if (allowedRotations.isNotEmpty()) allowedRotations[random.nextInt(allowedRotations.size)] else 0
+                            
+                            // Pobieramy z cache lub obliczamy i zapisujemy
+                            val finalModel = modelCache.getOrPut(rotation) { rotateModel(model, rotation) }
+
+                            placeStructure(chunk, lx, selectedY + yOffset, lz, finalModel, clearSpace)
+                        }
                 }
-                if (chunk.getBlock(tx, ty - 1, tz) == Color(0x59A608).rgb) {
-                    chunk.setBlock(tx, ty - 1, tz, Color(0x6c3c0c).rgb)
+            }
+        }
+    }
+
+    private fun rotateModel(model: List<ModelVoxel>, angle: Int): List<ModelVoxel> {
+        var normAngle = angle % 360
+        if (normAngle < 0) normAngle += 360
+        val steps = (normAngle / 90) % 4
+
+        if (steps == 0) return model
+
+        return model.map { voxel ->
+            var x = voxel.x
+            var z = voxel.z
+            repeat(steps) {
+                val oldX = x
+                val oldZ = z
+                x = -oldZ
+                z = oldX
+            }
+            ModelVoxel(x, voxel.y, z, voxel.color, voxel.isVoid)
+        }
+    }
+
+    private fun isStructureAt(wx: Int, wz: Int, density: Double, salt: Int): Boolean {
+        val hash = (wx * 73856093 xor wz * 19349663 xor seed xor salt).toString().hashCode()
+        val random = Random(hash.toLong())
+        return random.nextDouble() < density
+    }
+
+    private fun placeStructure(chunk: Chunk, rootLx: Int, rootY: Int, rootLz: Int, model: List<ModelVoxel>, clearSpace: Boolean) {
+        if (clearSpace && model.isNotEmpty()) {
+            // Tryb czyszczenia: obliczamy granice modelu i iterujemy po całym prostopadłościanie
+            val minX = model.minOf { it.x }
+            val maxX = model.maxOf { it.x }
+            val minY = model.minOf { it.y }
+            val maxY = model.maxOf { it.y }
+            val minZ = model.minOf { it.z }
+            val maxZ = model.maxOf { it.z }
+
+            // Mapa voxeli dla szybkiego sprawdzania co jest w modelu
+            val voxelMap = model.associate { Triple(it.x, it.y, it.z) to it }
+
+            for (x in minX..maxX) {
+                for (y in minY..maxY) {
+                    for (z in minZ..maxZ) {
+                        val tx = rootLx + x
+                        val ty = rootY + y
+                        val tz = rootLz + z
+
+                        if (tx in 0 until 16 && tz in 0 until 16 && ty in 0 until 128) {
+                            // Jeśli voxel jest w modelu -> jego kolor, jeśli nie -> powietrze (0)
+                            val voxel = voxelMap[Triple(x, y, z)]
+                            if (voxel != null) {
+                                if (!voxel.isVoid) {
+                                    chunk.setBlock(tx, ty, tz, voxel.color.rgb)
+                                }
+                            } else {
+                                chunk.setBlock(tx, ty, tz, 0)
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // Tryb standardowy: stawiamy tylko bloki z modelu
+            for (voxel in model) {
+                val tx = rootLx + voxel.x
+                val ty = rootY + voxel.y
+                val tz = rootLz + voxel.z
+
+                if (tx in 0 until 16 && tz in 0 until 16 && ty in 0 until 128) {
+                    if (voxel.isVoid) {
+                        chunk.setBlock(tx, ty, tz, 0) // Blok próżni zamienia się w powietrze (blokuje teren)
+                    } else {
+                        chunk.setBlock(tx, ty, tz, voxel.color.rgb)
+                    }
                 }
             }
         }

@@ -84,6 +84,8 @@ class DemoDisplay : JPanel() {
     // Color State
     var currentColor: Int = Color.WHITE.rgb
     var onVoxelPlaced: ((Int) -> Unit)? = null
+    var onColorsImported: ((Set<Int>) -> Unit)? = null
+    var showVoidBlocks = true
 
     // Define faces and their normals once for efficiency.
     // Winding order is counter-clockwise when viewed from the outside.
@@ -183,11 +185,18 @@ class DemoDisplay : JPanel() {
     }
 
     private fun handleSinglePress(keyCode: Int) {
+        if (keyCode == KeyEvent.VK_V) {
+            showVoidBlocks = !showVoidBlocks
+        }
         // Export
         if (keyCode == KeyEvent.VK_E) {
             val data = voxels.joinToString("") {
-                val hex = String.format("#%06X", (0xFFFFFF and it.color))
-                ";${it.x},${it.y},${it.z},$hex;"
+                if (it.color == 1) {
+                    ";${it.x},${it.y},${it.z},1;"
+                } else {
+                    val hex = String.format("#%06X", (0xFFFFFF and it.color))
+                    ";${it.x},${it.y},${it.z},$hex;"
+                }
             }
             val textArea = JTextArea(data)
             textArea.isEditable = false
@@ -204,6 +213,7 @@ class DemoDisplay : JPanel() {
             if (input != null && input.isNotBlank()) {
                 try {
                     voxels.clear()
+                    val importedColors = HashSet<Int>()
                     input.split(";").forEach { part ->
                         if (part.isBlank()) return@forEach
                         val coords = part.split(",")
@@ -212,15 +222,21 @@ class DemoDisplay : JPanel() {
                             val y = coords[1].toInt()
                             val z = coords[2].toInt()
                             val c = if (coords.size > 3) {
-                                try {
-                                    Color.decode(coords[3]).rgb
-                                } catch (e: Exception) {
-                                    coords[3].toIntOrNull() ?: Color.WHITE.rgb
+                                if (coords[3] == "1") {
+                                    1 // Blok próżni
+                                } else {
+                                    try {
+                                        Color.decode(coords[3]).rgb
+                                    } catch (e: Exception) {
+                                        coords[3].toIntOrNull() ?: Color.WHITE.rgb
+                                    }
                                 }
                             } else Color.WHITE.rgb
                             voxels.add(Voxel(x, y, z, c))
+                            importedColors.add(c)
                         }
                     }
+                    onColorsImported?.invoke(importedColors)
                 } catch (e: Exception) {
                     println("Import failed: ${e.message}")
                 }
@@ -381,7 +397,9 @@ class DemoDisplay : JPanel() {
 
         // Render Voxels
         // Sort voxels by distance to camera (simple painter's algo)
-        val sortedVoxels = voxels.sortedByDescending { 
+        val sortedVoxels = voxels
+            .filter { showVoidBlocks || it.color != 1 }
+            .sortedByDescending { 
             (it.x - camX)*(it.x - camX) + (it.y - camY)*(it.y - camY) + (it.z - camZ)*(it.z - camZ) 
         }
 
@@ -392,7 +410,7 @@ class DemoDisplay : JPanel() {
         // Draw UI
         g2d.color = Color.LIGHT_GRAY
         g2d.font = Font("Arial", Font.BOLD, 20)
-        g2d.drawString("Controls: E (Export), I (Import)", 20, 30)
+        g2d.drawString("Controls: E (Export), I (Import), V (Toggle Void)", 20, 30)
         g2d.drawString("Voxels: ${voxels.size}", 20, 60)
         g2d.drawString("Kliknij, aby zablokować mysz. ESC, aby zwolnić.", 20, 90)
         
@@ -465,7 +483,9 @@ class DemoDisplay : JPanel() {
 
             // Simple directional lighting model
             val lightDir = Vector3(0.5, 1.0, 0.5).normalized() // Light from top-right-front
-            val baseColor = Color(v.color)
+            
+            // Obsługa bloku próżni (ID 1) -> Czerwony 50% opacity
+            val baseColor = if (v.color == 1) Color(255, 0, 0, 128) else Color(v.color)
 
             // Calculate light intensity based on the angle between the face normal and the light direction
             val dot = normal.x * lightDir.x + normal.y * lightDir.y + normal.z * lightDir.z
@@ -475,7 +495,7 @@ class DemoDisplay : JPanel() {
             val r = (baseColor.red * brightness).toInt()
             val g_ = (baseColor.green * brightness).toInt()
             val b = (baseColor.blue * brightness).toInt()
-            g.color = Color(r, g_, b)
+            g.color = Color(r, g_, b, baseColor.alpha) // Zachowujemy alpha dla przezroczystości
 
             g.fill(polygon)
             g.color = g.color.darker() // Draw a slightly darker outline
@@ -542,6 +562,15 @@ class PaletteWindow(private val display: DemoDisplay) : JFrame("Paleta Barw") {
             val btn = createColorButton(c.rgb)
             basicColorsPanel.add(btn)
         }
+
+        // Przycisk dla bloku próżni (Void)
+        val voidBtn = JButton("PRÓŻNIA")
+        voidBtn.background = Color(255, 0, 0, 128)
+        voidBtn.addActionListener {
+            display.currentColor = 1
+            updateHexField(1)
+        }
+        basicColorsPanel.add(voidBtn)
 
         // 2. Custom Color Picker
         val pickerBtn = JButton("Wybierz inny kolor...")
@@ -695,7 +724,11 @@ class PaletteWindow(private val display: DemoDisplay) : JFrame("Paleta Barw") {
                     val col = 10 - v.x // Odwrócenie osi X
                     val row = v.z + 10
                     if (col in 0 until gridSize && row in 0 until gridSize) {
-                        g.color = Color(v.color)
+                        if (v.color == 1) {
+                            g.color = Color(255, 0, 0, 128)
+                        } else {
+                            g.color = Color(v.color)
+                        }
                         g.fillRect((col * cellW).toInt() + 1, (row * cellH).toInt() + 1, cellW.toInt() - 1, cellH.toInt() - 1)
                     }
                 }
@@ -709,7 +742,7 @@ class PaletteWindow(private val display: DemoDisplay) : JFrame("Paleta Barw") {
                     val maxCol = max(start.x, end.x)
                     val minRow = min(start.y, end.y)
                     val maxRow = max(start.y, end.y)
-                    val c = Color(display.currentColor)
+                    val c = if (display.currentColor == 1) Color(255, 0, 0, 128) else Color(display.currentColor)
                     g.color = Color(c.red, c.green, c.blue, 128)
                     for (col in minCol..maxCol) {
                         for (row in minRow..maxRow) {
@@ -760,7 +793,11 @@ class PaletteWindow(private val display: DemoDisplay) : JFrame("Paleta Barw") {
     }
 
     private fun updateHexField(rgb: Int) {
-        hexField.text = String.format("#%06X", (0xFFFFFF and rgb))
+        if (rgb == 1) {
+            hexField.text = "VOID"
+        } else {
+            hexField.text = String.format("#%06X", (0xFFFFFF and rgb))
+        }
     }
 
     fun addToHistory(rgb: Int) {
@@ -776,7 +813,7 @@ class PaletteWindow(private val display: DemoDisplay) : JFrame("Paleta Barw") {
     private fun createColorButton(rgb: Int): JButton {
         val btn = JButton()
         btn.preferredSize = Dimension(30, 30)
-        btn.background = Color(rgb)
+        btn.background = if (rgb == 1) Color(255, 0, 0, 128) else Color(rgb)
         btn.isContentAreaFilled = false
         btn.isOpaque = true
         btn.addActionListener {
@@ -794,6 +831,7 @@ fun main() {
 
         // Link history logic
         display.onVoxelPlaced = { color -> palette.addToHistory(color) }
+        display.onColorsImported = { colors -> colors.forEach { palette.addToHistory(it) } }
 
         val frame = JFrame("FileZeroVoxelEditor.kt")
         frame.defaultCloseOperation = JFrame.EXIT_ON_CLOSE
