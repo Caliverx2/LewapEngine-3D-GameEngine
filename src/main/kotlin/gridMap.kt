@@ -3,6 +3,8 @@ package org.lewapnoob.gridMap
 import java.awt.*
 import java.awt.event.ComponentAdapter
 import java.awt.event.ComponentEvent
+import java.awt.event.FocusAdapter
+import java.awt.event.FocusEvent
 import java.awt.event.KeyAdapter
 import java.awt.event.KeyEvent
 import java.awt.event.MouseAdapter
@@ -106,11 +108,23 @@ class gridMap : JPanel() {
         if (stream != null) {
             Font.createFont(Font.TRUETYPE_FONT, stream).deriveFont(30f)
         } else {
-            Font("Consolas", Font.PLAIN, 16)
+            Font("Consolas", Font.BOLD, 30)
         }
     } catch (e: Exception) {
         println("Failed to load font 'mojangles.ttf', using default.")
-        Font("Consolas", Font.PLAIN, 16)
+        Font("Consolas", Font.BOLD, 30)
+    }
+
+    private val hotbarFont = try {
+        val stream = javaClass.classLoader.getResourceAsStream("fonts/mojangles.ttf")
+        if (stream != null) {
+            Font.createFont(Font.TRUETYPE_FONT, stream).deriveFont(24f)
+        } else {
+            Font("Consolas", Font.BOLD, 24)
+        }
+    } catch (e: Exception) {
+        println("Failed to load font 'mojangles.ttf', using default.")
+        Font("Consolas", Font.BOLD, 24)
     }
 
     // --- Voxel World Data ---
@@ -168,6 +182,11 @@ class gridMap : JPanel() {
     private val AirModel = AirModelData
     private val IglooModel = IglooModelData
 
+    // --- Inventory System ---
+    data class ItemStack(val color: Int, var count: Int)
+    private val inventory = arrayOfNulls<ItemStack>(9)
+    private var selectedSlot = 0
+
     init {
         preferredSize = Dimension((baseCols + 1) * cellSize, (baseRows + 1) * cellSize)
         setBackground(Color(113, 144, 225))
@@ -175,6 +194,12 @@ class gridMap : JPanel() {
         addMouseListener(GridMouseListener())
         addMouseMotionListener(GridMouseMotionListener())
         isFocusable = true
+
+        addFocusListener(object : FocusAdapter() {
+            override fun focusLost(e: FocusEvent?) {
+                keys.clear()
+            }
+        })
 
         addComponentListener(object : ComponentAdapter() {
             override fun componentMoved(e: ComponentEvent?) {
@@ -192,6 +217,11 @@ class gridMap : JPanel() {
         updateWorld()
 
         loop()
+
+        addItem("#FF0000", 65)
+        addItem("#00FF00", 65)
+        addItem("#0000FF", 65)
+        addItem("2", 65)
     }
 
     private fun updateWorld() {
@@ -284,7 +314,7 @@ class gridMap : JPanel() {
         // Drzewa: density=0.004, minH=0, maxH=128, target=Grass, offset=1
         generateStructureType(chunk, cx, cz, treeModel, 0.004, 50, 128, Color(0x59A608).rgb, 1)
         generateStructureType(chunk, cx, cz, AirModel, 0.001, 80, 128, BlockAir, 1, true, listOf(0, 90, 180, 270))
-        generateStructureType(chunk, cx, cz, DungeonModel, 0.001, 0, 30, Color(0x8EA3A1).rgb, 1, true, listOf(0, 90, 180, 270))
+        generateStructureType(chunk, cx, cz, DungeonModel, 0.0001, 0, 30, Color(0x8EA3A1).rgb, 1, true, listOf(0, 90, 180, 270))
         generateStructureType(chunk, cx, cz, IglooModel, 0.00001, 50, 80, Color(0x59A608).rgb, 0, false, listOf(0, 90, 180, 270))
 
         // Resetujemy flagę modified, bo to jest stan początkowy (naturalny)
@@ -568,6 +598,52 @@ class gridMap : JPanel() {
         }
     }
 
+    // --- System dodawania przedmiotów (API) ---
+
+    // Uniwersalna funkcja addItem przyjmująca String (ID lub HEX)
+    fun addItem(value: String, count: Int = 1) {
+        val id = try {
+            if (value.startsWith("#")) {
+                Color.decode(value).rgb
+            } else {
+                value.toInt()
+            }
+        } catch (e: Exception) {
+            println("Błąd: Nieprawidłowa wartość przedmiotu '$value'")
+            return
+        }
+
+        if (id == 0) return // Ignorujemy ID 0 (powietrze)
+
+        repeat(count) {
+            // 1. Szukamy istniejącego stacka z tym samym kolorem, który ma mniej niż 64
+            var added = false
+            for (i in inventory.indices) {
+                val stack = inventory[i]
+                if (stack != null && stack.color == id && stack.count < 64) {
+                    stack.count++
+                    added = true
+                    break
+                }
+            }
+            // 2. Jeśli nie znaleziono pasującego stacka, szukamy pierwszego wolnego slotu
+            if (!added) {
+                for (i in inventory.indices) {
+                    if (inventory[i] == null) {
+                        inventory[i] = ItemStack(id, 1)
+                        break
+                    }
+                }
+            }
+        }
+    }
+
+    private fun consumeCurrentItem() {
+        val stack = inventory[selectedSlot] ?: return
+        stack.count--
+        if (stack.count <= 0) inventory[selectedSlot] = null
+    }
+
     private fun setBlock(x: Int, y: Int, z: Int, color: Color?) {
         if (y < 0 || y >= 128) return // Zmieniono górną granicę wysokości
         val cx = if (x >= 0) x / 16 else (x + 1) / 16 - 1
@@ -676,6 +752,31 @@ class gridMap : JPanel() {
         var lastY = y
         var lastZ = z
 
+        // Sprawdzenie czy jesteśmy wewnątrz bloku - jeśli tak, pozwalamy go zniszczyć
+        if (getBlock(x, y, z) != null) {
+            if (!place) {
+                // Zbieranie do ekwipunku
+                val blockColor = getBlock(x, y, z)
+                if (blockColor != null) {
+                    addItem(blockColor.rgb.toString())
+                }
+                setBlock(x, y, z, null)
+
+
+                val cx = if (x >= 0) x / 16 else (x + 1) / 16 - 1
+                val cz = if (z >= 0) z / 16 else (z + 1) / 16 - 1
+                updateChunkMesh(cx, cz)
+
+                val lx = x - cx * 16
+                val lz = z - cz * 16
+                if (lx == 0) updateChunkMesh(cx - 1, cz)
+                if (lx == 15) updateChunkMesh(cx + 1, cz)
+                if (lz == 0) updateChunkMesh(cx, cz - 1)
+                if (lz == 15) updateChunkMesh(cx, cz + 1)
+                return
+            }
+        }
+
         // Pętla DDA
         while (true) {
             if (minOf(tMaxX, tMaxY, tMaxZ) > reachDistance) break
@@ -704,13 +805,25 @@ class gridMap : JPanel() {
 
                 if (place) {
                     if (!isPlayerInsideBlock(lastX, lastY, lastZ)) {
-                        setBlock(lastX, lastY, lastZ, Color(0x6c3c0c)) // Kolor ziemi
-                        updateX = lastX
-                        updateZ = lastZ
+                        // Sprawdzamy czy mamy blok w ręce
+                        val stack = inventory[selectedSlot]
+                        if (stack != null) {
+                            setBlock(lastX, lastY, lastZ, Color(stack.color))
+                            consumeCurrentItem()
+                            updateX = lastX
+                            updateZ = lastZ
+                        } else {
+                            return // Nie mamy bloków, nie budujemy
+                        }
                     } else {
                         return
                     }
                 } else {
+                    // Zbieranie do ekwipunku (niszczenie z dystansu)
+                    val blockColor = getBlock(x, y, z)
+                    if (blockColor != null) {
+                        addItem(blockColor.rgb.toString())
+                    }
                     setBlock(x, y, z, null)
                 }
 
@@ -1770,6 +1883,87 @@ class gridMap : JPanel() {
             g2d.drawString(chunkText, 10, fm.ascent + 10)
             g2d.drawString(posText, 10, fm.ascent*2 + 10)
         }
+
+        renderInventory(g2d)
+    }
+
+    private fun renderInventory(g2d: Graphics2D) {
+        val slotSize = 50
+        val padding = 5
+        val totalWidth = 9 * (slotSize + padding) - padding
+        val startX = (width - totalWidth) / 2
+        val startY = height - slotSize - 20
+
+        for (i in 0 until 9) {
+            val x = startX + i * (slotSize + padding)
+            val y = startY
+
+            // Tło slotu
+            if (i == selectedSlot) {
+                g2d.color = Color(255, 255, 255, 180) // Podświetlenie
+                g2d.stroke = BasicStroke(3f)
+            } else {
+                g2d.color = Color(0, 0, 0, 150)
+                g2d.stroke = BasicStroke(1f)
+            }
+
+            g2d.fillRect(x, y, slotSize, slotSize)
+            g2d.color = if (i == selectedSlot) Color.YELLOW else Color.GRAY
+            g2d.drawRect(x, y, slotSize, slotSize)
+
+            // Rysowanie przedmiotu (Miniatura 3D)
+            val stack = inventory[i]
+            if (stack != null) {
+                drawIsometricBlock(g2d, x + slotSize / 2, y + slotSize / 2 + 5, slotSize - 20, Color(stack.color))
+
+                // Licznik
+                g2d.color = Color.WHITE
+                g2d.font = hotbarFont
+                val countStr = stack.count.toString()
+                val strW = g2d.fontMetrics.stringWidth(countStr)
+                g2d.drawString(countStr, x + slotSize - strW - 3, y + slotSize - 3)
+            }
+        }
+    }
+
+    // Rysuje prostą kostkę izometryczną 2D udającą 3D
+    private fun drawIsometricBlock(g2d: Graphics2D, cx: Int, cy: Int, size: Int, color: Color) {
+        val scale = size * 0.4
+        
+        val p = arrayOf(
+            Vector3d(-1.0, 1.0, -1.0), Vector3d(1.0, 1.0, -1.0),
+            Vector3d(1.0, 1.0, 1.0), Vector3d(-1.0, 1.0, 1.0),
+            Vector3d(-1.0, -1.0, -1.0), Vector3d(1.0, -1.0, -1.0),
+            Vector3d(1.0, -1.0, 1.0), Vector3d(-1.0, -1.0, 1.0)
+        )
+
+        val yaw = Math.toRadians(45.0)
+        val pitch = Math.asin(1.0 / Math.sqrt(3.0))
+
+        val cosYaw = cos(yaw); val sinYaw = sin(yaw)
+        val cosPitch = cos(pitch); val sinPitch = sin(pitch)
+
+        fun project(v: Vector3d): Point {
+            var x = v.x * cosYaw - v.z * sinYaw
+            var y = v.y
+            var z = v.z * cosYaw + v.x * sinYaw
+            val y2 = y * cosPitch - z * sinPitch
+            return Point((cx + x * scale).toInt(), (cy - y2 * scale).toInt())
+        }
+
+        val pts = p.map { project(it) }
+
+        // Top (Y+)
+        g2d.color = color.brighter()
+        g2d.fillPolygon(intArrayOf(pts[0].x, pts[1].x, pts[2].x, pts[3].x), intArrayOf(pts[0].y, pts[1].y, pts[2].y, pts[3].y), 4)
+
+        // Right (X+)
+        g2d.color = color.darker()
+        g2d.fillPolygon(intArrayOf(pts[1].x, pts[5].x, pts[6].x, pts[2].x), intArrayOf(pts[1].y, pts[5].y, pts[6].y, pts[2].y), 4)
+
+        // Left (Z+)
+        g2d.color = color
+        g2d.fillPolygon(intArrayOf(pts[3].x, pts[2].x, pts[6].x, pts[7].x), intArrayOf(pts[3].y, pts[2].y, pts[6].y, pts[7].y), 4)
     }
 
     private fun drawLine(x0: Int, y0: Int, x1: Int, y1: Int) {
@@ -2029,6 +2223,11 @@ class gridMap : JPanel() {
             }
             if (e?.keyCode == KeyEvent.VK_V) {
                 showChunkBorders = !showChunkBorders
+            }
+
+            // Wybór slotu ekwipunku (1-9)
+            if (e != null && e.keyCode >= KeyEvent.VK_1 && e.keyCode <= KeyEvent.VK_9) {
+                selectedSlot = e.keyCode - KeyEvent.VK_1
             }
         }
 
