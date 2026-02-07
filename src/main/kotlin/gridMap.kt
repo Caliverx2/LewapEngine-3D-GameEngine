@@ -14,6 +14,9 @@ import java.awt.image.DataBufferInt
 import java.util.Arrays
 import java.util.Collections
 import javax.swing.*
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.Executors
 import java.io.*
 import kotlin.math.cos
 import kotlin.math.sin
@@ -57,6 +60,13 @@ class gridMap : JPanel() {
     private val gravity = 0.1
     private val jumpStrength = 0.8
 
+    private var debugXray = false
+    private val oreColors = ConcurrentHashMap.newKeySet<Int>()
+
+    // System dnia i nocy
+    private var gameTime = 12.0
+    private var globalSunIntensity = 1.0
+
     private val imageWidth = baseCols + 1
     private val displayImage = BufferedImage(imageWidth, baseRows + 1, BufferedImage.TYPE_INT_RGB)
     private val pixels = (displayImage.raster.dataBuffer as DataBufferInt).data
@@ -68,20 +78,20 @@ class gridMap : JPanel() {
 
     // --- 3D Structures ---
     data class Vector3d(var x: Double, var y: Double, var z: Double, var ao: Double = 1.0)
-    private fun Vector3d.copy(): Vector3d = Vector3d(x, y, z, ao)
     data class BlockPos(val x: Int, val y: Int, val z: Int)
+    data class RayHit(val blockPos: BlockPos, val faceIndex: Int)
 
     data class Triangle3d(
-        val p1: Vector3d, val p2: Vector3d, val p3: Vector3d, val color: Color
+        val p1: Vector3d, val p2: Vector3d, val p3: Vector3d, val color: Color, val lightLevel: Int
     )
 
     // Scena 3D
     private val BlockAir = 0
-    private val chunkMeshes = mutableMapOf<Point, Array<MutableList<Triangle3d>>>()
+    private val chunkMeshes = ConcurrentHashMap<Point, Array<MutableList<Triangle3d>>>()
     // Mapa przechowująca maskę bitową okluzji dla każdego segmentu (index 0-63)
     // Bity: 1=West(X-), 2=East(X+), 4=Down(Y-), 8=Up(Y+), 16=North(Z-), 32=South(Z+)
-    private val chunkOcclusion = mutableMapOf<Point, ByteArray>()
-    
+    private val chunkOcclusion = ConcurrentHashMap<Point, ByteArray>()
+
     private val FACE_WEST = 1
     private val FACE_EAST = 2
     private val FACE_DOWN = 4
@@ -93,10 +103,19 @@ class gridMap : JPanel() {
     private val trianglesToRaster = mutableListOf<Triangle3d>()
 
     // Cache widoczności (BFS)
-    private val cachedVisibleSegments = java.util.ArrayList<Triple<Int, Int, Int>>()
+    // Optymalizacja: Płaska tablica zamiast listy obiektów Triple, aby uniknąć alokacji (GC)
+    // ZWIĘKSZONO: Dla renderDistance 12+ potrzeba więcej miejsca (ok. 40k segmentów)
+    private var visibleSegmentsFlat = IntArray(65536 * 3)
+    private var visibleSegmentsCount = 0
+    private val bfsQueue = IntArray(65536 * 3) // Kolejka BFS (x, y, z) - ZWIĘKSZONO
+    private var bfsVisited = IntArray(64 * 16 * 64) // Tokeny odwiedzin
+    private var bfsVisitToken = 0
+
     private var lastCamSecX = Int.MIN_VALUE
     private var lastCamSecY = Int.MIN_VALUE
     private var lastCamSecZ = Int.MIN_VALUE
+    private var lastYaw = Double.MAX_VALUE
+    private var lastPitch = Double.MAX_VALUE
     private var visibilityGraphDirty = true
 
     // FPS Counter
@@ -135,6 +154,8 @@ class gridMap : JPanel() {
         // Zmiana: Płaska tablica intów zamiast tablicy obiektów Color.
         // 0 oznacza brak bloku (powietrze), inne wartości to ARGB koloru.
         val blocks = IntArray(width * height * depth)
+        // Mapa światła (0-16)
+        val light = ByteArray(width * height * depth)
         var modified = false
 
         fun getIndex(x: Int, y: Int, z: Int): Int = x + width * (z + depth * y)
@@ -143,9 +164,11 @@ class gridMap : JPanel() {
             modified = true
         }
         fun getBlock(x: Int, y: Int, z: Int): Int = blocks[getIndex(x, y, z)]
+        fun setLight(x: Int, y: Int, z: Int, level: Int) { light[getIndex(x, y, z)] = level.toByte() }
+        fun getLight(x: Int, y: Int, z: Int): Int = light[getIndex(x, y, z)].toInt()
     }
 
-    private val chunks = mutableMapOf<Point, Chunk>()
+    private val chunks = ConcurrentHashMap<Point, Chunk>()
     private var seed = 6767
     private lateinit var caveNoise: PerlinNoise
     private lateinit var noise: PerlinNoise
@@ -187,6 +210,11 @@ class gridMap : JPanel() {
     private val inventory = arrayOfNulls<ItemStack>(9)
     private var selectedSlot = 0
 
+    // --- Threading & Optimization ---
+    private val chunkExecutor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors())
+    private val chunksBeingGenerated = ConcurrentHashMap.newKeySet<Point>()
+    private val chunksToMeshQueue = ConcurrentLinkedQueue<Point>()
+
     init {
         preferredSize = Dimension((baseCols + 1) * cellSize, (baseRows + 1) * cellSize)
         setBackground(Color(113, 144, 225))
@@ -198,6 +226,10 @@ class gridMap : JPanel() {
         addFocusListener(object : FocusAdapter() {
             override fun focusLost(e: FocusEvent?) {
                 keys.clear()
+                isMouseCaptured = false
+                isLeftMouseDown = false
+                isRightMouseDown = false
+                cursor = Cursor.getDefaultCursor()
             }
         })
 
@@ -212,7 +244,7 @@ class gridMap : JPanel() {
 
         // Ustawiamy gracza na powierzchni (pobieramy wysokość terenu w punkcie 0,0)
         val spawnH = getTerrainHeight(0, 0)
-        camY = (spawnH + 2) * cubeSize - 10.0
+        camY = (spawnH + 3) * cubeSize - 10.0
 
         updateWorld()
 
@@ -221,38 +253,71 @@ class gridMap : JPanel() {
         addItem("#FF0000", 65)
         addItem("#00FF00", 65)
         addItem("#0000FF", 65)
-        addItem("2", 65)
     }
 
     private fun updateWorld() {
         val currentChunkX = floor(camX / 32.0).toInt()
         val currentChunkZ = floor(camZ / 32.0).toInt()
 
-        var newChunkGenerated = false
-        val chunksToUpdate = mutableSetOf<Point>()
-
+        // 1. Zlecanie generowania chunków w tle (od środka na zewnątrz)
+        val chunksToLoad = java.util.ArrayList<Point>()
         for (cx in currentChunkX - renderDistance..currentChunkX + renderDistance) {
             for (cz in currentChunkZ - renderDistance..currentChunkZ + renderDistance) {
-                if (!chunks.containsKey(Point(cx, cz))) {
-                    generateChunk(cx, cz)
-                    // Oznaczamy nowy chunk i jego sąsiadów do aktualizacji mesha
-                    chunksToUpdate.add(Point(cx, cz))
-                    chunksToUpdate.addAll(getNeighborChunks(cx, cz))
-                    newChunkGenerated = true
+                val p = Point(cx, cz)
+                if (!chunks.containsKey(p) && !chunksBeingGenerated.contains(p)) {
+                    chunksToLoad.add(p)
                 }
             }
         }
 
-        if (newChunkGenerated || currentChunkX != lastChunkX || currentChunkZ != lastChunkZ) {
-            lastChunkX = currentChunkX
-            lastChunkZ = currentChunkZ
+        // Sortowanie: Najpierw najbliższe chunki
+        chunksToLoad.sortWith { p1, p2 ->
+            val d1 = (p1.x - currentChunkX) * (p1.x - currentChunkX) + (p1.y - currentChunkZ) * (p1.y - currentChunkZ)
+            val d2 = (p2.x - currentChunkX) * (p2.x - currentChunkX) + (p2.y - currentChunkZ) * (p2.y - currentChunkZ)
+            d1.compareTo(d2)
         }
 
-        // Aktualizujemy meshe tylko dla nowych/zmienionych chunków
-        chunksToUpdate.forEach { p ->
+        var chunksSubmitted = 0
+        for (p in chunksToLoad) {
+            if (chunksSubmitted >= 1) break // Leniwe ładowanie: max 1 chunk na klatkę, by nie dławić systemu
+            chunksBeingGenerated.add(p)
+            chunkExecutor.submit {
+                try {
+                    Thread.sleep(15) // Dajemy "odetchnąć" procesorowi, by nie zużywać 100% wątku
+                    val newChunk = generateChunk(p.x, p.y)
+                    chunks[p] = newChunk
+
+                    // FIX: Wymuszamy aktualizację światła w nowym chunku i sąsiadach,
+                    // aby światło poprawnie rozeszło się przez granice nowo załadowanego obszaru.
+                    calculateLighting(newChunk)
+                    getNeighborChunks(p.x, p.y).forEach { neighborPos ->
+                        chunks[neighborPos]?.let { neighbor ->
+                            calculateLighting(neighbor)
+                            chunksToMeshQueue.add(neighborPos)
+                        }
+                    }
+
+                    chunksToMeshQueue.add(p)
+                } finally {
+                    chunksBeingGenerated.remove(p)
+                }
+            }
+            chunksSubmitted++
+        }
+
+        // 2. Przetwarzanie kolejki meshy (Limitowane, aby nie zabić FPS przy dużej ilości zmian naraz)
+        var meshesProcessed = 0
+        while (!chunksToMeshQueue.isEmpty() && meshesProcessed < 4) { // Max 4 chunki na klatkę
+            val p = chunksToMeshQueue.poll()
             if (chunks.containsKey(p)) {
                 updateChunkMesh(p.x, p.y)
+                meshesProcessed++
             }
+        }
+
+        if (currentChunkX != lastChunkX || currentChunkZ != lastChunkZ) {
+            lastChunkX = currentChunkX
+            lastChunkZ = currentChunkZ
         }
 
         // Zmiana: Usuwanie starych chunków i ich meshy (Garbage Collection logiczny)
@@ -272,19 +337,53 @@ class gridMap : JPanel() {
     }
 
     private fun getNeighborChunks(cx: Int, cz: Int): List<Point> {
-        return listOf(Point(cx + 1, cz), Point(cx - 1, cz), Point(cx, cz + 1), Point(cx, cz - 1))
+        return listOf(
+            // Krok 1: Bezpośredni sąsiedzi (Krzyż) - muszą być pierwsi!
+            Point(cx + 1, cz), Point(cx - 1, cz), Point(cx, cz + 1), Point(cx, cz - 1),
+            // Krok 2: Sąsiedzi diagonalni (Rogi)
+            // Pobierają światło od bezpośrednich sąsiadów, którzy chwilę wcześniej zostali zaktualizowani.
+            Point(cx + 1, cz + 1), Point(cx - 1, cz - 1), Point(cx - 1, cz + 1), Point(cx + 1, cz - 1)
+        )
     }
 
-    private fun generateChunk(cx: Int, cz: Int) {
+    private fun refreshChunkData(cx: Int, cz: Int) {
+        // 1. Zbieramy chunki w promieniu 2 (5x5), aby upewnić się, że światło wygaśnie poprawnie
+        // i nie wróci z "echem" od dalszych sąsiadów.
+        val affected = mutableSetOf<Point>()
+        affected.add(Point(cx, cz))
+
+        val layer1 = getNeighborChunks(cx, cz)
+        affected.addAll(layer1)
+
+        // Warstwa 2 (Sąsiedzi sąsiadów)
+        for (p in layer1) {
+            affected.addAll(getNeighborChunks(p.x, p.y))
+        }
+
+        // 2. RESET: Zerujemy światło w centrum i u bezpośrednich sąsiadów.
+        // To przerywa pętlę zwrotną ("light echo"), gdzie chunki karmią się nawzajem starym światłem.
+        chunks[Point(cx, cz)]?.let { Arrays.fill(it.light, 0.toByte()) }
+        layer1.forEach { pt -> chunks[pt]?.let { Arrays.fill(it.light, 0.toByte()) } }
+
+        // 3. Pętla aktualizacji (Ping-Pong) - 3 przebiegi dla stabilizacji po wyzerowaniu
+        repeat(3) {
+            affected.forEach { pt -> chunks[pt]?.let { calculateLighting(it) } }
+        }
+
+        // 4. Aktualizacja meshy (tylko środek i bezpośredni sąsiedzi - wystarczy dla wizualiów)
+        updateChunkMesh(cx, cz)
+        layer1.forEach { updateChunkMesh(it.x, it.y) }
+    }
+
+    private fun generateChunk(cx: Int, cz: Int): Chunk {
         // 0. Próba wczytania z dysku
         val loadedChunk = loadChunkFromDisk(cx, cz)
         if (loadedChunk != null) {
-            chunks[Point(cx, cz)] = loadedChunk
-            return
+            calculateLighting(loadedChunk) // Przeliczamy światło dla wczytanego chunka
+            return loadedChunk
         }
 
         val chunk = Chunk(cx, cz)
-        chunks[Point(cx, cz)] = chunk
 
         // 1. Generowanie terenu i jaskiń (Uniwersalna metoda)
         for (lx in 0 until 16) {
@@ -293,11 +392,11 @@ class gridMap : JPanel() {
                 val wx = cx * 16 + lx
                 val wz = cz * 16 + lz
                 val h = getTerrainHeight(wx, wz)
-                
+
                 for (y in 0..127) {
                     val wx = cx * 16 + lx
                     val wz = cz * 16 + lz
-                    
+
                     // Używamy tej samej funkcji co struktury - spójność 100%
                     val blockColor = computeWorldBlock(wx, y, wz, h)
                     if (blockColor != BlockAir) {
@@ -317,8 +416,130 @@ class gridMap : JPanel() {
         generateStructureType(chunk, cx, cz, DungeonModel, 0.0001, 0, 30, Color(0x8EA3A1).rgb, 1, true, listOf(0, 90, 180, 270))
         generateStructureType(chunk, cx, cz, IglooModel, 0.00001, 50, 80, Color(0x59A608).rgb, 0, false, listOf(0, 90, 180, 270))
 
+        // 5. Obliczanie oświetlenia
+        calculateLighting(chunk)
+
         // Resetujemy flagę modified, bo to jest stan początkowy (naturalny)
         chunk.modified = false
+
+        return chunk
+    }
+
+    private fun calculateLighting(chunk: Chunk) {
+        // Używamy tymczasowego bufora, aby uniknąć race condition (czytanie wyzerowanego światła przez inne wątki)
+        val newLight = ByteArray(chunk.width * chunk.height * chunk.depth)
+
+        // Kolejka BFS dla światła
+        val lightQueue = IntArray(16 * 128 * 16 * 2) // x, y, z spakowane lub indeksy
+        var qHead = 0
+        var qTail = 0
+
+        // 1. Inicjalizacja światła słonecznego (z góry)
+        for (x in 0 until 16) {
+            for (z in 0 until 16) {
+                var sunlight = true
+                for (y in 127 downTo 0) {
+                    val idx = chunk.getIndex(x, y, z)
+                    if (chunk.blocks[idx] != 0) {
+                        sunlight = false // Blokada światła
+                        newLight[idx] = 0
+                    } else {
+                        if (sunlight) {
+                            newLight[idx] = 16 // Pełne słońce
+                            lightQueue[qTail++] = idx
+                        } else {
+                            newLight[idx] = 0
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Import światła z sąsiadów (Propagacja przez granice chunków - powietrze oświetla powietrze)
+        // West (x-1) -> Nasze x=0 czyta z x=15 sąsiada
+        chunks[Point(chunk.x - 1, chunk.z)]?.let { neighbor ->
+            for (z in 0 until 16) {
+                for (y in 0 until 128) {
+                    val nLight = neighbor.getLight(15, y, z)
+                    val idx = chunk.getIndex(0, y, z)
+                    if (nLight > 1 && chunk.blocks[idx] == 0 && newLight[idx] < nLight - 1) {
+                        newLight[idx] = (nLight - 1).toByte()
+                        lightQueue[qTail++] = idx
+                    }
+                }
+            }
+        }
+        // East (x+1) -> Nasze x=15 czyta z x=0 sąsiada
+        chunks[Point(chunk.x + 1, chunk.z)]?.let { neighbor ->
+            for (z in 0 until 16) {
+                for (y in 0 until 128) {
+                    val nLight = neighbor.getLight(0, y, z)
+                    val idx = chunk.getIndex(15, y, z)
+                    if (nLight > 1 && chunk.blocks[idx] == 0 && newLight[idx] < nLight - 1) {
+                        newLight[idx] = (nLight - 1).toByte()
+                        lightQueue[qTail++] = idx
+                    }
+                }
+            }
+        }
+        // North (z-1) -> Nasze z=0 czyta z z=15 sąsiada
+        chunks[Point(chunk.x, chunk.z - 1)]?.let { neighbor ->
+            for (x in 0 until 16) {
+                for (y in 0 until 128) {
+                    val nLight = neighbor.getLight(x, y, 15)
+                    val idx = chunk.getIndex(x, y, 0)
+                    if (nLight > 1 && chunk.blocks[idx] == 0 && newLight[idx] < nLight - 1) {
+                        newLight[idx] = (nLight - 1).toByte()
+                        lightQueue[qTail++] = idx
+                    }
+                }
+            }
+        }
+        // South (z+1) -> Nasze z=15 czyta z z=0 sąsiada
+        chunks[Point(chunk.x, chunk.z + 1)]?.let { neighbor ->
+            for (x in 0 until 16) {
+                for (y in 0 until 128) {
+                    val nLight = neighbor.getLight(x, y, 0)
+                    val idx = chunk.getIndex(x, y, 15)
+                    if (nLight > 1 && chunk.blocks[idx] == 0 && newLight[idx] < nLight - 1) {
+                        newLight[idx] = (nLight - 1).toByte()
+                        lightQueue[qTail++] = idx
+                    }
+                }
+            }
+        }
+
+        // 3. Propagacja światła (BFS)
+        while (qHead < qTail) {
+            val idx = lightQueue[qHead++]
+            val currentLight = newLight[idx].toInt()
+
+            if (currentLight <= 1) continue // Nie ma co propagować
+
+            val cx = idx % 16
+            val cz = (idx / 16) % 16
+            val cy_real = idx / 256
+
+            val neighbors = arrayOf(
+                Triple(cx + 1, cy_real, cz), Triple(cx - 1, cy_real, cz),
+                Triple(cx, cy_real + 1, cz), Triple(cx, cy_real - 1, cz),
+                Triple(cx, cy_real, cz + 1), Triple(cx, cy_real, cz - 1)
+            )
+
+            for ((nx, ny, nz) in neighbors) {
+                if (nx in 0..15 && ny in 0..127 && nz in 0..15) {
+                    val nIdx = chunk.getIndex(nx, ny, nz)
+                    // Jeśli sąsiad jest powietrzem (lub przezroczysty) i ma mniej światła
+                    if (chunk.blocks[nIdx] == 0 && newLight[nIdx] < currentLight - 1) {
+                        newLight[nIdx] = (currentLight - 1).toByte()
+                        lightQueue[qTail++] = nIdx
+                    }
+                }
+            }
+        }
+
+        // Kopiujemy obliczone światło do głównej tablicy chunka
+        System.arraycopy(newLight, 0, chunk.light, 0, newLight.size)
     }
 
     private fun generateOres(chunk: Chunk, cx: Int, cz: Int) {
@@ -336,6 +557,9 @@ class gridMap : JPanel() {
     }
 
     private fun generateOreType(chunk: Chunk, rand: Random, target: Int, color: Int, minSize: Int, maxSize: Int, minY: Int, maxY: Int, maxVeins: Int) {
+        // Automatyczna rejestracja koloru rudy do systemu X-Ray
+        oreColors.add(color)
+
         val veinsCount = rand.nextInt(maxVeins + 1)
         for (i in 0 until veinsCount) {
             val startX = rand.nextInt(16)
@@ -359,7 +583,7 @@ class gridMap : JPanel() {
         while (currentSize < size && attempts < size * 4) {
             attempts++
             val source = vein[rand.nextInt(vein.size)]
-            
+
             val dir = rand.nextInt(6)
             var dx = 0; var dy = 0; var dz = 0
             when(dir) {
@@ -468,13 +692,13 @@ class gridMap : JPanel() {
         }
 
         if (noiseVal > threshold) return BlockAir // Jaskinia (powietrze)
-        
+
         return baseColor
     }
 
     private fun generateStructureType(chunk: Chunk, cx: Int, cz: Int, model: List<ModelVoxel>, density: Double, minH: Int, maxH: Int, targetBlock: Int, yOffset: Int, clearSpace: Boolean = false, allowedRotations: List<Int> = listOf(0)) {
         val margin = 10 // Margines dla struktur wychodzących poza chunk (np. korona drzewa)
-        
+
         // Cache dla obróconych modeli, aby nie tworzyć nowych obiektów dla każdego drzewa
         val modelCache = mutableMapOf<Int, List<ModelVoxel>>()
 
@@ -485,36 +709,36 @@ class gridMap : JPanel() {
 
                 // Unikalny seed dla typu struktury (bazując na hashcode modelu)
                 if (isStructureAt(wx, wz, density, model.hashCode())) {
-                        // Zbieramy wszystkie pasujące wysokości w kolumnie
-                        val validYs = mutableListOf<Int>()
+                    // Zbieramy wszystkie pasujące wysokości w kolumnie
+                    val validYs = mutableListOf<Int>()
 
-                        val startY = maxOf(minH, 0)
-                        val endY = minOf(maxH, 127)
-                        
-                        for (y in startY..endY) {
-                            // Sprawdzamy blok na dole i blok powyżej (czy jest miejsce)
-                            // computeWorldBlock zwraca ID bloku matematycznie, niezależnie od chunka
-                            if (computeWorldBlock(wx, y, wz) == targetBlock && computeWorldBlock(wx, y + 1, wz) == BlockAir) {
-                                validYs.add(y)
-                            }
+                    val startY = maxOf(minH, 0)
+                    val endY = minOf(maxH, 127)
+
+                    for (y in startY..endY) {
+                        // Sprawdzamy blok na dole i blok powyżej (czy jest miejsce)
+                        // computeWorldBlock zwraca ID bloku matematycznie, niezależnie od chunka
+                        if (computeWorldBlock(wx, y, wz) == targetBlock && computeWorldBlock(wx, y + 1, wz) == BlockAir) {
+                            validYs.add(y)
                         }
-                        
-                        if (validYs.isNotEmpty()) {
-                            // Wybieramy losową wysokość z dostępnych (deterministycznie)
-                            val hash = (wx * 73856093 xor wz * 19349663 xor seed xor model.hashCode()).toString().hashCode()
-                            val random = Random(hash.toLong())
-                            random.nextDouble() // Przesuwamy stan RNG (to samo wywołanie co w isStructureAt)
-                            
-                            val selectedY = validYs[random.nextInt(validYs.size)]
+                    }
 
-                            // Zabezpieczenie przed pustą listą rotacji
-                            val rotation = if (allowedRotations.isNotEmpty()) allowedRotations[random.nextInt(allowedRotations.size)] else 0
-                            
-                            // Pobieramy z cache lub obliczamy i zapisujemy
-                            val finalModel = modelCache.getOrPut(rotation) { rotateModel(model, rotation) }
+                    if (validYs.isNotEmpty()) {
+                        // Wybieramy losową wysokość z dostępnych (deterministycznie)
+                        val hash = (wx * 73856093 xor wz * 19349663 xor seed xor model.hashCode()).toString().hashCode()
+                        val random = Random(hash.toLong())
+                        random.nextDouble() // Przesuwamy stan RNG (to samo wywołanie co w isStructureAt)
 
-                            placeStructure(chunk, lx, selectedY + yOffset, lz, finalModel, clearSpace)
-                        }
+                        val selectedY = validYs[random.nextInt(validYs.size)]
+
+                        // Zabezpieczenie przed pustą listą rotacji
+                        val rotation = if (allowedRotations.isNotEmpty()) allowedRotations[random.nextInt(allowedRotations.size)] else 0
+
+                        // Pobieramy z cache lub obliczamy i zapisujemy
+                        val finalModel = modelCache.getOrPut(rotation) { rotateModel(model, rotation) }
+
+                        placeStructure(chunk, lx, selectedY + yOffset, lz, finalModel, clearSpace)
+                    }
                 }
             }
         }
@@ -659,7 +883,7 @@ class gridMap : JPanel() {
         chunk.setBlock(lx, y, lz, color?.rgb ?: 0)
     }
 
-    private fun getTargetBlock(): BlockPos? {
+    private fun getTargetBlock(): RayHit? {
         val startX = camX / cubeSize + 0.5
         val startY = (camY + 10.0) / cubeSize + 0.5
         val startZ = camZ / cubeSize + 0.5
@@ -688,6 +912,8 @@ class gridMap : JPanel() {
         var tMaxY = if (dirY == 0.0) Double.MAX_VALUE else distY * tDeltaY
         var tMaxZ = if (dirZ == 0.0) Double.MAX_VALUE else distZ * tDeltaZ
 
+        var lastFace = -1
+
         while (true) {
             if (minOf(tMaxX, tMaxY, tMaxZ) > reachDistance) break
 
@@ -695,22 +921,26 @@ class gridMap : JPanel() {
                 if (tMaxX < tMaxZ) {
                     x += stepX
                     tMaxX += tDeltaX
+                    lastFace = if (stepX > 0) 2 else 3 // 2: Left(X-), 3: Right(X+)
                 } else {
                     z += stepZ
                     tMaxZ += tDeltaZ
+                    lastFace = if (stepZ > 0) 0 else 1 // 0: Front(Z-), 1: Back(Z+)
                 }
             } else {
                 if (tMaxY < tMaxZ) {
                     y += stepY
                     tMaxY += tDeltaY
+                    lastFace = if (stepY > 0) 5 else 4 // 5: Bottom(Y-), 4: Top(Y+)
                 } else {
                     z += stepZ
                     tMaxZ += tDeltaZ
+                    lastFace = if (stepZ > 0) 0 else 1
                 }
             }
 
             if (getBlock(x, y, z) != null) {
-                return BlockPos(x, y, z)
+                return RayHit(BlockPos(x, y, z), lastFace)
             }
         }
         return null
@@ -765,14 +995,9 @@ class gridMap : JPanel() {
 
                 val cx = if (x >= 0) x / 16 else (x + 1) / 16 - 1
                 val cz = if (z >= 0) z / 16 else (z + 1) / 16 - 1
-                updateChunkMesh(cx, cz)
 
-                val lx = x - cx * 16
-                val lz = z - cz * 16
-                if (lx == 0) updateChunkMesh(cx - 1, cz)
-                if (lx == 15) updateChunkMesh(cx + 1, cz)
-                if (lz == 0) updateChunkMesh(cx, cz - 1)
-                if (lz == 15) updateChunkMesh(cx, cz + 1)
+                // Używamy nowej metody z podwójnym przebiegiem i szerszym zasięgiem
+                refreshChunkData(cx, cz)
                 return
             }
         }
@@ -830,15 +1055,9 @@ class gridMap : JPanel() {
                 // Aktualizujemy tylko chunk, w którym zaszła zmiana
                 val cx = if (updateX >= 0) updateX / 16 else (updateX + 1) / 16 - 1
                 val cz = if (updateZ >= 0) updateZ / 16 else (updateZ + 1) / 16 - 1
-                updateChunkMesh(cx, cz)
 
-                // Jeśli blok jest na krawędzi chunka, aktualizujemy też sąsiada
-                val lx = updateX - cx * 16
-                val lz = updateZ - cz * 16
-                if (lx == 0) updateChunkMesh(cx - 1, cz)
-                if (lx == 15) updateChunkMesh(cx + 1, cz)
-                if (lz == 0) updateChunkMesh(cx, cz - 1)
-                if (lz == 15) updateChunkMesh(cx, cz + 1)
+                // Używamy nowej metody z podwójnym przebiegiem i szerszym zasięgiem
+                refreshChunkData(cx, cz)
                 return
             }
 
@@ -866,6 +1085,22 @@ class gridMap : JPanel() {
         val colorInt = chunk.getBlock(lx, y, lz)
         // Jeśli 0 to null (powietrze), w przeciwnym razie odtwarzamy obiekt Color
         return if (colorInt == 0) null else Color(colorInt)
+    }
+
+    // Pobiera poziom światła z globalnych współrzędnych
+    private fun getLight(x: Int, y: Int, z: Int): Int {
+        if (y < 0 || y >= 128) return 16 // Poza światem jasno
+        val cx = if (x >= 0) x / 16 else (x + 1) / 16 - 1
+        val cz = if (z >= 0) z / 16 else (z + 1) / 16 - 1
+
+        val chunk = chunks[Point(cx, cz)] ?: return 16 // Jeśli chunk nie załadowany, zakładamy jasno
+
+        var lx = x % 16
+        if (lx < 0) lx += 16
+        var lz = z % 16
+        if (lz < 0) lz += 16
+
+        return chunk.getLight(lx, y, lz)
     }
 
     // Generuje mesh tylko dla jednego chunka
@@ -1001,18 +1236,19 @@ class gridMap : JPanel() {
             }
         }
 
-        fun addTri(i1: Int, i2: Int, i3: Int, i4: Int, shade: Double, ao: DoubleArray) {
+        fun addTri(i1: Int, i2: Int, i3: Int, i4: Int, shade: Double, ao: DoubleArray, light: Int) {
             val v1 = p[i1].copy().apply { this.ao = ao[0] * shade }
             val v2 = p[i2].copy().apply { this.ao = ao[1] * shade }
             val v3 = p[i3].copy().apply { this.ao = ao[2] * shade }
             val v4 = p[i4].copy().apply { this.ao = ao[3] * shade }
 
-            target.add(Triangle3d(v1, v2, v3, c))
-            target.add(Triangle3d(v1, v3, v4, c))
+            target.add(Triangle3d(v1, v2, v3, c, light))
+            target.add(Triangle3d(v1, v3, v4, c, light))
         }
 
         val aoValues = DoubleArray(4)
         val v = Array(4) { BooleanArray(3) }
+        var lightLevel = 16
 
         // Obliczanie AO dla 4 wierzchołków danej ściany
         when (faceType) {
@@ -1022,7 +1258,8 @@ class gridMap : JPanel() {
                 v[2][0] = getBlock(wx + 1, wy, wz - 1) != null; v[2][1] = getBlock(wx, wy + 1, wz - 1) != null; v[2][2] = getBlock(wx + 1, wy + 1, wz - 1) != null
                 v[3][0] = getBlock(wx - 1, wy, wz - 1) != null; v[3][1] = getBlock(wx, wy + 1, wz - 1) != null; v[3][2] = getBlock(wx - 1, wy + 1, wz - 1) != null
                 for (i in 0..3) aoValues[i] = vertexAO(v[i][0], v[i][1], v[i][2])
-                addTri(0, 1, 2, 3, 0.8, aoValues)
+                lightLevel = getLight(wx, wy, wz - 1)
+                addTri(0, 1, 2, 3, 0.8, aoValues, lightLevel)
             }
             1 -> { // Back (Z+), quad 5,4,7,6
                 v[0][0] = getBlock(wx + 1, wy, wz + 1) != null; v[0][1] = getBlock(wx, wy - 1, wz + 1) != null; v[0][2] = getBlock(wx + 1, wy - 1, wz + 1) != null
@@ -1030,7 +1267,8 @@ class gridMap : JPanel() {
                 v[2][0] = getBlock(wx - 1, wy, wz + 1) != null; v[2][1] = getBlock(wx, wy + 1, wz + 1) != null; v[2][2] = getBlock(wx - 1, wy + 1, wz + 1) != null
                 v[3][0] = getBlock(wx + 1, wy, wz + 1) != null; v[3][1] = getBlock(wx, wy + 1, wz + 1) != null; v[3][2] = getBlock(wx + 1, wy + 1, wz + 1) != null
                 for (i in 0..3) aoValues[i] = vertexAO(v[i][0], v[i][1], v[i][2])
-                addTri(5, 4, 7, 6, 0.8, aoValues)
+                lightLevel = getLight(wx, wy, wz + 1)
+                addTri(5, 4, 7, 6, 0.8, aoValues, lightLevel)
             }
             2 -> { // Left (X-), quad 4,0,3,7
                 v[0][0] = getBlock(wx - 1, wy, wz + 1) != null; v[0][1] = getBlock(wx - 1, wy - 1, wz) != null; v[0][2] = getBlock(wx - 1, wy - 1, wz + 1) != null
@@ -1038,7 +1276,8 @@ class gridMap : JPanel() {
                 v[2][0] = getBlock(wx - 1, wy, wz - 1) != null; v[2][1] = getBlock(wx - 1, wy + 1, wz) != null; v[2][2] = getBlock(wx - 1, wy + 1, wz - 1) != null
                 v[3][0] = getBlock(wx - 1, wy, wz + 1) != null; v[3][1] = getBlock(wx - 1, wy + 1, wz) != null; v[3][2] = getBlock(wx - 1, wy + 1, wz + 1) != null
                 for (i in 0..3) aoValues[i] = vertexAO(v[i][0], v[i][1], v[i][2])
-                addTri(4, 0, 3, 7, 0.6, aoValues)
+                lightLevel = getLight(wx - 1, wy, wz)
+                addTri(4, 0, 3, 7, 0.6, aoValues, lightLevel)
             }
             3 -> { // Right (X+), quad 1,5,6,2
                 v[0][0] = getBlock(wx + 1, wy, wz - 1) != null; v[0][1] = getBlock(wx + 1, wy - 1, wz) != null; v[0][2] = getBlock(wx + 1, wy - 1, wz - 1) != null
@@ -1046,7 +1285,8 @@ class gridMap : JPanel() {
                 v[2][0] = getBlock(wx + 1, wy, wz + 1) != null; v[2][1] = getBlock(wx + 1, wy + 1, wz) != null; v[2][2] = getBlock(wx + 1, wy + 1, wz + 1) != null
                 v[3][0] = getBlock(wx + 1, wy, wz - 1) != null; v[3][1] = getBlock(wx + 1, wy + 1, wz) != null; v[3][2] = getBlock(wx + 1, wy + 1, wz - 1) != null
                 for (i in 0..3) aoValues[i] = vertexAO(v[i][0], v[i][1], v[i][2])
-                addTri(1, 5, 6, 2, 0.6, aoValues)
+                lightLevel = getLight(wx + 1, wy, wz)
+                addTri(1, 5, 6, 2, 0.6, aoValues, lightLevel)
             }
             4 -> { // Top (Y+), quad 3,2,6,7
                 v[0][0] = getBlock(wx - 1, wy + 1, wz) != null; v[0][1] = getBlock(wx, wy + 1, wz - 1) != null; v[0][2] = getBlock(wx - 1, wy + 1, wz - 1) != null
@@ -1054,7 +1294,8 @@ class gridMap : JPanel() {
                 v[2][0] = getBlock(wx + 1, wy + 1, wz) != null; v[2][1] = getBlock(wx, wy + 1, wz + 1) != null; v[2][2] = getBlock(wx + 1, wy + 1, wz + 1) != null
                 v[3][0] = getBlock(wx - 1, wy + 1, wz) != null; v[3][1] = getBlock(wx, wy + 1, wz + 1) != null; v[3][2] = getBlock(wx - 1, wy + 1, wz + 1) != null
                 for (i in 0..3) aoValues[i] = vertexAO(v[i][0], v[i][1], v[i][2])
-                addTri(3, 2, 6, 7, 1.0, aoValues)
+                lightLevel = getLight(wx, wy + 1, wz)
+                addTri(3, 2, 6, 7, 1.0, aoValues, lightLevel)
             }
             5 -> { // Bottom (Y-), quad 4,5,1,0
                 v[0][0] = getBlock(wx - 1, wy - 1, wz) != null; v[0][1] = getBlock(wx, wy - 1, wz + 1) != null; v[0][2] = getBlock(wx - 1, wy - 1, wz + 1) != null
@@ -1062,7 +1303,8 @@ class gridMap : JPanel() {
                 v[2][0] = getBlock(wx + 1, wy - 1, wz) != null; v[2][1] = getBlock(wx, wy - 1, wz - 1) != null; v[2][2] = getBlock(wx + 1, wy - 1, wz - 1) != null
                 v[3][0] = getBlock(wx - 1, wy - 1, wz) != null; v[3][1] = getBlock(wx, wy - 1, wz - 1) != null; v[3][2] = getBlock(wx - 1, wy - 1, wz - 1) != null
                 for (i in 0..3) aoValues[i] = vertexAO(v[i][0], v[i][1], v[i][2])
-                addTri(4, 5, 1, 0, 0.4, aoValues)
+                lightLevel = getLight(wx, wy - 1, wz)
+                addTri(4, 5, 1, 0, 0.4, aoValues, lightLevel)
             }
         }
     }
@@ -1080,6 +1322,7 @@ class gridMap : JPanel() {
         Thread {
             var lastTime = System.nanoTime()
             val nsPerTick = 1000000000.0 / 30.0 // TPS (Ticki fizyki na sekundę)
+            val nsPerFrame = 1000000000.0 / 120.0 // limit FPS
             var delta = 0.0
 
             while (running) {
@@ -1101,6 +1344,22 @@ class gridMap : JPanel() {
                     lastAutoSaveTime = System.currentTimeMillis()
                 }
 
+                // --- DAY/NIGHT CYCLE ---
+                // 24 minuty = 1440 sekund = 24 godziny w grze
+                // 1 godzina w grze = 60 sekund realnych
+                // 30 TPS -> 1 tick = 1/30 sekundy
+                // Delta w godzinach na tick = 1.0 / (60.0 * 30.0)
+                val timeStep = 1.0 / (60.0 * 30.0)
+                gameTime = (gameTime + timeStep) % 24.0
+
+                // Obliczanie jasności słońca (9:00 - 21:00 dzień, reszta noc)
+                if (gameTime in 9.0..21.0) {
+                    val angle = (gameTime - 9.0) / 12.0 * Math.PI
+                    globalSunIntensity = sin(angle)
+                } else {
+                    globalSunIntensity = 0.0
+                }
+
                 if (delta > 10) delta = 10.0 // Zabezpieczenie przed "spiralą śmierci" przy dużym lagu
 
                 while (delta >= 1) {
@@ -1115,21 +1374,62 @@ class gridMap : JPanel() {
                 // Kopiujemy bufor renderowania do bufora wyświetlania (Double Buffering)
                 System.arraycopy(backBuffer, 0, pixels, 0, pixels.size)
                 repaint()
+
+                // --- FPS LIMITER ---
+                val frameTime = System.nanoTime() - now
+                if (frameTime < nsPerFrame) {
+                    val sleepNs = (nsPerFrame - frameTime).toLong()
+                    if (sleepNs > 0) {
+                        Thread.sleep(sleepNs / 1000000, (sleepNs % 1000000).toInt())
+                    }
+                }
             }
         }.start()
     }
 
+    // Prekalkulowane wartości dla Frustum Culling
+    private val sectionRadius = sqrt(3.0) * 4.0 * cubeSize
+    private val sectionSafeRadius = sectionRadius * 1.42
+
+    private fun isSegmentVisible(secX: Int, secY: Int, secZ: Int): Boolean {
+        val cx = if (secX >= 0) secX / 2 else (secX + 1) / 2 - 1
+        val cz = if (secZ >= 0) secZ / 2 else (secZ + 1) / 2 - 1
+        val localSecX = abs(secX % 2)
+        val localSecZ = abs(secZ % 2)
+        return isSectionVisible(cx, localSecX, secY, localSecZ, cz)
+    }
+
     private fun rebuildVisibilityGraph(startSecX: Int, startSecY: Int, startSecZ: Int) {
-        cachedVisibleSegments.clear()
-
-        val queue = java.util.ArrayDeque<Triple<Int, Int, Int>>()
-        val visited = java.util.HashSet<Triple<Int, Int, Int>>()
-
-        val startNode = Triple(startSecX, startSecY, startSecZ)
-        queue.add(startNode)
-        visited.add(startNode)
+        visibleSegmentsCount = 0
 
         val maxRadius = renderDistance * 2
+        val diameter = maxRadius * 2 + 1
+
+        // Resetujemy token odwiedzin (szybsze niż czyszczenie tablicy)
+        bfsVisitToken++
+        if (bfsVisitToken == 0) bfsVisitToken = 1 // Unikamy 0
+
+        // Upewniamy się, że tablica visited jest wystarczająco duża
+        val requiredSize = diameter * 16 * diameter
+        if (bfsVisited.size < requiredSize) {
+            bfsVisited = IntArray(requiredSize)
+        }
+
+        // Inicjalizacja kolejki
+        var qHead = 0
+        var qTail = 0
+
+        // Dodajemy startNode
+        bfsQueue[qTail++] = startSecX
+        bfsQueue[qTail++] = startSecY
+        bfsQueue[qTail++] = startSecZ
+
+        // Oznaczamy startNode jako odwiedzony
+        // Mapowanie (relativeX, y, relativeZ) -> index
+        // relativeX = x - startSecX + maxRadius
+        val startIndex = (maxRadius * 16 + startSecY) * diameter + maxRadius
+        bfsVisited[startIndex] = bfsVisitToken
+
         // Kierunki i odpowiadające im bity ścian:
         // Triple(dx, dy, dz), ExitBit (z obecnego), EntryBit (do sąsiada)
         val dirs = arrayOf(
@@ -1141,14 +1441,21 @@ class gridMap : JPanel() {
             Triple(Triple(0, -1, 0), FACE_DOWN, FACE_UP)      // Y-
         )
 
-        while (!queue.isEmpty()) {
-            val current = queue.poll()
-            val (currX, currY, currZ) = current
+        while (qHead < qTail) {
+            val currX = bfsQueue[qHead++]
+            val currY = bfsQueue[qHead++]
+            val currZ = bfsQueue[qHead++]
 
             // Optymalizacja: Dodajemy do listy renderowania TYLKO jeśli segment ma geometrię.
             // Puste segmenty (powietrze) są odwiedzane przez BFS, ale nie muszą być rysowane.
             if (!isSegmentEmptyBySec(currX, currY, currZ)) {
-                cachedVisibleSegments.add(current)
+                if (visibleSegmentsCount * 3 >= visibleSegmentsFlat.size) {
+                    visibleSegmentsFlat = visibleSegmentsFlat.copyOf(visibleSegmentsFlat.size * 2)
+                }
+                visibleSegmentsFlat[visibleSegmentsCount * 3] = currX
+                visibleSegmentsFlat[visibleSegmentsCount * 3 + 1] = currY
+                visibleSegmentsFlat[visibleSegmentsCount * 3 + 2] = currZ
+                visibleSegmentsCount++
             }
 
             // Pobieramy maskę okluzji obecnego segmentu
@@ -1160,7 +1467,14 @@ class gridMap : JPanel() {
                 val nz = currZ + dir.third
 
                 if (ny < 0 || ny > 15) continue
-                if (abs(nx - startSecX) > maxRadius || abs(nz - startSecZ) > maxRadius) continue
+
+                val dx = nx - startSecX
+                val dz = nz - startSecZ
+                if (abs(dx) > maxRadius || abs(dz) > maxRadius) continue
+
+                // Sprawdzamy visited
+                val visitIndex = ((dx + maxRadius) * 16 + ny) * diameter + (dz + maxRadius)
+                if (bfsVisited[visitIndex] == bfsVisitToken) continue
 
                 // 1. Sprawdzamy czy możemy wyjść z obecnego segmentu w tym kierunku
                 // Jeśli ściana wyjściowa jest pełna, a my nie jesteśmy wewnątrz niej (kamera), to nie widzimy przez nią.
@@ -1169,18 +1483,34 @@ class gridMap : JPanel() {
                     continue
                 }
 
+                // Fix: Frustum Culling w BFS - nie wchodzimy do segmentów poza widokiem
+                if (!isSegmentVisible(nx, ny, nz)) continue
+
                 // 2. Sprawdzamy czy możemy wejść do sąsiada
                 val neighborMask = getSegmentOcclusionMask(nx, ny, nz)
-                // Jeśli ściana wejściowa sąsiada jest pełna -> Widzimy tę ścianę (dodajemy do kolejki/listy),
-                // ale NIE widzimy nic za nią (nie propagujemy dalej BFS w tym kierunku).
-                // Ale musimy dodać sąsiada do visited/queue, żeby został narysowany.
-                // W BFS "queue" służy do propagacji. Jeśli tu zablokujemy, to sąsiad zostanie dodany,
-                // ale w następnej iteracji pętli while, "currMask" (którym będzie ten sąsiad) zablokuje wyjście (krok 1 powyżej).
-                // Więc po prostu dodajemy do kolejki. Logika "ExitBit" w następnym kroku załatwi sprawę zatrzymania.
 
-                val neighbor = Triple(nx, ny, nz)
-                if (visited.add(neighbor)) {
-                    queue.add(neighbor)
+                // Oznaczamy jako odwiedzony
+                bfsVisited[visitIndex] = bfsVisitToken
+
+                // Fix: Jeśli ściana wejściowa jest pełna, widzimy ją, ale nie propagujemy BFS dalej (nie widzimy przez nią).
+                if ((neighborMask.toInt() and entryBit) == 0) { // Jeśli ściana wejściowa NIE jest pełna...
+                    // ZABEZPIECZENIE: Sprawdzamy czy kolejka się nie przepełni
+                    if (qTail + 3 >= bfsQueue.size) break
+
+                    bfsQueue[qTail++] = nx
+                    bfsQueue[qTail++] = ny
+                    bfsQueue[qTail++] = nz
+                } else { // Jeśli ściana wejściowa JEST pełna...
+                    // Widzimy tę ścianę, więc musimy ją narysować.
+                    if (!isSegmentEmptyBySec(nx, ny, nz)) {
+                        if (visibleSegmentsCount * 3 >= visibleSegmentsFlat.size) {
+                            visibleSegmentsFlat = visibleSegmentsFlat.copyOf(visibleSegmentsFlat.size * 2)
+                        }
+                        visibleSegmentsFlat[visibleSegmentsCount * 3] = nx
+                        visibleSegmentsFlat[visibleSegmentsCount * 3 + 1] = ny
+                        visibleSegmentsFlat[visibleSegmentsCount * 3 + 2] = nz
+                        visibleSegmentsCount++
+                    }
                 }
             }
         }
@@ -1202,17 +1532,22 @@ class gridMap : JPanel() {
         val camSecZ = floor(camZ / segmentSize).toInt()
 
         // Aktualizacja grafu widoczności tylko gdy zmienimy segment lub świat się zmieni
-        if (visibilityGraphDirty || camSecX != lastCamSecX || camSecY != lastCamSecY || camSecZ != lastCamSecZ) {
+        if (visibilityGraphDirty || camSecX != lastCamSecX || camSecY != lastCamSecY || camSecZ != lastCamSecZ ||
+            abs(yaw - lastYaw) > 0.001 || abs(pitch - lastPitch) > 0.001) {
             rebuildVisibilityGraph(camSecX, camSecY, camSecZ)
             lastCamSecX = camSecX
             lastCamSecY = camSecY
             lastCamSecZ = camSecZ
+            lastYaw = yaw
+            lastPitch = pitch
             visibilityGraphDirty = false
         }
 
         // Iterujemy po wcześniej obliczonych widocznych segmentach
-        for (i in cachedVisibleSegments.indices) {
-            val (currX, currY, currZ) = cachedVisibleSegments[i]
+        for (i in 0 until visibleSegmentsCount) {
+            val currX = visibleSegmentsFlat[i * 3]
+            val currY = visibleSegmentsFlat[i * 3 + 1]
+            val currZ = visibleSegmentsFlat[i * 3 + 2]
 
             // Konwersja globalnych współrzędnych segmentu na Chunk + Local Segment
             val cx = if (currX >= 0) currX / 2 else (currX + 1) / 2 - 1
@@ -1244,7 +1579,7 @@ class gridMap : JPanel() {
                                 )
 
                                 if (t1.x * normal.x + t1.y * normal.y + t1.z * normal.z > 0) {
-                                    trianglesToRaster.add(Triangle3d(t1, t2, t3, tri.color))
+                                    trianglesToRaster.add(Triangle3d(t1, t2, t3, tri.color, tri.lightLevel))
                                 }
                             }
                         }
@@ -1263,7 +1598,17 @@ class gridMap : JPanel() {
                 val p2_2d = project(clipped.p2)
                 val p3_2d = project(clipped.p3)
 
-                fillTriangle(p1_2d, p2_2d, p3_2d, clipped.p1, clipped.p2, clipped.p3, clipped.color)
+                // Aplikujemy oświetlenie dnia/nocy oraz cienie
+                // clipped.lightLevel to wartość 0-16 z mapy światła
+                // globalSunIntensity to 0.0-1.0 z cyklu dnia
+                // Zmiana: Poziom 0 to 1/4 jasności (0.25), poziom 16 to pełna jasność (1.0)
+                val lightFactor = 0.25 + 0.75 * (clipped.lightLevel / 16.0) * globalSunIntensity
+
+                val r = (clipped.color.red * lightFactor).toInt().coerceIn(0, 255)
+                val g = (clipped.color.green * lightFactor).toInt().coerceIn(0, 255)
+                val b = (clipped.color.blue * lightFactor).toInt().coerceIn(0, 255)
+
+                fillTriangle(p1_2d, p2_2d, p3_2d, clipped.p1, clipped.p2, clipped.p3, Color(r, g, b))
             }
         }
 
@@ -1271,121 +1616,13 @@ class gridMap : JPanel() {
             renderChunkBorders()
         }
 
-        val target = getTargetBlock()
-        if (target != null) {
-            drawSelectionBox(target)
+        val hit = getTargetBlock()
+        if (hit != null) {
+            drawSelectionBox(hit.blockPos)
         }
-    }
 
-    private fun checkPointOcclusion(px: Double, py: Double, pz: Double, cx: Double, cy: Double, cz: Double, targetSecX: Int, targetSecY: Int, targetSecZ: Int): Boolean {
-        val vx = px - cx; val vy = py - cy; val vz = pz - cz
-        val dist = sqrt(vx * vx + vy * vy + vz * vz)
-        return fastSegmentRaycast(cx, cy, cz, vx / dist, vy / dist, vz / dist, dist, targetSecX, targetSecY, targetSecZ)
-    }
-
-    // Szybki Raycast sprawdzający tylko czy trafiliśmy w jakikolwiek blok na drodze
-    private fun fastRaycastHit(startX: Double, startY: Double, startZ: Double, dirX: Double, dirY: Double, dirZ: Double, maxDist: Double): Boolean {
-        // Pozycja startowa w przestrzeni voxeli
-        var x = floor(startX / cubeSize + 0.5).toInt()
-        var y = floor((startY + 10.0) / cubeSize + 0.5).toInt()
-        var z = floor(startZ / cubeSize + 0.5).toInt()
-
-        val stepX = if (dirX > 0) 1 else -1
-        val stepY = if (dirY > 0) 1 else -1
-        val stepZ = if (dirZ > 0) 1 else -1
-
-        val tDeltaX = if (dirX == 0.0) Double.MAX_VALUE else abs(1.0 / dirX)
-        val tDeltaY = if (dirY == 0.0) Double.MAX_VALUE else abs(1.0 / dirY)
-        val tDeltaZ = if (dirZ == 0.0) Double.MAX_VALUE else abs(1.0 / dirZ)
-
-        val voxelStartX = x * cubeSize // Przybliżona pozycja środka voxela startowego w świecie (uproszczona)
-        // Dokładniejsze obliczenie dystansu do pierwszej granicy
-        // (startX / cubeSize) to pozycja w jednostkach bloków.
-        val gridX = startX / cubeSize
-        val gridY = (startY + 10.0) / cubeSize
-        val gridZ = startZ / cubeSize
-
-        val distX = if (stepX > 0) (floor(gridX + 0.5) + 0.5 - gridX) else (gridX - (floor(gridX + 0.5) - 0.5))
-        val distY = if (stepY > 0) (floor(gridY + 0.5) + 0.5 - gridY) else (gridY - (floor(gridY + 0.5) - 0.5))
-        val distZ = if (stepZ > 0) (floor(gridZ + 0.5) + 0.5 - gridZ) else (gridZ - (floor(gridZ + 0.5) - 0.5))
-
-        var tMaxX = if (dirX == 0.0) Double.MAX_VALUE else abs(distX) * tDeltaX
-        var tMaxY = if (dirY == 0.0) Double.MAX_VALUE else abs(distY) * tDeltaY
-        var tMaxZ = if (dirZ == 0.0) Double.MAX_VALUE else abs(distZ) * tDeltaZ
-
-        // Przeliczamy maxDist na jednostki t (kroki DDA)
-        // t = distance / cubeSize (w przybliżeniu, bo tDelta są znormalizowane do 1 bloku)
-        val maxT = maxDist / cubeSize
-
-        while (true) {
-            if (minOf(tMaxX, tMaxY, tMaxZ) > maxT) return false // Nie trafiliśmy w nic do limitu dystansu
-
-            if (tMaxX < tMaxY) {
-                if (tMaxX < tMaxZ) { x += stepX; tMaxX += tDeltaX } else { z += stepZ; tMaxZ += tDeltaZ }
-            } else {
-                if (tMaxY < tMaxZ) { y += stepY; tMaxY += tDeltaY } else { z += stepZ; tMaxZ += tDeltaZ }
-            }
-
-            // Jeśli trafiliśmy w blok, zwracamy true (jest okluzja)
-            if (getBlock(x, y, z) != null) {
-                // Sprawdzamy, czy ten blok należy do "pełnego" segmentu.
-                // Jeśli tak, to jest to ściana/ziemia i blokuje widok.
-                // Jeśli nie (np. drzewo), ignorujemy to trafienie i szukamy dalej.
-                if (isSegmentOccluder(x, y, z)) {
-                    return true // Trafiliśmy w inny pełny segment -> Zasłonięty.
-                }
-            }
-        }
-    }
-
-    // Bardzo szybki Raycast działający na siatce segmentów (8x8x8), a nie bloków.
-    // Ignoruje drzewa i małe przeszkody. Zatrzymuje się tylko na pełnych segmentach (Occluderach).
-    private fun fastSegmentRaycast(startX: Double, startY: Double, startZ: Double, dirX: Double, dirY: Double, dirZ: Double, maxDist: Double, targetSecX: Int, targetSecY: Int, targetSecZ: Int): Boolean {
-        val segmentSize = 8 * cubeSize // 16.0
-
-        // Start w przestrzeni segmentów
-        var x = floor(startX / segmentSize).toInt()
-        var y = floor((startY + 10.0) / segmentSize).toInt()
-        var z = floor(startZ / segmentSize).toInt()
-
-        val stepX = if (dirX > 0) 1 else -1
-        val stepY = if (dirY > 0) 1 else -1
-        val stepZ = if (dirZ > 0) 1 else -1
-
-        val tDeltaX = if (dirX == 0.0) Double.MAX_VALUE else abs(1.0 / dirX)
-        val tDeltaY = if (dirY == 0.0) Double.MAX_VALUE else abs(1.0 / dirY)
-        val tDeltaZ = if (dirZ == 0.0) Double.MAX_VALUE else abs(1.0 / dirZ)
-
-        val gridX = startX / segmentSize
-        val gridY = (startY + 10.0) / segmentSize
-        val gridZ = startZ / segmentSize
-
-        val distX = if (stepX > 0) (floor(gridX) + 1.0 - gridX) else (gridX - floor(gridX))
-        val distY = if (stepY > 0) (floor(gridY) + 1.0 - gridY) else (gridY - floor(gridY))
-        val distZ = if (stepZ > 0) (floor(gridZ) + 1.0 - gridZ) else (gridZ - floor(gridZ))
-
-        var tMaxX = if (dirX == 0.0) Double.MAX_VALUE else abs(distX) * tDeltaX
-        var tMaxY = if (dirY == 0.0) Double.MAX_VALUE else abs(distY) * tDeltaY
-        var tMaxZ = if (dirZ == 0.0) Double.MAX_VALUE else abs(distZ) * tDeltaZ
-
-        val maxT = maxDist / segmentSize
-
-        while (true) {
-            if (minOf(tMaxX, tMaxY, tMaxZ) > maxT) return false // Dolatujemy do celu bez przeszkód
-
-            if (tMaxX < tMaxY) {
-                if (tMaxX < tMaxZ) { x += stepX; tMaxX += tDeltaX } else { z += stepZ; tMaxZ += tDeltaZ }
-            } else {
-                if (tMaxY < tMaxZ) { y += stepY; tMaxY += tDeltaY } else { z += stepZ; tMaxZ += tDeltaZ }
-            }
-
-            // Jeśli dotarliśmy do segmentu docelowego -> Widoczny
-            if (x == targetSecX && y == targetSecY && z == targetSecZ) return false
-
-            // Sprawdzamy czy segment jest pełny (Occluder)
-            if (isSegmentEmptyBySec(x, y, z)) {
-                return true // Trafiliśmy w ścianę
-            }
+        if (debugXray) {
+            renderXRay()
         }
     }
 
@@ -1404,16 +1641,6 @@ class gridMap : JPanel() {
         return occlusionData[index]
     }
 
-    private fun isSegmentOccluder(x: Int, y: Int, z: Int): Boolean {
-        // Używane przez Raycast - uznajemy za okluder tylko jeśli WSZYSTKIE ściany są pełne (lub wewnątrz jest pełno)
-        // Można to ulepszyć, ale dla raycastu "fast skip" wystarczy sprawdzenie flagi FULL (63)
-        val secX = floor(x / 8.0).toInt()
-        val secY = floor((y + 10.0) / 8.0).toInt()
-        val secZ = floor(z / 8.0).toInt()
-        val mask = getSegmentOcclusionMask(secX, secY, secZ)
-        return mask == SEGMENT_FULL.toByte()
-    }
-
     private fun isSegmentEmptyBySec(secX: Int, secY: Int, secZ: Int): Boolean {
         if (secY < 0 || secY > 15) return true
         val cx = if (secX >= 0) secX / 2 else (secX + 1) / 2 - 1
@@ -1425,17 +1652,6 @@ class gridMap : JPanel() {
         val localSecZ = abs(secZ % 2)
         val index = secY * 4 + localSecZ * 2 + localSecX
         return mesh[index].isEmpty()
-    }
-
-    private fun calculateSectionIndex(x: Int, y: Int, z: Int): Int {
-        var lx = x % 16; if (lx < 0) lx += 16
-        var lz = z % 16; if (lz < 0) lz += 16
-
-        val secX = lx / 8
-        val secY = (y / 8).coerceIn(0, 15)
-        val secZ = lz / 8
-
-        return secY * 4 + secZ * 2 + secX
     }
 
     private fun isSectionVisible(cx: Int, secX: Int, secY: Int, secZ: Int, cz: Int): Boolean {
@@ -1458,9 +1674,8 @@ class gridMap : JPanel() {
         val centerY = (secY * 8 + 4) * cubeSize - 10.0
         val centerZ = (cz * 16 + secZ * 8 + 4) * cubeSize
 
-        // Promień otaczający sekcję 8x8x8 (sqrt(4^2 + 4^2 + 4^2) ~= 6.9)
-        // Dajemy lekki zapas (8.0)
-        val radius = 8.0 * cubeSize
+        // Używamy pre-kalkulowanego promienia
+        val radius = sectionRadius
 
         // Transformacja punktu środkowego do przestrzeni kamery (uproszczona wersja transform())
         var x = centerX - camX
@@ -1489,10 +1704,9 @@ class gridMap : JPanel() {
         // 3. Czy sekcja jest w stożku widzenia (FOV)?
         // Obliczamy proporcje ekranu (Aspect Ratio), bo ekran jest szerszy niż wyższy
         val aspect = baseCols.toDouble() / baseRows.toDouble()
-        
-        // Margines bezpieczeństwa dla promienia (1.5x), aby uwzględnić geometrię sfery vs płaszczyzny
-        val safeRadius = radius * 1.5
-        
+
+        val safeRadius = sectionSafeRadius
+
         // Dla FOV 90, tan(45) = 1.0.
         // Sprawdzamy poziomo (X). Slope = 1.0.
         // Dodajemy warunek limitX > 0, aby uniknąć błędów przy ujemnym Z (gdy obiekt jest blisko/za kamerą)
@@ -1551,11 +1765,11 @@ class gridMap : JPanel() {
 
         val result = mutableListOf<Triangle3d>()
         if (output.size == 3) {
-            result.add(Triangle3d(output[0], output[1], output[2], tri.color))
+            result.add(Triangle3d(output[0], output[1], output[2], tri.color, tri.lightLevel))
         } else if (output.size == 4) {
             // Jeśli powstał czworokąt, dzielimy go na dwa trójkąty
-            result.add(Triangle3d(output[0], output[1], output[2], tri.color))
-            result.add(Triangle3d(output[0], output[2], output[3], tri.color))
+            result.add(Triangle3d(output[0], output[1], output[2], tri.color, tri.lightLevel))
+            result.add(Triangle3d(output[0], output[2], output[3], tri.color, tri.lightLevel))
         }
         return result
     }
@@ -1582,6 +1796,46 @@ class gridMap : JPanel() {
         val screenY = py + (baseRows / 2)
 
         return Vector3d(screenX, screenY, v.z)
+    }
+
+    private fun renderXRay() {
+        val currentChunkX = floor(camX / 32.0).toInt()
+        val currentChunkZ = floor(camZ / 32.0).toInt()
+        val radius = renderDistance
+
+        for (cx in currentChunkX - radius..currentChunkX + radius) {
+            for (cz in currentChunkZ - radius..currentChunkZ + radius) {
+                val chunk = chunks[Point(cx, cz)] ?: continue
+
+                for (i in 0 until 64) {
+                    val secY = i / 4
+                    val rem = i % 4
+                    val secZ = rem / 2
+                    val secX = rem % 2
+
+                    if (isSectionVisible(cx, secX, secY, secZ, cz)) {
+                        val startX = secX * 8
+                        val startY = secY * 8
+                        val startZ = secZ * 8
+
+                        for (ly in startY until startY + 8) {
+                            val yOffset = ly * 256
+                            for (lz in startZ until startZ + 8) {
+                                val zOffset = lz * 16
+                                for (lx in startX until startX + 8) {
+                                    val color = chunk.blocks[lx + zOffset + yOffset]
+                                    if (oreColors.contains(color)) {
+                                        val wx = cx * 16 + lx
+                                        val wz = cz * 16 + lz
+                                        drawXRayBox(wx, ly, wz, Color(color))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     private fun renderChunkBorders() {
@@ -1672,7 +1926,33 @@ class gridMap : JPanel() {
         drawLine3D(c2, c6, color); drawLine3D(c3, c7, color)
     }
 
-    private fun drawLine3D(p1: Vector3d, p2: Vector3d, color: Color) {
+    private fun drawXRayBox(x: Int, y: Int, z: Int, color: Color) {
+        val wx = x * cubeSize
+        val wy = y * cubeSize - 10.0
+        val wz = z * cubeSize
+        val d = cubeSize / 2.0
+
+        val c0 = Vector3d(wx - d, wy - d, wz - d)
+        val c1 = Vector3d(wx + d, wy - d, wz - d)
+        val c2 = Vector3d(wx + d, wy + d, wz - d)
+        val c3 = Vector3d(wx - d, wy + d, wz - d)
+        val c4 = Vector3d(wx - d, wy - d, wz + d)
+        val c5 = Vector3d(wx + d, wy - d, wz + d)
+        val c6 = Vector3d(wx + d, wy + d, wz + d)
+        val c7 = Vector3d(wx - d, wy + d, wz + d)
+
+        // Front
+        drawLine3D(c0, c1, color, true); drawLine3D(c1, c2, color, true)
+        drawLine3D(c2, c3, color, true); drawLine3D(c3, c0, color, true)
+        // Back
+        drawLine3D(c4, c5, color, true); drawLine3D(c5, c6, color, true)
+        drawLine3D(c6, c7, color, true); drawLine3D(c7, c4, color, true)
+        // Connecting
+        drawLine3D(c0, c4, color, true); drawLine3D(c1, c5, color, true)
+        drawLine3D(c2, c6, color, true); drawLine3D(c3, c7, color, true)
+    }
+
+    private fun drawLine3D(p1: Vector3d, p2: Vector3d, color: Color, ignoreDepth: Boolean = false) {
         val t1 = transform(p1)
         val t2 = transform(p2)
 
@@ -1687,10 +1967,10 @@ class gridMap : JPanel() {
         val proj1 = project(v1)
         val proj2 = project(v2)
 
-        rasterizeLine(proj1, proj2, color)
+        rasterizeLine(proj1, proj2, color, ignoreDepth)
     }
 
-    private fun rasterizeLine(p1: Vector3d, p2: Vector3d, color: Color) {
+    private fun rasterizeLine(p1: Vector3d, p2: Vector3d, color: Color, ignoreDepth: Boolean = false) {
         var x0 = p1.x; var y0 = p1.y; var z0 = p1.z
         var x1 = p2.x; var y1 = p2.y; var z1 = p2.z
 
@@ -1743,9 +2023,9 @@ class gridMap : JPanel() {
             if (ix0 in 0..baseCols && iy0 in 0..baseRows) {
                 val t = if (totalSteps == 0) 0.0 else i.toDouble() / totalSteps
                 val currZ = 1.0 / (w0 + t * (w1 - w0))
-                if (currZ < zBuffer[iy0][ix0]) {
+                if (currZ < zBuffer[iy0][ix0] || ignoreDepth) {
                     backBuffer[iy0 * imageWidth + ix0] = color.rgb
-                    zBuffer[iy0][ix0] = currZ
+                    if (!ignoreDepth) zBuffer[iy0][ix0] = currZ
                 }
             }
             if (ix0 == ix1 && iy0 == iy1) break
@@ -1810,7 +2090,7 @@ class gridMap : JPanel() {
         for (y in minY..maxY) {
             var v = rowV
             var w = rowW
-            
+
             // Indeks w tablicy pikseli (optymalizacja dostępu do tablicy)
             var pixelIndex = y * imageWidth + minX
 
@@ -1819,7 +2099,7 @@ class gridMap : JPanel() {
                 // u = 1 - v - w, więc warunek u >= 0 to v + w <= 1
                 if (v >= -0.001 && w >= -0.001 && (v + w) <= 1.001) {
                     val u = 1.0 - v - w
-                    
+
                     // Interpolacja głębokości (Z) i AO dla danego piksela
                     val depth = u * v1.z + v * v2.z + w * v3.z
                     val ao = u * v1.ao + v * v2.ao + w * v3.ao
@@ -1882,6 +2162,33 @@ class gridMap : JPanel() {
             g2d.color = Color.ORANGE
             g2d.drawString(chunkText, 10, fm.ascent + 10)
             g2d.drawString(posText, 10, fm.ascent*2 + 10)
+
+            // Debug czasu
+            val timeText = String.format("Time: %.2f (Intensity: %.2f)", gameTime, globalSunIntensity)
+            g2d.drawString(timeText, 10, fm.ascent*3 + 10)
+
+            // Informacje o bloku, na który patrzy gracz
+            val hit = getTargetBlock()
+            if (hit != null) {
+                val target = hit.blockPos
+                val blockColor = getBlock(target.x, target.y, target.z)
+                
+                // Obliczamy pozycję sąsiada w zależności od ściany, na którą patrzymy
+                var nx = target.x; var ny = target.y; var nz = target.z
+                when(hit.faceIndex) {
+                    0 -> nz-- // Front (Z-) -> sąsiad Z-1
+                    1 -> nz++ // Back (Z+) -> sąsiad Z+1
+                    2 -> nx-- // Left (X-) -> sąsiad X-1
+                    3 -> nx++ // Right (X+) -> sąsiad X+1
+                    4 -> ny++ // Top (Y+) -> sąsiad Y+1
+                    5 -> ny-- // Bottom (Y-) -> sąsiad Y-1
+                }
+                val lightLevel = getLight(nx, ny, nz)
+
+                val colorHex = if (blockColor != null) String.format("#%06X", (0xFFFFFF and blockColor.rgb)) else "N/A"
+                val targetText = "Target: [${target.x}, ${target.y}, ${target.z}] Color: $colorHex Face: ${hit.faceIndex} Light: $lightLevel"
+                g2d.drawString(targetText, 10, fm.ascent*4 + 10)
+            }
         }
 
         renderInventory(g2d)
@@ -1929,7 +2236,7 @@ class gridMap : JPanel() {
     // Rysuje prostą kostkę izometryczną 2D udającą 3D
     private fun drawIsometricBlock(g2d: Graphics2D, cx: Int, cy: Int, size: Int, color: Color) {
         val scale = size * 0.4
-        
+
         val p = arrayOf(
             Vector3d(-1.0, 1.0, -1.0), Vector3d(1.0, 1.0, -1.0),
             Vector3d(1.0, 1.0, 1.0), Vector3d(-1.0, 1.0, 1.0),
@@ -2213,16 +2520,19 @@ class gridMap : JPanel() {
                 cursor = Cursor.getDefaultCursor()
             }
 
-            if ((e?.keyCode == KeyEvent.VK_NUMPAD9) or (e?.keyCode == KeyEvent.VK_9)) {
+            if (e?.keyCode == KeyEvent.VK_NUMPAD9) {
                 debugFly = !debugFly
                 println("DebugFly: $debugFly")
             }
-            if ((e?.keyCode == KeyEvent.VK_NUMPAD8) or (e?.keyCode == KeyEvent.VK_8)) {
+            if (e?.keyCode == KeyEvent.VK_NUMPAD8) {
                 debugNoclip = !debugNoclip
                 println("debugNoclip: $debugNoclip")
             }
             if (e?.keyCode == KeyEvent.VK_V) {
                 showChunkBorders = !showChunkBorders
+            }
+            if (e?.keyCode == KeyEvent.VK_X) {
+                debugXray = !debugXray
             }
 
             // Wybór slotu ekwipunku (1-9)
