@@ -175,7 +175,7 @@ class Server : JFrame("Server"), ServerStatusListener {
     init {
         statusIndicator.preferredSize = Dimension(15, 15)
         onStatusChanged(ServerStatus.STOPPED)
-
+        iconImage = java.awt.Toolkit.getDefaultToolkit().getImage(Server::class.java.getResource("/icons/LewapEngineServer.png"))
         defaultCloseOperation = EXIT_ON_CLOSE
         layout = FlowLayout()
         add(JLabel("Port:"))

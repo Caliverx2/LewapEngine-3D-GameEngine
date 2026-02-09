@@ -340,6 +340,7 @@ class MazePathfindingPanel : JPanel() {
 fun main() {
     SwingUtilities.invokeLater {
         val frame = JFrame("Maze Generator with Dijkstra agent")
+        frame.iconImage = Toolkit.getDefaultToolkit().getImage(MazePathfindingPanel::class.java.getResource("/icons/MazeGenerator.png"))
         frame.defaultCloseOperation = JFrame.EXIT_ON_CLOSE
         frame.isResizable = false
         frame.add(MazePathfindingPanel())

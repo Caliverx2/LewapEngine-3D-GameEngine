@@ -651,7 +651,7 @@ class ModelEditor : Application() {
         }
 
         stage.title = "FileZero.kt Model 3D Editor"
-        stage.icons.add(Image(ModelEditor::class.java.classLoader.getResourceAsStream("textures/icon.png")))
+        stage.icons.add(Image(ModelEditor::class.java.classLoader.getResourceAsStream("icons/LewapEngineModelEditor3d.png")))
         stage.scene = scene
         stage.show()
         draw(gc, canvas.width, canvas.height, 0.0, 0.0)

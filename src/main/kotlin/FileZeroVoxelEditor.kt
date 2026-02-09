@@ -191,8 +191,8 @@ class DemoDisplay : JPanel() {
         // Export
         if (keyCode == KeyEvent.VK_E) {
             val data = voxels.joinToString("") {
-                if (it.color == 1) {
-                    ";${it.x},${it.y},${it.z},1;"
+                if ((it.color ushr 24) == 0) {
+                    ";${it.x},${it.y},${it.z},${it.color};"
                 } else {
                     val hex = String.format("#%06X", (0xFFFFFF and it.color))
                     ";${it.x},${it.y},${it.z},$hex;"
@@ -222,13 +222,18 @@ class DemoDisplay : JPanel() {
                             val y = coords[1].toInt()
                             val z = coords[2].toInt()
                             val c = if (coords.size > 3) {
-                                if (coords[3] == "1") {
-                                    1 // Blok próżni
-                                } else {
+                                val valStr = coords[3]
+                                if (valStr.startsWith("#")) {
                                     try {
-                                        Color.decode(coords[3]).rgb
+                                        Color.decode(valStr).rgb
                                     } catch (e: Exception) {
-                                        coords[3].toIntOrNull() ?: Color.WHITE.rgb
+                                        Color.WHITE.rgb
+                                    }
+                                } else {
+                                    valStr.toIntOrNull() ?: try {
+                                        Color.decode(valStr).rgb
+                                    } catch (e: Exception) {
+                                        Color.WHITE.rgb
                                     }
                                 }
                             } else Color.WHITE.rgb
@@ -398,7 +403,7 @@ class DemoDisplay : JPanel() {
         // Render Voxels
         // Sort voxels by distance to camera (simple painter's algo)
         val sortedVoxels = voxels
-            .filter { showVoidBlocks || it.color != 1 }
+            .filter { showVoidBlocks || (it.color ushr 24) != 0 }
             .sortedByDescending { 
             (it.x - camX)*(it.x - camX) + (it.y - camY)*(it.y - camY) + (it.z - camZ)*(it.z - camZ) 
         }
@@ -485,7 +490,8 @@ class DemoDisplay : JPanel() {
             val lightDir = Vector3(0.5, 1.0, 0.5).normalized() // Light from top-right-front
             
             // Obsługa bloku próżni (ID 1) -> Czerwony 50% opacity
-            val baseColor = if (v.color == 1) Color(255, 0, 0, 128) else Color(v.color)
+            val isId = (v.color ushr 24) == 0
+            val baseColor = if (isId) Color(255, 0, 0, 128) else Color(v.color)
 
             // Calculate light intensity based on the angle between the face normal and the light direction
             val dot = normal.x * lightDir.x + normal.y * lightDir.y + normal.z * lightDir.z
@@ -545,6 +551,7 @@ class PaletteWindow(private val display: DemoDisplay) : JFrame("Paleta Barw") {
         layout = BorderLayout()
         preferredSize = Dimension(340, 650)
         defaultCloseOperation = DO_NOTHING_ON_CLOSE // Don't close app on palette close
+        iconImage = Toolkit.getDefaultToolkit().getImage(PaletteWindow::class.java.getResource("/icons/GridMapVoxelEditor.png"))
 
         val mainContainer = JPanel()
         mainContainer.layout = BoxLayout(mainContainer, BoxLayout.Y_AXIS)
@@ -586,8 +593,16 @@ class PaletteWindow(private val display: DemoDisplay) : JFrame("Paleta Barw") {
         hexPanel.add(JLabel("HEX:"))
         hexPanel.add(hexField)
         hexField.addActionListener {
+            val text = hexField.text.trim()
+            if (!text.startsWith("#")) {
+                val id = text.toIntOrNull()
+                if (id != null) {
+                    display.currentColor = id
+                    return@addActionListener
+                }
+            }
             try {
-                val c = Color.decode(hexField.text)
+                val c = Color.decode(text)
                 display.currentColor = c.rgb
             } catch (e: Exception) {
                 JOptionPane.showMessageDialog(this, "Błędny format HEX!")
@@ -724,7 +739,7 @@ class PaletteWindow(private val display: DemoDisplay) : JFrame("Paleta Barw") {
                     val col = 10 - v.x // Odwrócenie osi X
                     val row = v.z + 10
                     if (col in 0 until gridSize && row in 0 until gridSize) {
-                        if (v.color == 1) {
+                        if ((v.color ushr 24) == 0) {
                             g.color = Color(255, 0, 0, 128)
                         } else {
                             g.color = Color(v.color)
@@ -742,7 +757,7 @@ class PaletteWindow(private val display: DemoDisplay) : JFrame("Paleta Barw") {
                     val maxCol = max(start.x, end.x)
                     val minRow = min(start.y, end.y)
                     val maxRow = max(start.y, end.y)
-                    val c = if (display.currentColor == 1) Color(255, 0, 0, 128) else Color(display.currentColor)
+                    val c = if ((display.currentColor ushr 24) == 0) Color(255, 0, 0, 128) else Color(display.currentColor)
                     g.color = Color(c.red, c.green, c.blue, 128)
                     for (col in minCol..maxCol) {
                         for (row in minRow..maxRow) {
@@ -793,8 +808,8 @@ class PaletteWindow(private val display: DemoDisplay) : JFrame("Paleta Barw") {
     }
 
     private fun updateHexField(rgb: Int) {
-        if (rgb == 1) {
-            hexField.text = "VOID"
+        if ((rgb ushr 24) == 0) {
+            hexField.text = rgb.toString()
         } else {
             hexField.text = String.format("#%06X", (0xFFFFFF and rgb))
         }
@@ -813,7 +828,8 @@ class PaletteWindow(private val display: DemoDisplay) : JFrame("Paleta Barw") {
     private fun createColorButton(rgb: Int): JButton {
         val btn = JButton()
         btn.preferredSize = Dimension(30, 30)
-        btn.background = if (rgb == 1) Color(255, 0, 0, 128) else Color(rgb)
+        val isId = (rgb ushr 24) == 0
+        btn.background = if (isId) Color(255, 0, 0, 128) else Color(rgb)
         btn.isContentAreaFilled = false
         btn.isOpaque = true
         btn.addActionListener {
@@ -834,6 +850,7 @@ fun main() {
         display.onColorsImported = { colors -> colors.forEach { palette.addToHistory(it) } }
 
         val frame = JFrame("FileZeroVoxelEditor.kt")
+        frame.iconImage = Toolkit.getDefaultToolkit().getImage(display::class.java.getResource("/icons/GridMapVoxelEditor.png"))
         frame.defaultCloseOperation = JFrame.EXIT_ON_CLOSE
         frame.isResizable = false
         frame.add(display)
