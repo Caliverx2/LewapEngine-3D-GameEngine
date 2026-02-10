@@ -54,121 +54,148 @@ data class Chunk(val x: Int, val z: Int) {
     fun getMeta(x: Int, y: Int, z: Int): Int = metadata[getIndex(x, y, z)].toInt()
 }
 
+// --- STRATEGIA OŚWIETLENIA (API) ---
+// To pozwala modom przejąć kontrolę nad tym, jak światło wpływa na kolor piksela.
+interface LightProcessor {
+    fun process(x: Int, y: Int, z: Int, baseColor: Color, skyLevel: Int, blockLevel: Int, sunIntensity: Double, minLight: Double): Int
+}
+
 class gridMap : JPanel() {
-    private val downscale = 8
-    private val baseCols = 1920 / downscale
-    private val baseRows = 1080 / downscale
-    private val cellSize = downscale/2
-    private val cubeSize = 2.0
-    private val reachDistance = 5.0
-    private val radiusCollision = 0.3
-    private val playerHeight = 1.8
+    val downscale = 8
+    val baseCols = 1920 / downscale
+    val baseRows = 1080 / downscale
+    val cellSize = downscale/2
+    val cubeSize = 2.0
+    var reachDistance = 5.0
+    val radiusCollision = 0.3
+    val playerHeight = 1.8
 
     // Kamera
-    private val fov = 90.0
-    private var camX = 0.0
-    private var camY = 0.0
-    private var camZ = 0.0
-    private var yaw = 0.0
-    private var pitch = 0.0
+    var fov = 90.0
+    var camX = 0.0
+    var camY = 0.0
+    var camZ = 0.0
+    var yaw = 0.0
+    var pitch = 0.0
         set(value) {
             field = value.coerceIn(-Math.PI / 2, Math.PI / 2)
         }
     // Getter dla pozycji oczu (uwzględnia kucanie)
-    private val viewY: Double
+    val viewY: Double
         get() {
             val isCrouching = !debugFly && !debugNoclip && inputManager.isKeyDown(KeyEvent.VK_SHIFT)
             return camY - (if (isCrouching) 0.2 * cubeSize else 0.0)
         }
-    private var renderDistance = 5
-    private val debugChunkRenderDistance = 1
-    private val simulateFluidsDistance = 1
-    private val speed = 0.3
-    private var currentSpeed = speed
-    private val rotationalSpeed = 0.1
+    var renderDistance = 5
+    var debugChunkRenderDistance = 1
+    var simulateFluidsDistance = 1
+    var speed = 0.3
+    var currentSpeed = speed
+    val rotationalSpeed = 0.1
 
-    private var debugNoclip = false
-    private var debugFly = false
-    private var debugFullbright = false
-    private var showChunkBorders = false
-    private var velocityY = 0.0
-    private var isOnGround = false
-    private val gravity = 0.1
-    private val jumpStrength = 0.8
+    var debugNoclip = false
+    var debugFly = false
+    var debugFullbright = false
+    var showChunkBorders = false
+    var velocityY = 0.0
+    var isOnGround = false
+    var gravity = 0.1
+    var jumpStrength = 0.8
 
-    private var debugXray = false
-    private val oreColors = ConcurrentHashMap.newKeySet<Int>()
+    var debugXray = false
+    val oreColors = ConcurrentHashMap.newKeySet<Int>()
 
     // System dnia i nocy
-    private var gameTime = 12.0
-    private var dayCounter = 0
-    private var globalSunIntensity = 1.0
-    private var currentSkyColor = Color(113, 144, 225).rgb
-    private val stars = ArrayList<Vector3d>()
-    private var cloudOffset = 0.0
-    private var FullbrightFactor = 0.0
+    var gameTime = 12.0
+    var dayCounter = 0
+    var globalSunIntensity = 1.0
+    var currentSkyColor = Color(113, 144, 225).rgb
+    var stars = ArrayList<Vector3d>()
+    var cloudOffset = 0.0
+    var FullbrightFactor = 0.0
 
-    private val imageWidth = baseCols + 1
-    private val displayImage = BufferedImage(imageWidth, baseRows + 1, BufferedImage.TYPE_INT_RGB)
-    private val pixels = (displayImage.raster.dataBuffer as DataBufferInt).data
-    private val backBuffer = IntArray(pixels.size)
-    private val zBuffer = Array(baseRows + 1) { DoubleArray(baseCols + 1) { Double.MAX_VALUE } }
+    val imageWidth = baseCols + 1
+    val displayImage = BufferedImage(imageWidth, baseRows + 1, BufferedImage.TYPE_INT_RGB)
+    val pixels = (displayImage.raster.dataBuffer as DataBufferInt).data
+    val backBuffer = IntArray(pixels.size)
+    val zBuffer = Array(baseRows + 1) { DoubleArray(baseCols + 1) { Double.MAX_VALUE } }
 
     // Odległość płaszczyzny przycinającej (near plane)
-    private val nearPlaneZ = 0.1
+    val nearPlaneZ = 0.1
 
     // --- Definicje Bloków Specjalnych (ID) ---
-    private val BLOCK_ID_AIR = 0
-    private val BLOCK_ID_LIGHT = 2
-    private val BLOCK_ID_LAVA = 3
-    private val BLOCK_ID_WATER = 4
-    private val blockIdColors = mapOf(
+    val BLOCK_ID_AIR = 0
+    val BLOCK_ID_LIGHT = 2
+    val BLOCK_ID_LAVA = 3
+    val BLOCK_ID_WATER = 4
+    var blockIdColors = mutableMapOf(
         BLOCK_ID_LIGHT to Color(0xFFFDD0).rgb,
         BLOCK_ID_LAVA to Color(0xFF8C00).rgb,
         BLOCK_ID_WATER to Color(0.37f, 0.69f, 0.78f, 0.5f).rgb
     )
-    private val fluidProperties = mapOf(
+    var fluidProperties = mapOf(
         BLOCK_ID_LAVA to FluidProperties(tickRate = 30), // 1 aktualizacja na sekundę
         BLOCK_ID_WATER to FluidProperties(tickRate = 15)  // 2 aktualizacje na sekundę
     )
-    private val fluidBlocks = fluidProperties.keys
-    private var minLightFactor = 0.15
+    val fluidBlocks = fluidProperties.keys
+    var minLightFactor = 0.15
+    
+    // Domyślna implementacja oświetlenia (Vanilla)
+    var lightProcessor: LightProcessor = object : LightProcessor {
+        override fun process(x: Int, y: Int, z: Int, baseColor: Color, skyLevel: Int, blockLevel: Int, sunIntensity: Double, minLight: Double): Int {
+            // Normalizacja poziomów światła (0-15 -> 0.0-1.0)
+            val skyIntensity = (skyLevel / 15.0) * sunIntensity
+            val blockIntensity = (blockLevel / 15.0)
+            
+            // Obliczamy jasność (max z nieba i bloku)
+            // Tutaj światło bloku jest zawsze białe (mnożnik 1.0)
+            val lightStrength = 0.75
+            val brightness = (minLight + maxOf(skyIntensity, blockIntensity) * lightStrength).coerceIn(0.0, 1.0)
+            
+            // Aplikujemy jasność do kanałów RGB
+            val r = (baseColor.red * brightness).toInt()
+            val g = (baseColor.green * brightness).toInt()
+            val b = (baseColor.blue * brightness).toInt()
+            
+            return (r shl 16) or (g shl 8) or b
+        }
+    }
 
     // Mapa przechowująca maskę bitową okluzji dla każdego segmentu (index 0-63)
     // Bity: 1=West(X-), 2=East(X+), 4=Down(Y-), 8=Up(Y+), 16=North(Z-), 32=South(Z+)
-    private val chunkOcclusion = ConcurrentHashMap<Point, ByteArray>()
-    private val chunkMeshes = ConcurrentHashMap<Point, Array<MutableList<Triangle3d>>>()
+    val chunkOcclusion = ConcurrentHashMap<Point, ByteArray>()
+    val chunkMeshes = ConcurrentHashMap<Point, Array<MutableList<Triangle3d>>>()
 
-    private val FACE_WEST = 1
-    private val FACE_EAST = 2
-    private val FACE_DOWN = 4
-    private val FACE_UP = 8
-    private val FACE_NORTH = 16
-    private val FACE_SOUTH = 32
-    private val SEGMENT_FULL = 63 // Wszystkie 6 ścian
+    val FACE_WEST = 1
+    val FACE_EAST = 2
+    val FACE_DOWN = 4
+    val FACE_UP = 8
+    val FACE_NORTH = 16
+    val FACE_SOUTH = 32
+    val SEGMENT_FULL = 63 // Wszystkie 6 ścian
 
     // Cache widoczności (BFS)
     // Optymalizacja: Płaska tablica zamiast listy obiektów Triple, aby uniknąć alokacji (GC)
     // ZWIĘKSZONO: Dla renderDistance 12+ potrzeba więcej miejsca (ok. 40k segmentów)
-    private var visibleSegmentsFlat = IntArray(524288 * 3) // Zwiększono 8x (dla segmentów 4x4x4)
-    private var visibleSegmentsCount = 0
-    private val bfsQueue = IntArray(524288 * 3) // Kolejka BFS (x, y, z) - Zwiększono 8x
-    private var bfsVisited = IntArray(64 * 32 * 64) // Tokeny odwiedzin
-    private var bfsRendered = IntArray(64 * 32 * 64) // Tokeny renderowania (zapobiega duplikatom)
-    private var bfsVisitToken = 0
+    var visibleSegmentsFlat = IntArray(524288 * 3) // Zwiększono 8x (dla segmentów 4x4x4)
+    var visibleSegmentsCount = 0
+    val bfsQueue = IntArray(524288 * 3) // Kolejka BFS (x, y, z) - Zwiększono 8x
+    var bfsVisited = IntArray(64 * 32 * 64) // Tokeny odwiedzin
+    var bfsRendered = IntArray(64 * 32 * 64) // Tokeny renderowania (zapobiega duplikatom)
+    var bfsVisitToken = 0
 
-    private var lastCamSecX = Int.MIN_VALUE
-    private var lastCamSecY = Int.MIN_VALUE
-    private var lastCamSecZ = Int.MIN_VALUE
-    private var lastYaw = Double.MAX_VALUE
-    private var lastPitch = Double.MAX_VALUE
-    private var visibilityGraphDirty = true
+    var lastCamSecX = Int.MIN_VALUE
+    var lastCamSecY = Int.MIN_VALUE
+    var lastCamSecZ = Int.MIN_VALUE
+    var lastYaw = Double.MAX_VALUE
+    var lastPitch = Double.MAX_VALUE
+    var visibilityGraphDirty = true
 
     // FPS Counter
-    private var lastFpsTime = System.currentTimeMillis()
-    private var frames = 0
-    private var fps = 0
-    private val fpsFont = try {
+    var lastFpsTime = System.currentTimeMillis()
+    var frames = 0
+    var fps = 0
+    val fpsFont = try {
         val stream = javaClass.classLoader.getResourceAsStream("fonts/mojangles.ttf")
         if (stream != null) {
             Font.createFont(Font.TRUETYPE_FONT, stream).deriveFont(30f)
@@ -180,7 +207,7 @@ class gridMap : JPanel() {
         Font("Consolas", Font.BOLD, 30)
     }
 
-    private val hotbarFont = try {
+    val hotbarFont = try {
         val stream = javaClass.classLoader.getResourceAsStream("fonts/mojangles.ttf")
         if (stream != null) {
             Font.createFont(Font.TRUETYPE_FONT, stream).deriveFont(24f)
@@ -192,46 +219,51 @@ class gridMap : JPanel() {
         Font("Consolas", Font.BOLD, 24)
     }
 
-    private val chunks = ConcurrentHashMap<Point, Chunk>()
-    private var seed = 6767
-    private lateinit var noise: PerlinNoise
-    private var lastChunkX = Int.MAX_VALUE
-    private var lastChunkZ = Int.MAX_VALUE
+    val chunks = ConcurrentHashMap<Point, Chunk>()
+    var seed = 6767
+    lateinit var noise: PerlinNoise
+    var lastChunkX = Int.MAX_VALUE
+    var lastChunkZ = Int.MAX_VALUE
 
     // System zapisu
-    private val chunkIO = ChunkIO("world1")
-    private var lastAutoSaveTime = System.currentTimeMillis()
+    var chunkIO = ChunkIO("world1")
+    var lastAutoSaveTime = System.currentTimeMillis()
 
     // Zbiór aktualnie wciśniętych klawiszy
 
     // Obsługa myszki
-    private var lastActionTime = 0L
-    private val actionDelay = 150 // Opóźnienie w ms (szybkość niszczenia)
-    @Volatile private var running = true
+    var lastActionTime = 0L
+    val actionDelay = 150 // Opóźnienie w ms (szybkość niszczenia)
+    @Volatile var running = true
 
-    private var gameTicks = 0L
+    var gameTicks = 0L
     // Cache dla obliczeń trygonometrycznych
-    private var cosYaw = 0.0
-    private var sinYaw = 0.0
-    private var cosPitch = 0.0
-    private var sinPitch = 0.0
+    var cosYaw = 0.0
+    var sinYaw = 0.0
+    var cosPitch = 0.0
+    var sinPitch = 0.0
 
-    private val chunkGenerator = ChunkGenerator(seed, oreColors)
+    var chunkGenerator = ChunkGenerator(seed, oreColors)
 
     // --- Inventory System ---
-    private lateinit var inputManager: InputManager
-    private val inventory = arrayOfNulls<ItemStack>(9)
-    private var selectedSlot = 0
+    lateinit var inputManager: InputManager
+    var inventory = arrayOfNulls<ItemStack>(9)
+    var selectedSlot = 0
 
     // --- Threading & Optimization ---
-    private val chunkExecutor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors())
-    private val chunksBeingGenerated = ConcurrentHashMap.newKeySet<Point>()
-    private val chunksToMeshQueue = ConcurrentLinkedQueue<Point>()
+    val chunkExecutor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors())
+    val chunksBeingGenerated = ConcurrentHashMap.newKeySet<Point>()
+    val chunksToMeshQueue = ConcurrentLinkedQueue<Point>()
+
+    // --- Modding System ---
+    private val modLoader = ModLoader(this)
 
     init {
         preferredSize = Dimension((baseCols + 1) * cellSize, (baseRows + 1) * cellSize)
         setBackground(Color(113, 144, 225))
         isFocusable = true
+
+        modLoader.loadMods()
 
         inputManager = InputManager(this)
 
@@ -454,7 +486,7 @@ class gridMap : JPanel() {
                             sunlight = false // Blokada światła dla bloków stałych
                         }
                         // Jeśli to blok światła, ustawiamy max jasność i dodajemy do kolejki propagacji
-                        if (blockId == BLOCK_ID_LIGHT) {
+                        if (blockId == BLOCK_ID_LIGHT || blockId in 6..8) {
                             blockL = 15
                         } else if (blockId == BLOCK_ID_LAVA) {
                             // Lawa emituje światło zależnie od poziomu (1-8 -> 8-15)
@@ -488,8 +520,8 @@ class gridMap : JPanel() {
             var changed = false
 
             val blockId = chunk.blocks[idx]
-            if (blockId == 0 || blockId == BLOCK_ID_WATER) {
-                val absorption = if (blockId == BLOCK_ID_WATER) 2 else 1 // Woda pochłania światło szybciej (2) niż powietrze (1)
+            if (blockId == 0 || fluidBlocks.contains(blockId)) {
+                val absorption = 1 // Zmiana: Woda pochłania 1 (tak jak powietrze), aby światło szło dalej
                 if (nSky > mySky + absorption) {
                     mySky = nSky - absorption
                     changed = true
@@ -546,8 +578,8 @@ class gridMap : JPanel() {
                 if (nx in 0..15 && ny in 0..127 && nz in 0..15) {
                     val nIdx = chunk.getIndex(nx, ny, nz)
                     val nBlockId = chunk.blocks[nIdx]
-                    if (nBlockId == 0 || nBlockId == BLOCK_ID_WATER) {
-                        val absorption = if (nBlockId == BLOCK_ID_WATER) 2 else 1
+                    if (nBlockId == 0 || fluidBlocks.contains(nBlockId)) {
+                        val absorption = 1
                         val nVal = newLight[nIdx].toInt() and 0xFF
                         var nSky = (nVal shr 4) and 0xF
                         var nBlock = nVal and 0xF
@@ -607,6 +639,25 @@ class gridMap : JPanel() {
                 }
             }
         }
+    }
+
+    // --- API dla Modów: Stawianie struktur ---
+    fun placeStructure(model: List<ModelVoxel>, x: Int, y: Int, z: Int) {
+        // Znajdujemy środek modelu, aby postawić go w miejscu kliknięcia
+        // (Opcjonalnie: można to pominąć i stawiać względem 0,0 modelu)
+        
+        for (voxel in model) {
+            if (voxel.isVoid) {
+                setBlock(x + voxel.x, y + voxel.y, z + voxel.z, 0)
+            } else {
+                setBlock(x + voxel.x, y + voxel.y, z + voxel.z, voxel.color.rgb)
+            }
+        }
+        
+        // Odświeżamy chunki w okolicy (uproszczone odświeżanie centralnego punktu)
+        val cx = if (x >= 0) x / 16 else (x + 1) / 16 - 1
+        val cz = if (z >= 0) z / 16 else (z + 1) / 16 - 1
+        refreshChunkData(cx, cz)
     }
 
     private fun consumeCurrentItem() {
@@ -825,6 +876,13 @@ class gridMap : JPanel() {
                         // Sprawdzamy czy mamy blok w ręce
                         val stack = inventory[selectedSlot]
                         if (stack != null) {
+                            // --- MOD HOOK ---
+                            // Pytamy mody, czy chcą przejąć kontrolę nad stawianiem tego bloku
+                            if (modLoader.notifyBlockPlace(lastX, lastY, lastZ, stack.color)) {
+                                consumeCurrentItem() // Zużywamy przedmiot, bo mod "coś zrobił"
+                                return
+                            }
+                            
                             setBlock(lastX, lastY, lastZ, stack.color)
                             // Jeśli stawiamy płyn (np. lawę), ustawiamy go jako źródło
                             if (fluidBlocks.contains(stack.color)) {
@@ -1033,7 +1091,7 @@ class gridMap : JPanel() {
                     if (shouldRenderSide(wx - 1, y, wz)) addFace(targetList, wx, y, wz, xPos, yPos, zPos, 2, color, isFluid, height, getNeighborHeight(wx - 1, y, wz))
                     if (shouldRenderSide(wx + 1, y, wz)) addFace(targetList, wx, y, wz, xPos, yPos, zPos, 3, color, isFluid, height, getNeighborHeight(wx + 1, y, wz))
                     if (shouldRenderCap(wx, y + 1, wz, true)) addFace(targetList, wx, y, wz, xPos, yPos, zPos, 4, color, isFluid, height, 0.0)
-                    if (shouldRenderCap(wx, y - 1, wz, false)) addFace(targetList, wx, y, wz, xPos, yPos, zPos, 5, color, isFluid, height, 0.0)
+                    if (shouldRenderCap(wx, y - 1, wz, false)) addFace(targetList, wx, y, wz, xPos, yPos, zPos, 5, color, false, height, 0.0)
                 }
             }
         }
@@ -1113,6 +1171,7 @@ class gridMap : JPanel() {
         )
 
         fun vertexAO(s1: Boolean, s2: Boolean, corner: Boolean): Double {
+            if (isDoubleSided) return 1.0 // FIX: Wyłączamy cieniowanie AO dla cieczy (lawa pod blokiem będzie jasna)
             val level = if (s1 && s2) 3 else (if (s1) 1 else 0) + (if (s2) 1 else 0) + (if (corner) 1 else 0)
             return when (level) {
                 0 -> 1.0 // Najjaśniej
@@ -1141,61 +1200,70 @@ class gridMap : JPanel() {
         val aoValues = DoubleArray(4)
         val v = Array(4) { BooleanArray(3) }
         var lightLevel = 16
+        
+        // Jeśli to płyn (isDoubleSided), bierzemy światło z wnętrza bloku. Jeśli stały - z sąsiada.
+        val selfLight = getLight(wx, wy, wz)
+        
+        // Helper do AO: Blok rzuca cień tylko jeśli nie jest powietrzem i NIE jest cieczą
+        fun isOccluding(x: Int, y: Int, z: Int): Boolean {
+            val id = getRawBlock(x, y, z)
+            return id != 0 && !fluidBlocks.contains(id)
+        }
 
         // Obliczanie AO dla 4 wierzchołków danej ściany
         when (faceType) {
             0 -> { // Front (Z-), quad 0,1,2,3
-                v[0][0] = getBlock(wx - 1, wy, wz - 1) != null; v[0][1] = getBlock(wx, wy - 1, wz - 1) != null; v[0][2] = getBlock(wx - 1, wy - 1, wz - 1) != null
-                v[1][0] = getBlock(wx + 1, wy, wz - 1) != null; v[1][1] = getBlock(wx, wy - 1, wz - 1) != null; v[1][2] = getBlock(wx + 1, wy - 1, wz - 1) != null
-                v[2][0] = getBlock(wx + 1, wy, wz - 1) != null; v[2][1] = getBlock(wx, wy + 1, wz - 1) != null; v[2][2] = getBlock(wx + 1, wy + 1, wz - 1) != null
-                v[3][0] = getBlock(wx - 1, wy, wz - 1) != null; v[3][1] = getBlock(wx, wy + 1, wz - 1) != null; v[3][2] = getBlock(wx - 1, wy + 1, wz - 1) != null
+                v[0][0] = isOccluding(wx - 1, wy, wz - 1); v[0][1] = isOccluding(wx, wy - 1, wz - 1); v[0][2] = isOccluding(wx - 1, wy - 1, wz - 1)
+                v[1][0] = isOccluding(wx + 1, wy, wz - 1); v[1][1] = isOccluding(wx, wy - 1, wz - 1); v[1][2] = isOccluding(wx + 1, wy - 1, wz - 1)
+                v[2][0] = isOccluding(wx + 1, wy, wz - 1); v[2][1] = isOccluding(wx, wy + 1, wz - 1); v[2][2] = isOccluding(wx + 1, wy + 1, wz - 1)
+                v[3][0] = isOccluding(wx - 1, wy, wz - 1); v[3][1] = isOccluding(wx, wy + 1, wz - 1); v[3][2] = isOccluding(wx - 1, wy + 1, wz - 1)
                 for (i in 0..3) aoValues[i] = vertexAO(v[i][0], v[i][1], v[i][2])
-                lightLevel = getLight(wx, wy, wz - 1)
+                lightLevel = if (isDoubleSided) selfLight else getLight(wx, wy, wz - 1)
                 addTri(0, 1, 2, 3, 0.8, aoValues, lightLevel)
             }
             1 -> { // Back (Z+), quad 5,4,7,6
-                v[0][0] = getBlock(wx + 1, wy, wz + 1) != null; v[0][1] = getBlock(wx, wy - 1, wz + 1) != null; v[0][2] = getBlock(wx + 1, wy - 1, wz + 1) != null
-                v[1][0] = getBlock(wx - 1, wy, wz + 1) != null; v[1][1] = getBlock(wx, wy - 1, wz + 1) != null; v[1][2] = getBlock(wx - 1, wy - 1, wz + 1) != null
-                v[2][0] = getBlock(wx - 1, wy, wz + 1) != null; v[2][1] = getBlock(wx, wy + 1, wz + 1) != null; v[2][2] = getBlock(wx - 1, wy + 1, wz + 1) != null
-                v[3][0] = getBlock(wx + 1, wy, wz + 1) != null; v[3][1] = getBlock(wx, wy + 1, wz + 1) != null; v[3][2] = getBlock(wx + 1, wy + 1, wz + 1) != null
+                v[0][0] = isOccluding(wx + 1, wy, wz + 1); v[0][1] = isOccluding(wx, wy - 1, wz + 1); v[0][2] = isOccluding(wx + 1, wy - 1, wz + 1)
+                v[1][0] = isOccluding(wx - 1, wy, wz + 1); v[1][1] = isOccluding(wx, wy - 1, wz + 1); v[1][2] = isOccluding(wx - 1, wy - 1, wz + 1)
+                v[2][0] = isOccluding(wx - 1, wy, wz + 1); v[2][1] = isOccluding(wx, wy + 1, wz + 1); v[2][2] = isOccluding(wx - 1, wy + 1, wz + 1)
+                v[3][0] = isOccluding(wx + 1, wy, wz + 1); v[3][1] = isOccluding(wx, wy + 1, wz + 1); v[3][2] = isOccluding(wx + 1, wy + 1, wz + 1)
                 for (i in 0..3) aoValues[i] = vertexAO(v[i][0], v[i][1], v[i][2])
-                lightLevel = getLight(wx, wy, wz + 1)
+                lightLevel = if (isDoubleSided) selfLight else getLight(wx, wy, wz + 1)
                 addTri(5, 4, 7, 6, 0.8, aoValues, lightLevel)
             }
             2 -> { // Left (X-), quad 4,0,3,7
-                v[0][0] = getBlock(wx - 1, wy, wz + 1) != null; v[0][1] = getBlock(wx - 1, wy - 1, wz) != null; v[0][2] = getBlock(wx - 1, wy - 1, wz + 1) != null
-                v[1][0] = getBlock(wx - 1, wy, wz - 1) != null; v[1][1] = getBlock(wx - 1, wy - 1, wz) != null; v[1][2] = getBlock(wx - 1, wy - 1, wz - 1) != null
-                v[2][0] = getBlock(wx - 1, wy, wz - 1) != null; v[2][1] = getBlock(wx - 1, wy + 1, wz) != null; v[2][2] = getBlock(wx - 1, wy + 1, wz - 1) != null
-                v[3][0] = getBlock(wx - 1, wy, wz + 1) != null; v[3][1] = getBlock(wx - 1, wy + 1, wz) != null; v[3][2] = getBlock(wx - 1, wy + 1, wz + 1) != null
+                v[0][0] = isOccluding(wx - 1, wy, wz + 1); v[0][1] = isOccluding(wx - 1, wy - 1, wz); v[0][2] = isOccluding(wx - 1, wy - 1, wz + 1)
+                v[1][0] = isOccluding(wx - 1, wy, wz - 1); v[1][1] = isOccluding(wx - 1, wy - 1, wz); v[1][2] = isOccluding(wx - 1, wy - 1, wz - 1)
+                v[2][0] = isOccluding(wx - 1, wy, wz - 1); v[2][1] = isOccluding(wx - 1, wy + 1, wz); v[2][2] = isOccluding(wx - 1, wy + 1, wz - 1)
+                v[3][0] = isOccluding(wx - 1, wy, wz + 1); v[3][1] = isOccluding(wx - 1, wy + 1, wz); v[3][2] = isOccluding(wx - 1, wy + 1, wz + 1)
                 for (i in 0..3) aoValues[i] = vertexAO(v[i][0], v[i][1], v[i][2])
-                lightLevel = getLight(wx - 1, wy, wz)
+                lightLevel = if (isDoubleSided) selfLight else getLight(wx - 1, wy, wz)
                 addTri(4, 0, 3, 7, 0.6, aoValues, lightLevel)
             }
             3 -> { // Right (X+), quad 1,5,6,2
-                v[0][0] = getBlock(wx + 1, wy, wz - 1) != null; v[0][1] = getBlock(wx + 1, wy - 1, wz) != null; v[0][2] = getBlock(wx + 1, wy - 1, wz - 1) != null
-                v[1][0] = getBlock(wx + 1, wy, wz + 1) != null; v[1][1] = getBlock(wx + 1, wy - 1, wz) != null; v[1][2] = getBlock(wx + 1, wy - 1, wz + 1) != null
-                v[2][0] = getBlock(wx + 1, wy, wz + 1) != null; v[2][1] = getBlock(wx + 1, wy + 1, wz) != null; v[2][2] = getBlock(wx + 1, wy + 1, wz + 1) != null
-                v[3][0] = getBlock(wx + 1, wy, wz - 1) != null; v[3][1] = getBlock(wx + 1, wy + 1, wz) != null; v[3][2] = getBlock(wx + 1, wy + 1, wz - 1) != null
+                v[0][0] = isOccluding(wx + 1, wy, wz - 1); v[0][1] = isOccluding(wx + 1, wy - 1, wz); v[0][2] = isOccluding(wx + 1, wy - 1, wz - 1)
+                v[1][0] = isOccluding(wx + 1, wy, wz + 1); v[1][1] = isOccluding(wx + 1, wy - 1, wz); v[1][2] = isOccluding(wx + 1, wy - 1, wz + 1)
+                v[2][0] = isOccluding(wx + 1, wy, wz + 1); v[2][1] = isOccluding(wx + 1, wy + 1, wz); v[2][2] = isOccluding(wx + 1, wy + 1, wz + 1)
+                v[3][0] = isOccluding(wx + 1, wy, wz - 1); v[3][1] = isOccluding(wx + 1, wy + 1, wz); v[3][2] = isOccluding(wx + 1, wy + 1, wz - 1)
                 for (i in 0..3) aoValues[i] = vertexAO(v[i][0], v[i][1], v[i][2])
-                lightLevel = getLight(wx + 1, wy, wz)
+                lightLevel = if (isDoubleSided) selfLight else getLight(wx + 1, wy, wz)
                 addTri(1, 5, 6, 2, 0.6, aoValues, lightLevel)
             }
             4 -> { // Top (Y+), quad 3,2,6,7
-                v[0][0] = getBlock(wx - 1, wy + 1, wz) != null; v[0][1] = getBlock(wx, wy + 1, wz - 1) != null; v[0][2] = getBlock(wx - 1, wy + 1, wz - 1) != null
-                v[1][0] = getBlock(wx + 1, wy + 1, wz) != null; v[1][1] = getBlock(wx, wy + 1, wz - 1) != null; v[1][2] = getBlock(wx + 1, wy + 1, wz - 1) != null
-                v[2][0] = getBlock(wx + 1, wy + 1, wz) != null; v[2][1] = getBlock(wx, wy + 1, wz + 1) != null; v[2][2] = getBlock(wx + 1, wy + 1, wz + 1) != null
-                v[3][0] = getBlock(wx - 1, wy + 1, wz) != null; v[3][1] = getBlock(wx, wy + 1, wz + 1) != null; v[3][2] = getBlock(wx - 1, wy + 1, wz + 1) != null
+                v[0][0] = isOccluding(wx - 1, wy + 1, wz); v[0][1] = isOccluding(wx, wy + 1, wz - 1); v[0][2] = isOccluding(wx - 1, wy + 1, wz - 1)
+                v[1][0] = isOccluding(wx + 1, wy + 1, wz); v[1][1] = isOccluding(wx, wy + 1, wz - 1); v[1][2] = isOccluding(wx + 1, wy + 1, wz - 1)
+                v[2][0] = isOccluding(wx + 1, wy + 1, wz); v[2][1] = isOccluding(wx, wy + 1, wz + 1); v[2][2] = isOccluding(wx + 1, wy + 1, wz + 1)
+                v[3][0] = isOccluding(wx - 1, wy + 1, wz); v[3][1] = isOccluding(wx, wy + 1, wz + 1); v[3][2] = isOccluding(wx - 1, wy + 1, wz + 1)
                 for (i in 0..3) aoValues[i] = vertexAO(v[i][0], v[i][1], v[i][2])
-                lightLevel = getLight(wx, wy + 1, wz)
+                lightLevel = if (isDoubleSided) selfLight else getLight(wx, wy + 1, wz)
                 addTri(3, 2, 6, 7, 1.0, aoValues, lightLevel)
             }
             5 -> { // Bottom (Y-), quad 4,5,1,0
-                v[0][0] = getBlock(wx - 1, wy - 1, wz) != null; v[0][1] = getBlock(wx, wy - 1, wz + 1) != null; v[0][2] = getBlock(wx - 1, wy - 1, wz + 1) != null
-                v[1][0] = getBlock(wx + 1, wy - 1, wz) != null; v[1][1] = getBlock(wx, wy - 1, wz + 1) != null; v[1][2] = getBlock(wx + 1, wy - 1, wz + 1) != null
-                v[2][0] = getBlock(wx + 1, wy - 1, wz) != null; v[2][1] = getBlock(wx, wy - 1, wz - 1) != null; v[2][2] = getBlock(wx + 1, wy - 1, wz - 1) != null
-                v[3][0] = getBlock(wx - 1, wy - 1, wz) != null; v[3][1] = getBlock(wx, wy - 1, wz - 1) != null; v[3][2] = getBlock(wx - 1, wy - 1, wz - 1) != null
+                v[0][0] = isOccluding(wx - 1, wy - 1, wz); v[0][1] = isOccluding(wx, wy - 1, wz + 1); v[0][2] = isOccluding(wx - 1, wy - 1, wz + 1)
+                v[1][0] = isOccluding(wx + 1, wy - 1, wz); v[1][1] = isOccluding(wx, wy - 1, wz + 1); v[1][2] = isOccluding(wx + 1, wy - 1, wz + 1)
+                v[2][0] = isOccluding(wx + 1, wy - 1, wz); v[2][1] = isOccluding(wx, wy - 1, wz - 1); v[2][2] = isOccluding(wx + 1, wy - 1, wz - 1)
+                v[3][0] = isOccluding(wx - 1, wy - 1, wz); v[3][1] = isOccluding(wx, wy - 1, wz - 1); v[3][2] = isOccluding(wx - 1, wy - 1, wz - 1)
                 for (i in 0..3) aoValues[i] = vertexAO(v[i][0], v[i][1], v[i][2])
-                lightLevel = getLight(wx, wy - 1, wz)
+                lightLevel = if (isDoubleSided) selfLight else getLight(wx, wy - 1, wz)
                 addTri(4, 5, 1, 0, 0.4, aoValues, lightLevel)
             }
         }
@@ -1473,6 +1541,9 @@ class gridMap : JPanel() {
                     gameTicks++
                     simulateFluids(gameTicks)
 
+                    // --- MOD HOOK: Logika gry (Tick) ---
+                    modLoader.notifyTick()
+
                     delta--
 
                     inputManager.resetFrameState()
@@ -1498,8 +1569,8 @@ class gridMap : JPanel() {
     }
 
     // Prekalkulowane wartości dla Frustum Culling
-    private val sectionRadius = sqrt(3.0) * 2.0 * cubeSize
-    private val sectionSafeRadius = sectionRadius * 2.5 // Zwiększono margines, aby naprawić "wygryzanie" krawędzi
+    val sectionRadius = sqrt(3.0) * 2.0 * cubeSize
+    val sectionSafeRadius = sectionRadius * 2.5 // Zwiększono margines, aby naprawić "wygryzanie" krawędzi
 
     private fun isSegmentVisible(secX: Int, secY: Int, secZ: Int): Boolean {
         val cx = if (secX >= 0) secX / 4 else (secX + 1) / 4 - 1
@@ -1747,14 +1818,16 @@ class gridMap : JPanel() {
                 val packedLight = clipped.lightLevel
                 val skyLight = (packedLight shr 4) and 0xF
                 val blockLight = packedLight and 0xF
-                val effectiveLight = maxOf(skyLight * globalSunIntensity, blockLight.toDouble())
-                val lightFactor = (minLightFactor + 0.75 * (effectiveLight / 15.0) + FullbrightFactor).coerceIn(0.0, 1.0)
-
-                val r = (clipped.color.red * lightFactor).toInt().coerceIn(0, 255)
-                val g = (clipped.color.green * lightFactor).toInt().coerceIn(0, 255)
-                val b = (clipped.color.blue * lightFactor).toInt().coerceIn(0, 255)
-
-                fillTriangle(p1_2d, p2_2d, p3_2d, clipped.p1, clipped.p2, clipped.p3, Color(r, g, b))
+                
+                // Używamy wymiennego procesora oświetlenia!
+                val finalRGB = lightProcessor.process(
+                    (clipped.p1.x + camX).toInt(),
+                    (clipped.p1.y + viewY).toInt(),
+                    (clipped.p1.z + camZ).toInt(),
+                    clipped.color, skyLight, blockLight, globalSunIntensity, minLightFactor + FullbrightFactor
+                )
+                
+                fillTriangle(p1_2d, p2_2d, p3_2d, clipped.p1, clipped.p2, clipped.p3, Color(finalRGB))
             }
         }
 
@@ -1772,13 +1845,20 @@ class gridMap : JPanel() {
                 val packedLight = clipped.lightLevel
                 val skyLight = (packedLight shr 4) and 0xF
                 val blockLight = packedLight and 0xF
-                val effectiveLight = maxOf(skyLight * globalSunIntensity, blockLight.toDouble())
-                val lightFactor = (minLightFactor + 0.75 * (effectiveLight / 15.0) + FullbrightFactor).coerceIn(0.0, 1.0)
 
-                val r = (clipped.color.red * lightFactor).toInt().coerceIn(0, 255)
-                val g = (clipped.color.green * lightFactor).toInt().coerceIn(0, 255)
-                val b = (clipped.color.blue * lightFactor).toInt().coerceIn(0, 255)
-
+                // To samo dla przezroczystych
+                val finalRGB = lightProcessor.process(
+                    (clipped.p1.x + camX).toInt(),
+                    (clipped.p1.y + viewY).toInt(),
+                    (clipped.p1.z + camZ).toInt(),
+                    clipped.color, skyLight, blockLight, globalSunIntensity, minLightFactor + FullbrightFactor
+                )
+                
+                // Musimy zachować alpha z oryginalnego koloru
+                val r = (finalRGB shr 16) and 0xFF
+                val g = (finalRGB shr 8) and 0xFF
+                val b = finalRGB and 0xFF
+                
                 fillTransparentTriangle(p1_2d, p2_2d, p3_2d, clipped.p1, clipped.p2, clipped.p3, Color(r, g, b, clipped.color.alpha))
             }
         }
@@ -2833,6 +2913,9 @@ class gridMap : JPanel() {
         }
 
         renderInventory(g2d)
+
+        // --- MOD HOOK: Renderowanie ---
+        modLoader.notifyRender(g2d, width, height)
     }
 
     private fun renderInventory(g2d: Graphics2D) {
@@ -2943,6 +3026,12 @@ class gridMap : JPanel() {
     private fun processSingleInput() {
         val consumedKeys = inputManager.consumeJustPressedKeys()
         for (keyCode in consumedKeys) {
+            // --- MOD HOOK: Klawisze ---
+            // Jeśli mod obsłużył klawisz (zwrócił true), nie wykonujemy standardowych akcji gry
+            if (modLoader.notifyKeyPress(keyCode)) {
+                continue
+            }
+
             if (keyCode == KeyEvent.VK_EQUALS) {
                 gameTime += 1
             }

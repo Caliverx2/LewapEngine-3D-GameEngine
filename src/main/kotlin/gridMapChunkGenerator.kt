@@ -5,24 +5,24 @@ import java.util.Random
 import kotlin.math.floor
 import kotlin.math.sqrt
 
-class ChunkGenerator(
-    private val seed: Int,
-    private val oreColors: MutableSet<Int>
+open class ChunkGenerator(
+    val seed: Int,
+    val oreColors: MutableSet<Int>
 ) {
-    private val noise = PerlinNoise(seed)
-    private val caveNoise = PerlinNoise(seed + 1)
+    val noise = PerlinNoise(seed)
+    val caveNoise = PerlinNoise(seed + 1)
 
     // Constants
-    private val BLOCK_ID_AIR = 0
-    private val BLOCK_ID_LIGHT = 2
-    private val BLOCK_ID_LAVA = 3
+    val BLOCK_ID_AIR = 0
+    val BLOCK_ID_LIGHT = 2
+    val BLOCK_ID_LAVA = 3
 
     // Models (Assuming these are available in the package)
-    private val treeModel = treeModelData
-    private val DungeonModel = DungeonModelData
-    private val IglooModel = IglooModelData
+    val treeModel = treeModelData
+    val DungeonModel = DungeonModelData
+    val IglooModel = IglooModelData
 
-    fun generate(cx: Int, cz: Int): Chunk {
+    open fun generate(cx: Int, cz: Int): Chunk {
         val chunk = Chunk(cx, cz)
 
         // 1. Generowanie terenu i jaskiń
@@ -56,12 +56,12 @@ class ChunkGenerator(
         return chunk
     }
 
-    fun getTerrainHeight(wx: Int, wz: Int): Int {
+    open fun getTerrainHeight(wx: Int, wz: Int): Int {
         val n = noise.noise(wx * 0.02, wz * 0.02)
         return (58 + n * 6).toInt().coerceIn(0, 127)
     }
 
-    private fun computeWorldBlock(wx: Int, wy: Int, wz: Int, precalcHeight: Int? = null): Int {
+    open fun computeWorldBlock(wx: Int, wy: Int, wz: Int, precalcHeight: Int? = null): Int {
         if (wy < 0) return BLOCK_ID_AIR
         if (wy == 0) return Color.BLACK.rgb // Bedrock
 
@@ -93,7 +93,7 @@ class ChunkGenerator(
         return baseColor
     }
 
-    private fun generateOres(chunk: Chunk, cx: Int, cz: Int) {
+    open fun generateOres(chunk: Chunk, cx: Int, cz: Int) {
         val rand = Random((cx * 341873128712L + cz * 132897987541L + seed).hashCode().toLong())
         val targetBlock = Color(0x8EA3A1).rgb
 
@@ -102,7 +102,7 @@ class ChunkGenerator(
         generateOreType(chunk, rand, targetBlock, Color(0x30ddeb).rgb, 1, 4, 1, 16, 5)
     }
 
-    private fun generateOreType(chunk: Chunk, rand: Random, target: Int, color: Int, minSize: Int, maxSize: Int, minY: Int, maxY: Int, maxVeins: Int) {
+    open fun generateOreType(chunk: Chunk, rand: Random, target: Int, color: Int, minSize: Int, maxSize: Int, minY: Int, maxY: Int, maxVeins: Int) {
         oreColors.add(color)
 
         val veinsCount = rand.nextInt(maxVeins + 1)
@@ -118,7 +118,7 @@ class ChunkGenerator(
         }
     }
 
-    private fun placeOreVein(chunk: Chunk, rand: Random, x: Int, y: Int, z: Int, size: Int, target: Int, color: Int, minY: Int, maxY: Int) {
+    open fun placeOreVein(chunk: Chunk, rand: Random, x: Int, y: Int, z: Int, size: Int, target: Int, color: Int, minY: Int, maxY: Int) {
         val vein = java.util.ArrayList<BlockPos>()
         vein.add(BlockPos(x, y, z))
         chunk.setBlock(x, y, z, color)
@@ -151,7 +151,7 @@ class ChunkGenerator(
         }
     }
 
-    private fun generateLavaLakes(chunk: Chunk, cx: Int, cz: Int) {
+    open fun generateLavaLakes(chunk: Chunk, cx: Int, cz: Int) {
         for (lx in -8..23) {
             for (lz in -8..23) {
                 val wx = cx * 16 + lx
@@ -168,13 +168,13 @@ class ChunkGenerator(
         }
     }
 
-    private fun isLakeCenter(wx: Int, wz: Int): Boolean {
+    open fun isLakeCenter(wx: Int, wz: Int): Boolean {
         val hash = (wx * 73856093 xor wz * 19349663 xor seed).toString().hashCode()
         val random = Random(hash.toLong())
         return random.nextDouble() < 0.0005
     }
 
-    private fun placeLake(chunk: Chunk, centerLx: Int, surfaceY: Int, centerLz: Int, radius: Double, maxDepth: Double) {
+    open fun placeLake(chunk: Chunk, centerLx: Int, surfaceY: Int, centerLz: Int, radius: Double, maxDepth: Double) {
         val stoneColor = Color(0x8EA3A1).rgb
         val margin = 5.0
         val minX = (centerLx - radius - margin).toInt().coerceIn(0, 15)
@@ -223,7 +223,7 @@ class ChunkGenerator(
         }
     }
 
-    private fun generateStructureType(chunk: Chunk, cx: Int, cz: Int, model: List<ModelVoxel>, density: Double, minH: Int, maxH: Int, targetBlock: Int, yOffset: Int, clearSpace: Boolean = false, allowedRotations: List<Int> = listOf(0)) {
+    open fun generateStructureType(chunk: Chunk, cx: Int, cz: Int, model: List<ModelVoxel>, density: Double, minH: Int, maxH: Int, targetBlock: Int, yOffset: Int, clearSpace: Boolean = false, allowedRotations: List<Int> = listOf(0)) {
         val margin = 10
         val modelCache = mutableMapOf<Int, List<ModelVoxel>>()
 
@@ -259,7 +259,7 @@ class ChunkGenerator(
         }
     }
 
-    private fun rotateModel(model: List<ModelVoxel>, angle: Int): List<ModelVoxel> {
+    open fun rotateModel(model: List<ModelVoxel>, angle: Int): List<ModelVoxel> {
         var normAngle = angle % 360
         if (normAngle < 0) normAngle += 360
         val steps = (normAngle / 90) % 4
@@ -277,13 +277,13 @@ class ChunkGenerator(
         }
     }
 
-    private fun isStructureAt(wx: Int, wz: Int, density: Double, salt: Int): Boolean {
+    open fun isStructureAt(wx: Int, wz: Int, density: Double, salt: Int): Boolean {
         val hash = (wx * 73856093 xor wz * 19349663 xor seed xor salt).toString().hashCode()
         val random = Random(hash.toLong())
         return random.nextDouble() < density
     }
 
-    private fun placeStructure(chunk: Chunk, rootLx: Int, rootY: Int, rootLz: Int, model: List<ModelVoxel>, clearSpace: Boolean) {
+    open fun placeStructure(chunk: Chunk, rootLx: Int, rootY: Int, rootLz: Int, model: List<ModelVoxel>, clearSpace: Boolean) {
         if (clearSpace && model.isNotEmpty()) {
             val minX = model.minOf { it.x }
             val maxX = model.maxOf { it.x }
@@ -333,7 +333,7 @@ class ChunkGenerator(
 }
 
 class PerlinNoise(seed: Int) {
-    private val p = IntArray(512)
+    val p = IntArray(512)
     init {
         val random = Random(seed.toLong())
         val permutation = (0..255).toMutableList()
@@ -398,10 +398,10 @@ class PerlinNoise(seed: Int) {
         )
         return (res + 1) / 2.0 // Bring to 0..1 range
     }
-    private fun fade(t: Double) = t * t * t * (t * (t * 6 - 15) + 10)
-    private fun lerp(t: Double, a: Double, b: Double) = a + t * (b - a)
-    private fun grad(hash: Int, x: Double, y: Double) = if (hash and 1 == 0) x else -x + if (hash and 2 == 0) y else -y
-    private fun grad(hash: Int, x: Double, y: Double, z: Double): Double {
+    fun fade(t: Double) = t * t * t * (t * (t * 6 - 15) + 10)
+    fun lerp(t: Double, a: Double, b: Double) = a + t * (b - a)
+    fun grad(hash: Int, x: Double, y: Double) = if (hash and 1 == 0) x else -x + if (hash and 2 == 0) y else -y
+    fun grad(hash: Int, x: Double, y: Double, z: Double): Double {
         // Standardowa implementacja gradientu dla 3D Perlin Noise
         val h = hash and 15
         val u = if (h < 8) x else y

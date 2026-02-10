@@ -6,7 +6,7 @@ import java.awt.image.BufferedImage
 import java.util.Collections
 import javax.swing.SwingUtilities
 
-class InputManager(private val component: Component) {
+open class InputManager(private val component: Component) {
     // Zbiór aktualnie wciśniętych klawiszy
     val keys: MutableSet<Int> = Collections.synchronizedSet(mutableSetOf<Int>())
     // Zbiór klawiszy wciśniętych tylko w tej klatce

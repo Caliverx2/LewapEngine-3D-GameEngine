@@ -8,11 +8,30 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
+import java.util.Locale.getDefault
 
-class ChunkIO(worldName: String) {
-    private val saveDir = File("saves/$worldName").apply { mkdirs() }
+/**
+ * Leniwie inicjalizowany, globalny obiekt przechowujący ścieżkę do głównego folderu gry.
+ * Używa standardowych lokalizacji dla różnych systemów operacyjnych, aby zapisy były zawsze w tym samym miejscu.
+ */
+internal val gameDir: File by lazy {
+    val appName = "gridMap"
+    val userHome = System.getProperty("user.home")
+    val os = System.getProperty("os.name").lowercase(getDefault())
 
-    fun saveChunk(chunk: Chunk) {
+    val path = when {
+        os.contains("win") -> System.getenv("APPDATA")?.let { File(it, appName) } ?: File(userHome, ".$appName")
+        os.contains("mac") -> File(userHome, "Library/Application Support/$appName")
+        else -> File(userHome, ".$appName") // Linux, etc.
+    }
+    path.apply { mkdirs() }
+}
+
+open class ChunkIO(worldName: String) {
+    // Używamy scentralizowanego folderu gry zdefiniowanego w gridMapModAPI.kt
+    val saveDir = File(gameDir, "saves/$worldName").apply { mkdirs() }
+
+    open fun saveChunk(chunk: Chunk) {
         try {
             val file = File(saveDir, "c_${chunk.x}_${chunk.z}.dat")
             DataOutputStream(BufferedOutputStream(FileOutputStream(file))).use { dos ->
@@ -36,7 +55,7 @@ class ChunkIO(worldName: String) {
         }
     }
 
-    fun loadChunk(cx: Int, cz: Int): Chunk? {
+    open fun loadChunk(cx: Int, cz: Int): Chunk? {
         val file = File(saveDir, "c_${cx}_${cz}.dat")
         if (!file.exists()) return null
 
