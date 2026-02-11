@@ -16,7 +16,20 @@ fun parseVoxelModel(data: String): List<ModelVoxel> {
                     if (colStr == "1") {
                         ModelVoxel(x, y, z, Color(0, true), true)
                     } else {
-                        val color = if (colStr.startsWith("#")) Color.decode(colStr) else Color(colStr.toInt(), true)
+                        val color = if (colStr.startsWith("#")) {
+                            val hex = colStr.substring(1)
+                            when (hex.length) {
+                                6 -> Color.decode(colStr) // #RRGGBB
+                                8 -> { // #RRGGBBAA
+                                    val r = hex.substring(0, 2).toInt(16)
+                                    val g = hex.substring(2, 4).toInt(16)
+                                    val b = hex.substring(4, 6).toInt(16)
+                                    val a = hex.substring(6, 8).toInt(16)
+                                    Color(r, g, b, a)
+                                }
+                                else -> throw IllegalArgumentException("Nieprawidłowy format HEX: $colStr")
+                            }
+                        } else Color(colStr.toInt(), true)
                         ModelVoxel(x, y, z, color)
                     }
                 } else null

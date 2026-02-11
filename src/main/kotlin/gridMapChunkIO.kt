@@ -7,6 +7,7 @@ import java.io.DataOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.EOFException
 import java.io.IOException
 import java.util.Locale.getDefault
 
@@ -26,6 +27,33 @@ internal val gameDir: File by lazy {
     }
     path.apply { mkdirs() }
 }
+
+/**
+ * Zwraca listę nazw światów (folderów) znajdujących się w katalogu zapisu gry.
+ */
+fun listWorlds(): List<String> {
+    val savesDir = File(gameDir, "saves")
+    if (!savesDir.exists() || !savesDir.isDirectory) {
+        return emptyList()
+    }
+    return savesDir.listFiles { file -> file.isDirectory }?.map { it.name }?.sorted() ?: emptyList()
+}
+
+data class WorldData(
+    val seed: Int,
+    val x: Double,
+    val y: Double,
+    val z: Double,
+    val yaw: Double,
+    val pitch: Double,
+    val debugNoclip: Boolean = false,
+    val debugFly: Boolean = false,
+    val debugFullbright: Boolean = false,
+    val showChunkBorders: Boolean = false,
+    val debugXray: Boolean = false,
+    val gameTime: Double = 12.0,
+    val dayCounter: Int = 0
+)
 
 open class ChunkIO(worldName: String) {
     // Używamy scentralizowanego folderu gry zdefiniowanego w gridMapModAPI.kt
@@ -78,6 +106,69 @@ open class ChunkIO(worldName: String) {
             }
             chunk.modified = false
             chunk
+        } catch (e: IOException) {
+            e.printStackTrace()
+            null
+        }
+    }
+
+    fun saveWorldData(data: WorldData) {
+        try {
+            val file = File(saveDir, "world.dat")
+            DataOutputStream(BufferedOutputStream(FileOutputStream(file))).use { dos ->
+                dos.writeInt(data.seed)
+                dos.writeDouble(data.x)
+                dos.writeDouble(data.y)
+                dos.writeDouble(data.z)
+                dos.writeDouble(data.yaw)
+                dos.writeDouble(data.pitch)
+                dos.writeBoolean(data.debugNoclip)
+                dos.writeBoolean(data.debugFly)
+                dos.writeBoolean(data.debugFullbright)
+                dos.writeBoolean(data.showChunkBorders)
+                dos.writeBoolean(data.debugXray)
+                dos.writeDouble(data.gameTime)
+                dos.writeInt(data.dayCounter)
+            }
+        } catch (e: IOException) {
+            e.printStackTrace()
+        }
+    }
+
+    fun loadWorldData(): WorldData? {
+        val file = File(saveDir, "world.dat")
+        if (!file.exists()) return null
+        return try {
+            DataInputStream(BufferedInputStream(FileInputStream(file))).use { dis ->
+                val seed = dis.readInt()
+                val x = dis.readDouble()
+                val y = dis.readDouble()
+                val z = dis.readDouble()
+                val yaw = dis.readDouble()
+                val pitch = dis.readDouble()
+
+                var debugNoclip = false
+                var debugFly = false
+                var debugFullbright = false
+                var showChunkBorders = false
+                var debugXray = false
+                var gameTime = 12.0
+                var dayCounter = 0
+
+                try {
+                    debugNoclip = dis.readBoolean()
+                    debugFly = dis.readBoolean()
+                    debugFullbright = dis.readBoolean()
+                    showChunkBorders = dis.readBoolean()
+                    debugXray = dis.readBoolean()
+                    gameTime = dis.readDouble()
+                    dayCounter = dis.readInt()
+                } catch (e: EOFException) {
+                    // Ignorujemy, stary zapis bez flag debugowania lub czasu
+                }
+
+                WorldData(seed, x, y, z, yaw, pitch, debugNoclip, debugFly, debugFullbright, showChunkBorders, debugXray, gameTime, dayCounter)
+            }
         } catch (e: IOException) {
             e.printStackTrace()
             null

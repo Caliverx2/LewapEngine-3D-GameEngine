@@ -23,6 +23,11 @@ open class InputManager(private val component: Component) {
     private val robot = try { Robot() } catch (e: AWTException) { null }
     private var windowPos = Point(0, 0)
 
+    private val blankCursor: Cursor by lazy {
+        val blankImage = BufferedImage(1, 1, BufferedImage.TYPE_INT_ARGB)
+        Toolkit.getDefaultToolkit().createCustomCursor(blankImage, Point(0, 0), "blank")
+    }
+
     val sensitivity = 0.003
     var mouseDeltaX = 0
         private set
@@ -46,6 +51,24 @@ open class InputManager(private val component: Component) {
                 if (component.isShowing) windowPos = component.locationOnScreen
             }
         })
+    }
+
+    fun captureMouse() {
+        if (isMouseCaptured) return
+        isMouseCaptured = true
+        component.cursor = blankCursor
+        if (component.isShowing) {
+            windowPos = component.locationOnScreen
+            // Reset deltas and center the mouse
+            resetFrameState()
+            robot?.mouseMove(windowPos.x + component.width / 2, windowPos.y + component.height / 2)
+        }
+    }
+
+    fun releaseMouse() {
+        if (!isMouseCaptured) return
+        isMouseCaptured = false
+        component.cursor = Cursor.getDefaultCursor()
     }
 
     fun isKeyDown(keyCode: Int): Boolean = keys.contains(keyCode)
@@ -79,10 +102,6 @@ open class InputManager(private val component: Component) {
                     justPressedKeys.add(it.keyCode)
                 }
             }
-            if (e?.keyCode == KeyEvent.VK_ESCAPE) {
-                isMouseCaptured = false
-                component.cursor = Cursor.getDefaultCursor()
-            }
         }
 
         override fun keyReleased(e: KeyEvent?) {
@@ -92,20 +111,10 @@ open class InputManager(private val component: Component) {
 
     private inner class MouseListener : MouseAdapter() {
         override fun mousePressed(e: MouseEvent) {
-            if (!isMouseCaptured) {
-                isMouseCaptured = true
-                // Ukrywamy kursor
-                val blankImage = BufferedImage(1, 1, BufferedImage.TYPE_INT_ARGB)
-                val blankCursor = Toolkit.getDefaultToolkit().createCustomCursor(blankImage, Point(0, 0), "blank")
-                component.cursor = blankCursor
-                if (component.isShowing) windowPos = component.locationOnScreen
-            } else {
-                if (SwingUtilities.isLeftMouseButton(e)) {
-                    isLeftMouseDown = true
-                } else if (SwingUtilities.isRightMouseButton(e)) {
-                    isRightMouseDown = true
-                }
-            }
+            // The decision to capture the mouse is now external.
+            // This listener just reports which button is down.
+            if (SwingUtilities.isLeftMouseButton(e)) isLeftMouseDown = true
+            if (SwingUtilities.isRightMouseButton(e)) isRightMouseDown = true
         }
 
         override fun mouseReleased(e: MouseEvent) {

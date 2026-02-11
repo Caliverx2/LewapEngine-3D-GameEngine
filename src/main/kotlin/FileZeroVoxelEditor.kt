@@ -190,12 +190,21 @@ class DemoDisplay : JPanel() {
         }
         // Export
         if (keyCode == KeyEvent.VK_E) {
-            val data = voxels.joinToString("") {
-                if ((it.color ushr 24) == 0) {
-                    ";${it.x},${it.y},${it.z},${it.color};"
+            val data = voxels.joinToString("") { voxel ->
+                val colorInt = voxel.color
+                val alpha = (colorInt ushr 24) and 0xFF
+
+                if (alpha == 0) { // ID-based block (like void)
+                    ";${voxel.x},${voxel.y},${voxel.z},${colorInt};"
+                } else if (alpha != 0xFF) { // Transparent color
+                    val r = (colorInt shr 16) and 0xFF
+                    val g = (colorInt shr 8) and 0xFF
+                    val b = colorInt and 0xFF
+                    val hex = String.format("#%02X%02X%02X%02X", r, g, b, alpha)
+                    ";${voxel.x},${voxel.y},${voxel.z},$hex;"
                 } else {
-                    val hex = String.format("#%06X", (0xFFFFFF and it.color))
-                    ";${it.x},${it.y},${it.z},$hex;"
+                    val hex = String.format("#%06X", (0xFFFFFF and colorInt))
+                    ";${voxel.x},${voxel.y},${voxel.z},$hex;"
                 }
             }
             val textArea = JTextArea(data)
@@ -221,24 +230,27 @@ class DemoDisplay : JPanel() {
                             val x = coords[0].toInt()
                             val y = coords[1].toInt()
                             val z = coords[2].toInt()
-                            val c = if (coords.size > 3) {
-                                val valStr = coords[3]
+                            val colorInt = if (coords.size > 3) {
+                                val valStr = coords[3].trim()
                                 if (valStr.startsWith("#")) {
-                                    try {
-                                        Color.decode(valStr).rgb
-                                    } catch (e: Exception) {
-                                        Color.WHITE.rgb
+                                    val hex = valStr.substring(1)
+                                    when (hex.length) {
+                                        6 -> Color.decode(valStr).rgb
+                                        8 -> {
+                                            val r = hex.substring(0, 2).toInt(16)
+                                            val g = hex.substring(2, 4).toInt(16)
+                                            val b = hex.substring(4, 6).toInt(16)
+                                            val a = hex.substring(6, 8).toInt(16)
+                                            Color(r, g, b, a).rgb
+                                        }
+                                        else -> Color.WHITE.rgb
                                     }
-                                } else {
-                                    valStr.toIntOrNull() ?: try {
-                                        Color.decode(valStr).rgb
-                                    } catch (e: Exception) {
-                                        Color.WHITE.rgb
-                                    }
+                                } else { // ID
+                                    valStr.toIntOrNull() ?: Color.WHITE.rgb
                                 }
                             } else Color.WHITE.rgb
-                            voxels.add(Voxel(x, y, z, c))
-                            importedColors.add(c)
+                            voxels.add(Voxel(x, y, z, colorInt))
+                            importedColors.add(colorInt)
                         }
                     }
                     onColorsImported?.invoke(importedColors)
@@ -491,7 +503,7 @@ class DemoDisplay : JPanel() {
             
             // Obsługa bloku próżni (ID 1) -> Czerwony 50% opacity
             val isId = (v.color ushr 24) == 0
-            val baseColor = if (isId) Color(255, 0, 0, 128) else Color(v.color)
+            val baseColor = if (isId) Color(255, 0, 0, 128) else Color(v.color, true)
 
             // Calculate light intensity based on the angle between the face normal and the light direction
             val dot = normal.x * lightDir.x + normal.y * lightDir.y + normal.z * lightDir.z
@@ -602,10 +614,25 @@ class PaletteWindow(private val display: DemoDisplay) : JFrame("Paleta Barw") {
                 }
             }
             try {
-                val c = Color.decode(text)
-                display.currentColor = c.rgb
+                val colorInt = if (text.startsWith("#")) {
+                    val hex = text.substring(1)
+                    when (hex.length) {
+                        6 -> Color.decode(text).rgb
+                        8 -> {
+                            val r = hex.substring(0, 2).toInt(16)
+                            val g = hex.substring(2, 4).toInt(16)
+                            val b = hex.substring(4, 6).toInt(16)
+                            val a = hex.substring(6, 8).toInt(16)
+                            Color(r, g, b, a).rgb
+                        }
+                        else -> throw IllegalArgumentException("Invalid hex format")
+                    }
+                } else {
+                    throw IllegalArgumentException("Not a hex color")
+                }
+                display.currentColor = colorInt
             } catch (e: Exception) {
-                JOptionPane.showMessageDialog(this, "Błędny format HEX!")
+                JOptionPane.showMessageDialog(this, "Błędny format HEX lub ID!")
             }
         }
 
@@ -808,10 +835,16 @@ class PaletteWindow(private val display: DemoDisplay) : JFrame("Paleta Barw") {
     }
 
     private fun updateHexField(rgb: Int) {
-        if ((rgb ushr 24) == 0) {
+        val alpha = (rgb ushr 24) and 0xFF
+        if (alpha == 0) { // ID
             hexField.text = rgb.toString()
+        } else if (alpha != 0xFF) { // Transparent
+            val r = (rgb shr 16) and 0xFF
+            val g = (rgb shr 8) and 0xFF
+            val b = rgb and 0xFF
+            hexField.text = String.format("#%02X%02X%02X%02X", r, g, b, alpha)
         } else {
-            hexField.text = String.format("#%06X", (0xFFFFFF and rgb))
+            hexField.text = String.format("#%06X", (0xFFFFFF and rgb)) // Opaque
         }
     }
 

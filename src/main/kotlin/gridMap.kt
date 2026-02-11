@@ -1,6 +1,8 @@
 package org.lewapnoob.gridMap
 
 import java.awt.*
+import java.awt.event.KeyAdapter
+import java.awt.event.MouseAdapter
 import java.awt.event.KeyEvent
 import java.awt.image.BufferedImage
 import java.awt.image.DataBufferInt
@@ -9,16 +11,17 @@ import javax.swing.*
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
-import java.io.*
+import java.util.Locale.getDefault
 import kotlin.math.sqrt
 import kotlin.math.floor
 import kotlin.math.abs
 import kotlin.math.sign
 import java.util.Random
-
-// --- 3D Structures (Moved out of gridMap class) ---
+import kotlin.system.exitProcess
 import kotlin.math.cos
 import kotlin.math.sin
+
+// --- 3D Structures (Moved out of gridMap class) ---
 data class Vector3d(var x: Double, var y: Double, var z: Double, var ao: Double = 1.0)
 data class BlockPos(val x: Int, val y: Int, val z: Int)
 data class RayHit(val blockPos: BlockPos, val faceIndex: Int)
@@ -26,6 +29,19 @@ data class Triangle3d(
     val p1: Vector3d, val p2: Vector3d, val p3: Vector3d, val color: Color, val lightLevel: Int
 )
 data class ModelVoxel(val x: Int, val y: Int, val z: Int, val color: Color, val isVoid: Boolean = false)
+
+// --- Stany gry i elementy UI ---
+enum class GameState {
+    MAIN_MENU, WORLD_SELECTION, CREATE_WORLD, IN_GAME, PAUSED
+}
+
+data class MenuButton(
+    val text: String,
+    var rect: Rectangle,
+    val enabled: Boolean = true,
+    val action: () -> Unit
+)
+
 data class ItemStack(val color: Int, var count: Int)
 data class FluidProperties(val tickRate: Int) // Ile ticków na aktualizację. 30 ticków = 1 sekunda.
 // --- Voxel World Data ---
@@ -251,51 +267,276 @@ class gridMap : JPanel() {
     var selectedSlot = 0
 
     // --- Threading & Optimization ---
-    val chunkExecutor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors())
-    val chunksBeingGenerated = ConcurrentHashMap.newKeySet<Point>()
-    val chunksToMeshQueue = ConcurrentLinkedQueue<Point>()
+    private val chunkExecutor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors())
+    private val chunksBeingGenerated = ConcurrentHashMap.newKeySet<Point>()
+    private val chunksToMeshQueue = ConcurrentLinkedQueue<Point>()
 
     // --- Modding System ---
     private val modLoader = ModLoader(this)
+
+    // --- Game State & Menu System ---
+    private var gameState = GameState.MAIN_MENU
+    private val mainMenuButtons = mutableListOf<MenuButton>()
+    private val worldSelectionButtons = mutableListOf<MenuButton>()
+    private val worldListButtons = mutableListOf<MenuButton>()
+    private val pauseMenuButtons = mutableListOf<MenuButton>()
+    private var worldList = listOf<String>()
+    private val createWorldMenuButtons = mutableListOf<MenuButton>()
+    private var newWorldName = "New World"
+    private var newWorldSeed = ""
+    private var activeTextField: Int? = null // 0 for name, 1 for seed
+    private val worldCreationTextFields = mutableMapOf<Int, Rectangle>()
+    private var createWorldError: String? = null
+    private var keyListenerForText: KeyAdapter? = null
+
+    private var hoveredWorld: String? = null
 
     init {
         preferredSize = Dimension((baseCols + 1) * cellSize, (baseRows + 1) * cellSize)
         setBackground(Color(113, 144, 225))
         isFocusable = true
 
-        modLoader.loadMods()
+        createMenus()
 
         inputManager = InputManager(this)
 
-        noise = PerlinNoise(seed)
+        // Dodajemy obsługę myszy dla menu
+        val menuMouseAdapter = object : MouseAdapter() {
+            override fun mouseClicked(e: java.awt.event.MouseEvent) {
+                handleMenuClick(e.point)
+            }
 
-        // Ustawiamy gracza na powierzchni (pobieramy wysokość terenu w punkcie 0,0)
-        val spawnH = chunkGenerator.getTerrainHeight(0, 0)
-        camY = (spawnH + 3) * cubeSize - 10.0
-
-        updateWorld()
+            override fun mouseMoved(e: java.awt.event.MouseEvent) {
+                handleMenuMouseMove(e.point)
+            }
+        }
+        addMouseListener(menuMouseAdapter)
+        addMouseMotionListener(menuMouseAdapter)
 
         loop()
+    }
 
-        addItem("#FF0000", 64)
-        addItem("#00FF00", 64)
-        addItem("#0000FF", 64)
-        addItem("$BLOCK_ID_LIGHT", 64)
-        addItem("$BLOCK_ID_LAVA", 64)
-        addItem("$BLOCK_ID_WATER", 64)
+    private fun createMenus() {
+        // Main Menu
+        mainMenuButtons.add(MenuButton("Singleplayer", Rectangle(), true) {
+            gameState = GameState.WORLD_SELECTION
+            updateWorldList()
+        })
+        mainMenuButtons.add(MenuButton("Multiplayer", Rectangle(), false) {})
+        mainMenuButtons.add(MenuButton("Options...", Rectangle(), false) {})
+        mainMenuButtons.add(MenuButton("Quit Game", Rectangle(), true) {
+            running = false
+            exitProcess(0)
+        })
 
-        // Generowanie gwiazd (Skymapa)
-        val rStar = Random(seed.toLong())
-        for (i in 0 until 2000) {
-            val u = rStar.nextDouble() * 2.0 - 1.0
-            val v = rStar.nextDouble() * 2.0 * Math.PI
-            val f = sqrt(1.0 - u * u)
-            val x = f * cos(v)
-            val y = f * sin(v)
-            val z = u
-            // Używamy 4 parametru (ao) jako losowego progu pojawienia się gwiazdy (0.0 - 1.0)
-            stars.add(Vector3d(x * 500.0, y * 500.0, z * 500.0, rStar.nextDouble()))
+        // World Selection Menu
+        worldSelectionButtons.add(MenuButton("Create New World", Rectangle(), true) {
+            showCreateWorldMenu()
+        })
+        worldSelectionButtons.add(MenuButton("Back", Rectangle(), true) {
+            gameState = GameState.MAIN_MENU
+        })
+
+
+        // Pause Menu
+        pauseMenuButtons.add(MenuButton("Back to game", Rectangle(), true) {
+            gameState = GameState.IN_GAME
+            inputManager.captureMouse()
+        })
+        pauseMenuButtons.add(MenuButton("Save and quit", Rectangle(), true) {
+            saveAndExitToMenu()
+        })
+
+        // Create World Menu
+        createWorldMenuButtons.add(MenuButton("Create World", Rectangle(), true) {
+            tryCreateWorld()
+        })
+        createWorldMenuButtons.add(MenuButton("Cancel", Rectangle(), true) {
+            hideCreateWorldMenu()
+            gameState = GameState.WORLD_SELECTION
+        })
+    }
+
+    private fun updateWorldList() {
+        worldList = listWorlds()
+        worldListButtons.clear()
+        worldList.forEach { worldName ->
+            worldListButtons.add(MenuButton(worldName, Rectangle(), true) {
+                startGame(worldName)
+            })
         }
+    }
+
+    private fun showCreateWorldMenu() {
+        gameState = GameState.CREATE_WORLD
+        newWorldName = "New World"
+        newWorldSeed = ""
+        activeTextField = 0
+        createWorldError = null
+
+        keyListenerForText = object : KeyAdapter() {
+            override fun keyTyped(e: KeyEvent) {
+                if (activeTextField == null) return
+
+                val char = e.keyChar
+                if (char.code >= 32 && char.code != 127) { // Printable chars
+                    if (activeTextField == 0) {
+                        if (newWorldName.length < 30) newWorldName += char
+                    } else { // seed
+                        if (newWorldSeed.length < 30) newWorldSeed += char
+                    }
+                    repaint()
+                }
+            }
+
+            override fun keyPressed(e: KeyEvent) {
+                if (activeTextField == null) return
+                when (e.keyCode) {
+                    KeyEvent.VK_BACK_SPACE -> {
+                        if (activeTextField == 0 && newWorldName.isNotEmpty()) {
+                            newWorldName = newWorldName.dropLast(1)
+                        } else if (activeTextField == 1 && newWorldSeed.isNotEmpty()) {
+                            newWorldSeed = newWorldSeed.dropLast(1)
+                        }
+                    }
+                    KeyEvent.VK_TAB -> activeTextField = if (activeTextField == 0) 1 else 0
+                }
+                repaint()
+            }
+        }
+        addKeyListener(keyListenerForText)
+    }
+
+    private fun hideCreateWorldMenu() {
+        keyListenerForText?.let { removeKeyListener(it) }
+        keyListenerForText = null
+        activeTextField = null
+        createWorldError = null
+    }
+
+    private fun tryCreateWorld() {
+        val name = newWorldName.trim()
+        if (name.isBlank() || name.contains("/") || name.contains("\\") || name == "." || name == "..") {
+            createWorldError = "Invalid world name."
+            repaint()
+            return
+        }
+        if (listWorlds().any { it.equals(name, ignoreCase = true) }) {
+            createWorldError = "World '$name' already exists."
+            repaint()
+            return
+        }
+
+        hideCreateWorldMenu()
+
+        val finalSeed = newWorldSeed.trim().toIntOrNull() ?: name.hashCode()
+
+        // Pre-create the world data file so startGame can load it
+        val newChunkIO = ChunkIO(name)
+        val tempNoise = PerlinNoise(finalSeed)
+        val tempChunkGen = ChunkGenerator(finalSeed, oreColors)
+        val spawnH = tempChunkGen.getTerrainHeight(0, 0)
+        val spawnY = (spawnH + 3) * cubeSize - 10.0
+
+        newChunkIO.saveWorldData(WorldData(finalSeed, 0.0, spawnY, 0.0, 0.0, 0.0))
+
+        startGame(name)
+    }
+
+    private fun saveAndExitToMenu() {
+        println("Saving modified chunks...")
+        chunks.values.filter { it.modified }.forEach { chunk ->
+            chunkIO.saveChunk(chunk)
+            chunk.modified = false
+        }
+        chunkIO.saveWorldData(WorldData(seed, camX, camY, camZ, yaw, pitch, debugNoclip, debugFly, debugFullbright, showChunkBorders, debugXray, gameTime, dayCounter))
+        println("All modified chunks saved.")
+
+        resetGame()
+        gameState = GameState.WORLD_SELECTION
+        updateWorldList()
+    }
+
+    private fun resetGame() {
+        chunks.clear()
+        chunkMeshes.clear()
+        chunkOcclusion.clear()
+        chunksBeingGenerated.clear()
+        chunksToMeshQueue.clear()
+        inventory = arrayOfNulls<ItemStack>(9)
+        lastChunkX = Int.MAX_VALUE
+        lastChunkZ = Int.MAX_VALUE
+        gameTime = 12.0
+        dayCounter = 0
+        camX = 0.0; camY = 0.0; camZ = 0.0
+        yaw = 0.0; pitch = 0.0
+        inputManager.releaseMouse()
+        inputManager.resetInputState()
+
+        // Reset debug flags
+        debugNoclip = false
+        debugFly = false
+        debugFullbright = false
+        FullbrightFactor = 0.0
+        showChunkBorders = false
+        debugXray = false
+    }
+
+    private fun startGame(worldName: String) {
+        resetGame()
+
+        // Inicjalizacja specyficzna dla świata
+        chunkIO = ChunkIO(worldName)
+        
+        val worldData = chunkIO.loadWorldData()
+        if (worldData != null) {
+            seed = worldData.seed
+            camX = worldData.x
+            camY = worldData.y
+            camZ = worldData.z
+            yaw = worldData.yaw
+            pitch = worldData.pitch
+            debugNoclip = worldData.debugNoclip
+            debugFly = worldData.debugFly
+            debugFullbright = worldData.debugFullbright
+            FullbrightFactor = if (debugFullbright) 1.0 else 0.0
+            showChunkBorders = worldData.showChunkBorders
+            debugXray = worldData.debugXray
+            gameTime = worldData.gameTime
+            dayCounter = worldData.dayCounter
+        } else {
+            seed = worldName.hashCode() // Domyślny seed dla nowego świata (unikalny per nazwa)
+        }
+
+        noise = PerlinNoise(seed)
+        chunkGenerator = ChunkGenerator(seed, oreColors)
+
+        modLoader.loadMods()
+
+        if (worldData == null) {
+            val spawnH = chunkGenerator.getTerrainHeight(0, 0)
+            camY = (spawnH + 3) * cubeSize - 10.0
+        }
+
+        // Początkowy ekwipunek
+        addItem("#FF0000", 64); addItem("#00FF00", 64); addItem("#0000FF", 64)
+        addItem("$BLOCK_ID_LIGHT", 64); addItem("$BLOCK_ID_LAVA", 64); addItem("$BLOCK_ID_WATER", 64)
+        addItem("#FFFFFF80", 32)
+
+        // Generowanie gwiazd (jeśli jeszcze nie ma)
+        if (stars.isEmpty()) {
+            val rStar = Random(seed.toLong())
+            for (i in 0 until 2000) {
+                val u = rStar.nextDouble() * 2.0 - 1.0
+                val v = rStar.nextDouble() * 2.0 * Math.PI
+                val f = sqrt(1.0 - u * u)
+                val x = f * cos(v); val y = f * sin(v); val z = u
+                stars.add(Vector3d(x * 500.0, y * 500.0, z * 500.0, rStar.nextDouble()))
+            }
+        }
+
+        gameState = GameState.IN_GAME
+        inputManager.captureMouse()
     }
 
     private fun updateWorld() {
@@ -473,18 +714,12 @@ class gridMap : JPanel() {
                     val idx = chunk.getIndex(x, y, z)
                     val blockId = chunk.blocks[idx]
 
-                    var skyL = 0
+                    val skyL = if (sunlight) 15 else 0
                     var blockL = 0
 
                     if (blockId != 0) {
-                        if (blockId == BLOCK_ID_WATER) {
-                            if (sunlight) {
-                                skyL = 15
-                                sunlight = false // Zatrzymujemy "nieskończony" promień, ale pozwalamy BFS rozprowadzić światło w dół
-                            }
-                        } else {
-                            sunlight = false // Blokada światła dla bloków stałych
-                        }
+                        if (isOpaqueForCulling(blockId)) sunlight = false
+
                         // Jeśli to blok światła, ustawiamy max jasność i dodajemy do kolejki propagacji
                         if (blockId == BLOCK_ID_LIGHT || blockId in 6..8) {
                             blockL = 15
@@ -492,10 +727,6 @@ class gridMap : JPanel() {
                             // Lawa emituje światło zależnie od poziomu (1-8 -> 8-15)
                             val level = chunk.getMeta(x, y, z) and 0xF
                             blockL = (level + 7).coerceIn(1, 15)
-                        }
-                    } else {
-                        if (sunlight) {
-                            skyL = 15
                         }
                     }
 
@@ -520,8 +751,9 @@ class gridMap : JPanel() {
             var changed = false
 
             val blockId = chunk.blocks[idx]
-            if (blockId == 0 || fluidBlocks.contains(blockId)) {
-                val absorption = 1 // Zmiana: Woda pochłania 1 (tak jak powietrze), aby światło szło dalej
+            // Światło może wejść do każdego nie-nieprzezroczystego bloku
+            if (!isOpaqueForCulling(blockId)) {
+                val absorption = 1 // TODO: Różne bloki mogą mieć różną absorpcję
                 if (nSky > mySky + absorption) {
                     mySky = nSky - absorption
                     changed = true
@@ -578,8 +810,9 @@ class gridMap : JPanel() {
                 if (nx in 0..15 && ny in 0..127 && nz in 0..15) {
                     val nIdx = chunk.getIndex(nx, ny, nz)
                     val nBlockId = chunk.blocks[nIdx]
-                    if (nBlockId == 0 || fluidBlocks.contains(nBlockId)) {
-                        val absorption = 1
+                    // Światło może propagować do każdego nie-nieprzezroczystego bloku
+                    if (!isOpaqueForCulling(nBlockId)) {
+                        val absorption = 1 // TODO: Różne bloki mogą mieć różną absorpcję
                         val nVal = newLight[nIdx].toInt() and 0xFF
                         var nSky = (nVal shr 4) and 0xF
                         var nBlock = nVal and 0xF
@@ -607,12 +840,27 @@ class gridMap : JPanel() {
     fun addItem(value: String, count: Int = 1) {
         val id = try {
             if (value.startsWith("#")) {
-                Color.decode(value).rgb
+                val hex = value.substring(1).uppercase(getDefault())
+                when (hex.length) {
+                    6 -> { // #RRGGBB, zakładamy pełną nieprzezroczystość (alpha=FF)
+                        val argbHex = "FF$hex"
+                        java.lang.Long.parseLong(argbHex, 16).toInt()
+                    }
+                    8 -> { // #RRGGBBAA, odczytujemy kanał alpha
+                        val rr = hex.substring(0, 2)
+                        val gg = hex.substring(2, 4)
+                        val bb = hex.substring(4, 6)
+                        val aa = hex.substring(6, 8)
+                        val argbHex = aa + rr + gg + bb
+                        java.lang.Long.parseLong(argbHex, 16).toInt()
+                    }
+                    else -> throw IllegalArgumentException("Nieprawidłowy format koloru HEX: $value")
+                }
             } else {
                 value.toInt()
             }
         } catch (e: Exception) {
-            println("Błąd: Nieprawidłowa wartość przedmiotu '$value'")
+            println("Błąd: Nieprawidłowa wartość przedmiotu '$value' (${e.message})")
             return
         }
 
@@ -971,6 +1219,15 @@ class gridMap : JPanel() {
         return Color(getBlockDisplayColor(colorInt))
     }
 
+    private fun isOpaqueForCulling(blockId: Int): Boolean {
+        if (blockId == 0) return false // air
+        if (fluidBlocks.contains(blockId)) return false // fluid
+
+        val displayColor = Color(getBlockDisplayColor(blockId), true)
+        // An unassigned ID will result in alpha=0, so it will be considered not opaque.
+        return displayColor.alpha == 255
+    }
+
     private fun getBlockDisplayColor(raw: Int): Int {
         return blockIdColors[raw] ?: raw
     }
@@ -1047,9 +1304,8 @@ class gridMap : JPanel() {
                     // Helper do decydowania czy rysować ściankę BOCZNĄ (uwzględnia różnice poziomów płynów)
                     fun shouldRenderSide(nx: Int, ny: Int, nz: Int): Boolean {
                         val neighborId = getRawBlock(nx, ny, nz)
-                        if (isFluid) {
-                            if (neighborId == 0) return true // Widać nas od strony powietrza
-                            if (fluidBlocks.contains(neighborId)) {
+                        if (isFluid) { // Current block is a fluid
+                            if (fluidBlocks.contains(neighborId)) { // Neighbor is also a fluid
                                 // Sąsiad to też płyn - sprawdzamy czy nas nie zasłania
                                 val neighborAbove = getRawBlock(nx, ny + 1, nz)
                                 if (neighborAbove == neighborId) return false // Sąsiad jest pełny (ma płyn nad sobą)
@@ -1057,9 +1313,21 @@ class gridMap : JPanel() {
                                 val neighborLevel = getFluidLevel(nx, ny, nz)
                                 return myLevel > neighborLevel // Rysujemy tylko jeśli jesteśmy wyżsi
                             }
-                            return false // Sąsiad to blok stały -> nie widać nas
+                            // Neighbor is a solid or air, render if it's not opaque
+                            return !isOpaqueForCulling(neighborId)
                         }
-                        return neighborId == 0 || fluidBlocks.contains(neighborId)
+                        // Current block is solid.
+                        val neighborIsTransparent = !isOpaqueForCulling(neighborId)
+                        if (neighborIsTransparent) { // Neighbor is transparent (air, fluid, or transparent solid)
+                            val currentIsTransparent = !isOpaqueForCulling(rawBlock)
+                            if (currentIsTransparent) { // Current is also a transparent solid
+                                // Render only if neighbor is air or fluid, not another transparent solid.
+                                return neighborId == 0 || fluidBlocks.contains(neighborId)
+                            }
+                            // Current is opaque, neighbor is transparent. Render.
+                            return true
+                        }
+                        return false // Neighbor is opaque.
                     }
 
                     // Helper do obliczania wysokości cieczy sąsiada (dla dolnej krawędzi ścianki)
@@ -1076,13 +1344,26 @@ class gridMap : JPanel() {
                     // Helper do decydowania czy rysować GÓRĘ/DÓŁ (standardowa logika)
                     fun shouldRenderCap(nx: Int, ny: Int, nz: Int, isTop: Boolean): Boolean {
                         val neighborId = getRawBlock(nx, ny, nz)
-                        if (isFluid) {
-                            // Dla górnej ściany lawy: rysujemy zawsze, chyba że nad nami jest ten sam płyn.
-                            // Pozwala to widzieć taflę lawy pod blokiem stałym (luka).
-                            if (isTop) return neighborId != rawBlock
-                            return neighborId == 0
+                        if (isFluid) { // Current block is a fluid
+                            if (isTop) {
+                                // Render top of fluid unless same fluid is above. Allows seeing surface under glass.
+                                return neighborId != rawBlock
+                            }
+                            // Render bottom of fluid if block below is not opaque.
+                            return !isOpaqueForCulling(neighborId)
                         }
-                        return neighborId == 0 || fluidBlocks.contains(neighborId)
+                        // Current block is solid.
+                        val neighborIsTransparent = !isOpaqueForCulling(neighborId)
+                        if (neighborIsTransparent) { // Neighbor is transparent (air, fluid, or transparent solid)
+                            val currentIsTransparent = !isOpaqueForCulling(rawBlock)
+                            if (currentIsTransparent) { // Current is also a transparent solid
+                                // Render only if neighbor is air or fluid, not another transparent solid.
+                                return neighborId == 0 || fluidBlocks.contains(neighborId)
+                            }
+                            // Current is opaque, neighbor is transparent. Render.
+                            return true
+                        }
+                        return false // Neighbor is opaque.
                     }
 
                     // Sprawdzamy sąsiadów
@@ -1204,10 +1485,9 @@ class gridMap : JPanel() {
         // Jeśli to płyn (isDoubleSided), bierzemy światło z wnętrza bloku. Jeśli stały - z sąsiada.
         val selfLight = getLight(wx, wy, wz)
         
-        // Helper do AO: Blok rzuca cień tylko jeśli nie jest powietrzem i NIE jest cieczą
+        // Helper do AO: Blok rzuca cień tylko jeśli jest w pełni nieprzezroczysty
         fun isOccluding(x: Int, y: Int, z: Int): Boolean {
-            val id = getRawBlock(x, y, z)
-            return id != 0 && !fluidBlocks.contains(id)
+            return isOpaqueForCulling(getRawBlock(x, y, z))
         }
 
         // Obliczanie AO dla 4 wierzchołków danej ściany
@@ -1477,89 +1757,80 @@ class gridMap : JPanel() {
             while (running) {
                 val now = System.nanoTime()
                 val elapsedNs = now - lastTime
-                delta += elapsedNs / nsPerTick
                 lastTime = now
 
-                // --- AUTO SAVE (Co 15 sekund) ---
-                if (System.currentTimeMillis() - lastAutoSaveTime > 15000) {
-                    var savedCount = 0
-                    chunks.values.forEach { chunk ->
-                        if (chunk.modified) {
-                            chunkIO.saveChunk(chunk)
-                            chunk.modified = false // Resetujemy flagę, bo na dysku jest już aktualna wersja
-                            savedCount++
+                if (gameState == GameState.IN_GAME) {
+                    delta += elapsedNs / nsPerTick
+
+                    // --- AUTO SAVE (Co 15 sekund) ---
+                    if (System.currentTimeMillis() - lastAutoSaveTime > 15000) {
+                        var savedCount = 0
+                        chunks.values.forEach { chunk ->
+                            if (chunk.modified) {
+                                chunkIO.saveChunk(chunk)
+                                chunk.modified = false // Resetujemy flagę, bo na dysku jest już aktualna wersja
+                                savedCount++
+                            }
                         }
+                        chunkIO.saveWorldData(WorldData(seed, camX, camY, camZ, yaw, pitch, debugNoclip, debugFly, debugFullbright, showChunkBorders, debugXray, gameTime, dayCounter))
+                        if (savedCount > 0) println("Auto-saved $savedCount chunks.")
+                        lastAutoSaveTime = System.currentTimeMillis()
                     }
-                    if (savedCount > 0) println("Auto-saved $savedCount chunks.")
-                    lastAutoSaveTime = System.currentTimeMillis()
-                }
 
-                // --- DAY/NIGHT CYCLE ---
-                // 24 minuty = 1440 sekund = 24 godziny w grze
-                // 1 godzina w grze = 60 sekund realnych
-                val elapsedSeconds = elapsedNs / 1_000_000_000.0
-                val gameHoursPassed = elapsedSeconds / 60.0
-                if (gameTime + gameHoursPassed >= 24.0) {
-                    dayCounter += 1
-                }
-                gameTime = (gameTime + gameHoursPassed) % 24.0
-
-                // Realistyczne wartości dla równonocy wiosennej (uśrednione)
-                val sunriseStart = 5.30
-                val dayFullStart = 7.00
-                val sunsetStart = 17.30
-                val nightFullStart = 19.00
-
-                globalSunIntensity = when {
-                    gameTime < sunriseStart || gameTime > nightFullStart -> 0.0
-                    gameTime in sunriseStart..dayFullStart -> {
-                        (gameTime - sunriseStart) / (dayFullStart - sunriseStart)
+                    // --- DAY/NIGHT CYCLE ---
+                    val elapsedSeconds = elapsedNs / 1_000_000_000.0
+                    val gameHoursPassed = elapsedSeconds / 60.0
+                    if (gameTime + gameHoursPassed >= 24.0) {
+                        dayCounter += 1
                     }
-                    gameTime in dayFullStart..sunsetStart -> 1.0
-                    gameTime in sunsetStart..nightFullStart -> {
-                        1.0 - (gameTime - sunsetStart) / (nightFullStart - sunsetStart)
+                    gameTime = (gameTime + gameHoursPassed) % 24.0
+
+                    val sunriseStart = 5.30; val dayFullStart = 7.00
+                    val sunsetStart = 17.30; val nightFullStart = 19.00
+
+                    globalSunIntensity = when {
+                        gameTime < sunriseStart || gameTime > nightFullStart -> 0.0
+                        gameTime in sunriseStart..dayFullStart -> (gameTime - sunriseStart) / (dayFullStart - sunriseStart)
+                        gameTime in dayFullStart..sunsetStart -> 1.0
+                        gameTime in sunsetStart..nightFullStart -> 1.0 - (gameTime - sunsetStart) / (nightFullStart - sunsetStart)
+                        else -> 0.0
+                    }.coerceIn(0.0, 1.0)
+
+                    val nightColor = Color(10, 10, 30).rgb
+                    val dayColor = Color(113, 144, 225).rgb
+                    currentSkyColor = interpolateColor(nightColor, dayColor, globalSunIntensity)
+
+                    if (delta > 10) delta = 10.0
+
+                    while (delta >= 1) {
+                        processInput()
+                        processSingleInput()
+                        updateWorld()
+                        cloudOffset += 1.0 / 30.0
+                        gameTicks++
+                        simulateFluids(gameTicks)
+                        modLoader.notifyTick()
+                        delta--
+                        inputManager.resetFrameState()
                     }
-                    else -> 0.0
-                }.coerceIn(0.0, 1.0)
 
-                // Obliczanie koloru nieba
-                val nightColor = Color(10, 10, 30).rgb
-                val dayColor = Color(113, 144, 225).rgb
-
-                // Płynne przejście tła (Noc <-> Dzień) bez pomarańczu (pomarańcz będzie w aurze słońca)
-                // Używamy globalSunIntensity jako współczynnika (0.0 = noc, 1.0 = dzień)
-                currentSkyColor = interpolateColor(nightColor, dayColor, globalSunIntensity)
-
-                if (delta > 10) delta = 10.0 // Zabezpieczenie przed "spiralą śmierci" przy dużym lagu
-
-                while (delta >= 1) {
-                    processInput()
+                    clearGrid()
+                    render3D()
+                    System.arraycopy(backBuffer, 0, pixels, 0, pixels.size)
+                } else if (gameState == GameState.PAUSED) {
+                    // When paused, we only process single key presses (for ESC)
+                    // and do nothing else for the game logic.
                     processSingleInput()
-                    updateWorld()
-                    cloudOffset += 1.0 / 30.0
-
-                    gameTicks++
-                    simulateFluids(gameTicks)
-
-                    // --- MOD HOOK: Logika gry (Tick) ---
-                    modLoader.notifyTick()
-
-                    delta--
-
-                    inputManager.resetFrameState()
+                    inputManager.resetFrameState() // Prevent mouse jump on unpause
                 }
 
-                clearGrid()
-                render3D()
-
-                // Kopiujemy bufor renderowania do bufora wyświetlania (Double Buffering)
-                System.arraycopy(backBuffer, 0, pixels, 0, pixels.size)
                 repaint()
 
                 // --- FPS LIMITER ---
                 val frameTime = System.nanoTime() - now
-                if (frameTime < nsPerFrame) {
-                    val sleepNs = (nsPerFrame - frameTime).toLong()
+                val targetFrameTime = if (gameState == GameState.IN_GAME) nsPerFrame else 1_000_000_000.0 / 60.0 // 60fps dla menu
+                if (frameTime < targetFrameTime) {
+                    val sleepNs = (targetFrameTime - frameTime).toLong()
                     if (sleepNs > 0) {
                         Thread.sleep(sleepNs / 1000000, (sleepNs % 1000000).toInt())
                     }
@@ -1567,6 +1838,49 @@ class gridMap : JPanel() {
             }
         }.start()
     }
+
+    private fun handleMenuClick(p: Point) {
+        if (gameState == GameState.IN_GAME) return
+
+        val buttonsToCheck = when (gameState) {
+            GameState.MAIN_MENU -> mainMenuButtons
+            GameState.PAUSED -> pauseMenuButtons
+            GameState.WORLD_SELECTION -> worldListButtons + worldSelectionButtons
+            GameState.CREATE_WORLD -> createWorldMenuButtons
+            else -> emptyList()
+        }
+
+        for (button in buttonsToCheck) {
+            if (button.enabled && button.rect.contains(p)) {
+                button.action()
+                return // Konsumuj kliknięcie
+            }
+        }
+
+        if (gameState == GameState.CREATE_WORLD) {
+            worldCreationTextFields.forEach { (id, rect) ->
+                if (rect.contains(p)) {
+                    activeTextField = id
+                    return
+                }
+            }
+        }
+    }
+
+    private fun handleMenuMouseMove(p: Point) {
+        if (gameState == GameState.WORLD_SELECTION) {
+            val oldHover = hoveredWorld
+            hoveredWorld = null
+            for (button in worldListButtons) {
+                if (button.rect.contains(p)) {
+                    hoveredWorld = button.text
+                    break
+                }
+            }
+            if (oldHover != hoveredWorld) repaint()
+        }
+    }
+
 
     // Prekalkulowane wartości dla Frustum Culling
     val sectionRadius = sqrt(3.0) * 2.0 * cubeSize
@@ -2837,10 +3151,27 @@ class gridMap : JPanel() {
     override fun paintComponent(g: Graphics) {
         super.paintComponent(g)
         val g2d = g as Graphics2D
+        g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+        g2d.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON)
 
-        // Rysowanie całego bufora obrazu naraz (skalowanie do rozmiaru okna)
+        when (gameState) {
+            GameState.IN_GAME -> renderGame(g2d)
+            GameState.PAUSED -> {
+                renderGame(g2d)
+                renderPauseOverlay(g2d)
+            }
+            GameState.MAIN_MENU -> renderMainMenu(g2d)
+            GameState.WORLD_SELECTION -> renderWorldSelectionMenu(g2d)
+            GameState.CREATE_WORLD -> renderCreateWorldMenu(g2d)
+        }
+    }
+
+    private fun renderGame(g2d: Graphics2D) {
         g2d.drawImage(displayImage, 0, 0, width, height, null)
 
+        if (gameState == GameState.PAUSED) return // Nie rysuj HUD w pauzie
+
+        // Celownik
         g2d.color = Color.WHITE
         val crossSize = 5
         val halfWidth = (baseCols*cellSize)/2
@@ -2849,7 +3180,7 @@ class gridMap : JPanel() {
         g2d.drawLine(halfWidth - crossSize, halfHeight, halfWidth + crossSize, halfHeight)
         g2d.drawLine(halfWidth, halfHeight - crossSize, halfWidth, halfHeight + crossSize)
 
-        // Rysowanie FPS
+        // FPS
         frames++
         if (System.currentTimeMillis() - lastFpsTime >= 1000) {
             fps = frames
@@ -2862,23 +3193,26 @@ class gridMap : JPanel() {
         val fm = g2d.fontMetrics
         g2d.drawString(fpsText, width - fm.stringWidth(fpsText) - 10, fm.ascent + 10)
 
-        // Rysowanie informacji o aktualnym chunku
+        // Debug info
         if (showChunkBorders) {
             val currentChunkX = floor(camX / 32.0).toInt()
             val currentChunkZ = floor(camZ / 32.0).toInt()
             val chunkText = "Chunk: c_${currentChunkX}_${currentChunkZ}.dat"
             val posText = "Position: (${floor((camX + (cubeSize/2))/2).toInt()}, ${floor((camY + (cubeSize/2))/2).toInt()+5}, ${floor((camZ + (cubeSize/2)) /2).toInt()})"
             val timeText = String.format("Time: %.2fzł (Intensity: %.2f) (Day $dayCounter)", gameTime, globalSunIntensity)
+            val seedText = "Seed: ${seed}"
 
             g2d.color = Color(0.82f, 0.82f, 0.82f, 0.75f)
             g2d.fillRect(5, 15, fm.stringWidth(chunkText) + 5, fm.ascent)
             g2d.fillRect(5, fm.ascent + 15, fm.stringWidth(posText) + 5, fm.ascent)
             g2d.fillRect(5, fm.ascent*2 + 15, fm.stringWidth(timeText) + 5, fm.ascent)
+            g2d.fillRect(5, fm.ascent*3 + 15, fm.stringWidth(seedText) + 5, fm.ascent)
 
             g2d.color = Color.WHITE
             g2d.drawString(chunkText, 10, fm.ascent + 10)
             g2d.drawString(posText, 10, fm.ascent*2 + 10)
             g2d.drawString(timeText, 10, fm.ascent*3 + 10)
+            g2d.drawString(seedText, 10, fm.ascent*4 + 10)
 
             // Informacje o bloku, na który patrzy gracz
             val hit = getTargetBlock()
@@ -2905,17 +3239,193 @@ class gridMap : JPanel() {
                 val targetText = "Target: [${target.x}, ${target.y}, ${target.z}] Color: $colorHex Face: ${hit.faceIndex} Light: $effectiveLight"
 
                 g2d.color = Color(0.82f, 0.82f, 0.82f, 0.75f)
-                g2d.fillRect(5, fm.ascent*3 + 15, fm.stringWidth(targetText) + 5, fm.ascent)
+                g2d.fillRect(5, fm.ascent*4 + 15, fm.stringWidth(targetText) + 5, fm.ascent)
 
                 g2d.color = Color.WHITE
-                g2d.drawString(targetText, 10, fm.ascent*4 + 10)
+                g2d.drawString(targetText, 10, fm.ascent*5 + 10)
             }
         }
 
+        // Hotbar
         renderInventory(g2d)
 
-        // --- MOD HOOK: Renderowanie ---
+        // Mod render hook
         modLoader.notifyRender(g2d, width, height)
+    }
+
+    private fun renderMainMenu(g2d: Graphics2D) {
+        g2d.color = Color(30, 30, 30)
+        g2d.fillRect(0, 0, width, height)
+
+        val titleFont = fpsFont.deriveFont(96f)
+        g2d.font = titleFont
+        g2d.color = Color.YELLOW
+        val title = "KapeLuż"
+        val fm = g2d.fontMetrics
+        val titleWidth = fm.stringWidth(title)
+        g2d.drawString(title, (width - titleWidth) / 2, 150)
+
+        drawButtons(g2d, mainMenuButtons, 250)
+    }
+
+    private fun renderWorldSelectionMenu(g2d: Graphics2D) {
+        g2d.color = Color(30, 30, 30)
+        g2d.fillRect(0, 0, width, height)
+
+        val titleFont = fpsFont.deriveFont(64f)
+        g2d.font = titleFont
+        g2d.color = Color.WHITE
+        val title = "Select World"
+        val fm = g2d.fontMetrics
+        val titleWidth = fm.stringWidth(title)
+        g2d.drawString(title, (width - titleWidth) / 2, 100)
+
+        // Rysowanie listy światów
+        val buttonFont = fpsFont.deriveFont(40f)
+        g2d.font = buttonFont
+        val listFm = g2d.fontMetrics
+        val buttonWidth = 600
+        val buttonHeight = 45
+        var currentY = 180
+
+        for (button in worldListButtons) {
+            button.rect = Rectangle((width - buttonWidth) / 2, currentY, buttonWidth, buttonHeight)
+
+            g2d.color = Color(0x6d6d6d)
+            g2d.fillRect(button.rect.x, button.rect.y, button.rect.width, button.rect.height)
+
+            if (hoveredWorld == button.text) {
+                g2d.color = Color.YELLOW
+                val arrow = ">"
+                g2d.drawString(arrow, button.rect.x - listFm.stringWidth(arrow) - 10, currentY + listFm.ascent)
+            }
+
+            g2d.color = Color.WHITE
+            val textWidth = listFm.stringWidth(button.text)
+            g2d.drawString(button.text, button.rect.x + 15, currentY + listFm.ascent)
+
+            currentY += buttonHeight + 15
+        }
+
+        // Rysowanie przycisku "Back"
+        val buttonBackWidth = 300
+        val buttonBackPadding = 20
+        val totalBottomWidth = worldSelectionButtons.size * buttonBackWidth + (worldSelectionButtons.size - 1) * buttonBackPadding
+        var currentX = (width - totalBottomWidth) / 2
+
+        g2d.font = buttonFont
+
+        for (button in worldSelectionButtons) {
+            button.rect = Rectangle(currentX, height - 100, buttonBackWidth, 50)
+
+            g2d.color = if (button.enabled) Color(0x6d6d6d) else Color(0x2c2c2c)
+            g2d.fillRect(button.rect.x, button.rect.y, button.rect.width, button.rect.height)
+
+            g2d.color = if (button.enabled) Color.WHITE else Color(0x808080)
+            val textWidth = listFm.stringWidth(button.text)
+            g2d.drawString(button.text, button.rect.x + (buttonBackWidth - textWidth) / 2, button.rect.y + listFm.ascent)
+
+            currentX += buttonBackWidth + buttonBackPadding
+        }
+    }
+
+    private fun renderPauseOverlay(g2d: Graphics2D) {
+        g2d.color = Color(0, 0, 0, 150)
+        g2d.fillRect(0, 0, width, height)
+
+        // Center the buttons vertically
+        val buttonHeight = 50
+        val buttonPadding = 20
+        val totalButtonsHeight = pauseMenuButtons.size * buttonHeight + (pauseMenuButtons.size - 1) * buttonPadding
+        val startY = (height - totalButtonsHeight) / 2
+
+        drawButtons(g2d, pauseMenuButtons, startY)
+    }
+
+    private fun renderCreateWorldMenu(g2d: Graphics2D) {
+        g2d.color = Color(30, 30, 30)
+        g2d.fillRect(0, 0, width, height)
+
+        val titleFont = fpsFont.deriveFont(64f)
+        g2d.font = titleFont
+        g2d.color = Color.WHITE
+        val title = "Create New World"
+        val fm = g2d.fontMetrics
+        val titleWidth = fm.stringWidth(title)
+        g2d.drawString(title, (width - titleWidth) / 2, 100)
+
+        // --- Text Fields ---
+        val fieldFont = fpsFont.deriveFont(32f)
+        g2d.font = fieldFont
+        val fieldFm = g2d.fontMetrics
+        val fieldWidth = 600
+        val fieldHeight = 40
+
+        // World Name
+        var currentY = 200
+        g2d.color = Color.LIGHT_GRAY
+        g2d.drawString("World Name", (width - fieldWidth) / 2, currentY - 5)
+        val nameRect = Rectangle((width - fieldWidth) / 2, currentY, fieldWidth, fieldHeight)
+        worldCreationTextFields[0] = nameRect
+        g2d.color = Color.BLACK
+        g2d.fillRect(nameRect.x, nameRect.y, nameRect.width, nameRect.height)
+        g2d.color = if (activeTextField == 0) Color.YELLOW else Color.WHITE
+        g2d.drawRect(nameRect.x, nameRect.y, nameRect.width, nameRect.height)
+        g2d.color = Color.WHITE
+        g2d.drawString(newWorldName, nameRect.x + 10, nameRect.y + fieldFm.ascent)
+
+        // Seed
+        currentY += 100
+        g2d.color = Color.LIGHT_GRAY
+        g2d.drawString("Seed (optional)", (width - fieldWidth) / 2, currentY - 5)
+        val seedRect = Rectangle((width - fieldWidth) / 2, currentY, fieldWidth, fieldHeight)
+        worldCreationTextFields[1] = seedRect
+        g2d.color = Color.BLACK
+        g2d.fillRect(seedRect.x, seedRect.y, seedRect.width, seedRect.height)
+        g2d.color = if (activeTextField == 1) Color.YELLOW else Color.WHITE
+        g2d.drawRect(seedRect.x, seedRect.y, seedRect.width, seedRect.height)
+        g2d.color = Color.WHITE
+        g2d.drawString(newWorldSeed, seedRect.x + 10, seedRect.y + fieldFm.ascent)
+
+        // Blinking cursor
+        if (activeTextField != null && (System.currentTimeMillis() / 500) % 2 == 0L) {
+            val activeRect = worldCreationTextFields[activeTextField]!!
+            val textToShow = if (activeTextField == 0) newWorldName else newWorldSeed
+            val cursorX = activeRect.x + 10 + fieldFm.stringWidth(textToShow)
+            g2d.color = Color.WHITE
+            g2d.fillRect(cursorX, activeRect.y + 5, 2, fieldHeight - 10)
+        }
+
+        // Error message
+        createWorldError?.let {
+            g2d.color = Color.RED
+            g2d.drawString(it, (width - fieldFm.stringWidth(it)) / 2, currentY + fieldHeight + 40)
+        }
+
+        // Buttons
+        drawButtons(g2d, createWorldMenuButtons, height - 150)
+    }
+
+    private fun drawButtons(g2d: Graphics2D, buttons: List<MenuButton>, startY: Int) {
+        val buttonFont = fpsFont.deriveFont(40f)
+        g2d.font = buttonFont
+        val fm = g2d.fontMetrics
+        val buttonWidth = 400
+        val buttonHeight = 50
+        var currentY = startY
+
+        for (button in buttons) {
+            button.rect = Rectangle((width - buttonWidth) / 2, currentY, buttonWidth, buttonHeight)
+
+            g2d.color = if (button.enabled) Color(0x6d6d6d) else Color(0x2c2c2c)
+            g2d.fillRect(button.rect.x, button.rect.y, button.rect.width, button.rect.height)
+
+            g2d.color = if (button.enabled) Color.WHITE else Color(0x808080)
+            val textWidth = fm.stringWidth(button.text)
+            g2d.drawString(button.text, (width - textWidth) / 2, currentY + fm.ascent)
+
+            currentY += buttonHeight + 20
+        }
     }
 
     private fun renderInventory(g2d: Graphics2D) {
@@ -3026,6 +3536,31 @@ class gridMap : JPanel() {
     private fun processSingleInput() {
         val consumedKeys = inputManager.consumeJustPressedKeys()
         for (keyCode in consumedKeys) {
+            if (keyCode == KeyEvent.VK_ESCAPE) {
+                if (gameState == GameState.IN_GAME) {
+                    gameState = GameState.PAUSED
+                    inputManager.releaseMouse()
+                    continue
+                } else if (gameState == GameState.PAUSED) {
+                    gameState = GameState.IN_GAME
+                    inputManager.captureMouse()
+                    continue
+                }
+            }
+
+            if (gameState == GameState.CREATE_WORLD) {
+                // Key processing is handled by a temporary KeyListener in this state
+                // but we still need to consume the event from the manager
+                // so it doesn't trigger game actions.
+                if (modLoader.notifyKeyPress(keyCode)) {
+                    continue
+                }
+                // We consume all keys in this state except ESC which is handled above.
+                // The actual logic is in the temporary KeyListener.
+                continue
+            }
+
+
             // --- MOD HOOK: Klawisze ---
             // Jeśli mod obsłużył klawisz (zwrócił true), nie wykonujemy standardowych akcji gry
             if (modLoader.notifyKeyPress(keyCode)) {
@@ -3033,24 +3568,28 @@ class gridMap : JPanel() {
             }
 
             if (keyCode == KeyEvent.VK_EQUALS) {
-                gameTime += 1
+                if (gameState == GameState.IN_GAME) gameTime += 1
             }
             if (keyCode == KeyEvent.VK_MINUS) {
-                if (gameTime < 1.0) {gameTime += 23; dayCounter -= 1} else gameTime -= 1
-                if (dayCounter < 0) dayCounter = 0
+                if (gameState == GameState.IN_GAME) {
+                    if (gameTime < 1.0) {gameTime += 23; dayCounter -= 1} else gameTime -= 1
+                    if (dayCounter < 0) dayCounter = 0
+                }
             }
-            if (keyCode == KeyEvent.VK_NUMPAD9) {
+
+            if (gameState == GameState.IN_GAME) {
+                if (keyCode == KeyEvent.VK_NUMPAD9) {
                     debugFly = !debugFly
                     println("DebugFly: $debugFly")
                 }
                 if (keyCode == KeyEvent.VK_NUMPAD8) {
                     debugNoclip = !debugNoclip
-                    println("debugNoclip: $debugNoclip")
+                    println("DebugNoclip: $debugNoclip")
                 }
                 if (keyCode == KeyEvent.VK_NUMPAD7) {
                     debugFullbright = !debugFullbright
                     if (debugFullbright) FullbrightFactor = 1.0 else FullbrightFactor = 0.0
-                    println("debugFullbright: $debugFullbright")
+                    println("DebugFullbright: $debugFullbright")
                 }
                 if (keyCode == KeyEvent.VK_V) {
                     showChunkBorders = !showChunkBorders
@@ -3058,17 +3597,20 @@ class gridMap : JPanel() {
                 if (keyCode == KeyEvent.VK_X) {
                     debugXray = !debugXray
                 }
-                if (keyCode >= KeyEvent.VK_1 && keyCode <= KeyEvent.VK_9) {
-                    selectedSlot = keyCode - KeyEvent.VK_1
-                }
                 if (keyCode == KeyEvent.VK_G) {
                     println("camX: ${camX.toSmartString()}, camY: ${camY.toSmartString()}, camZ: ${camZ.toSmartString()}, yaw: ${yaw.toSmartString()}, pitch: ${pitch.toSmartString()}, speed: $currentSpeed")
                 }
+                if (keyCode >= KeyEvent.VK_1 && keyCode <= KeyEvent.VK_9) {
+                    selectedSlot = keyCode - KeyEvent.VK_1
+                }
+            }
         }
     }
 
     // Logika poruszania się na podstawie wciśniętych klawiszy
     private fun processInput() {
+        if (gameState != GameState.IN_GAME) return
+
         var tempSpeed = speed
         var tempJumpStrength = jumpStrength
 
@@ -3367,7 +3909,7 @@ class gridMap : JPanel() {
 
 fun main() {
     SwingUtilities.invokeLater {
-        val frame = JFrame("gridMap")
+        val frame = JFrame("LewapEngine // gridMap")
         frame.iconImage = Toolkit.getDefaultToolkit().getImage(gridMap::class.java.getResource("/icons/GridMap.png"))
         frame.defaultCloseOperation = JFrame.EXIT_ON_CLOSE
         frame.isResizable = false
