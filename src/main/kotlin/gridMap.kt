@@ -17,6 +17,7 @@ import kotlin.math.floor
 import kotlin.math.abs
 import kotlin.math.sign
 import java.util.Random
+import javax.imageio.ImageIO
 import kotlin.system.exitProcess
 import kotlin.math.cos
 import kotlin.math.sin
@@ -34,13 +35,6 @@ data class ModelVoxel(val x: Int, val y: Int, val z: Int, val color: Color, val 
 enum class GameState {
     MAIN_MENU, WORLD_SELECTION, CREATE_WORLD, IN_GAME, PAUSED
 }
-
-data class MenuButton(
-    val text: String,
-    var rect: Rectangle,
-    val enabled: Boolean = true,
-    val action: () -> Unit
-)
 
 data class ItemStack(val color: Int, var count: Int)
 data class FluidProperties(val tickRate: Int) // Ile ticków na aktualizację. 30 ticków = 1 sekunda.
@@ -82,6 +76,8 @@ class gridMap : JPanel() {
     val baseRows = 1080 / downscale
     val cellSize = downscale/2
     val cubeSize = 2.0
+    val referenceWidth = (baseCols + 1) * cellSize
+    val referenceHeight = (baseRows + 1) * cellSize
     var reachDistance = 5.0
     val radiusCollision = 0.3
     val playerHeight = 1.8
@@ -120,6 +116,9 @@ class gridMap : JPanel() {
 
     var debugXray = false
     val oreColors = ConcurrentHashMap.newKeySet<Int>()
+    
+    // Zbiór bloków, które mają być ignorowane przez standardowy renderer (bo mod je rysuje sam)
+    val customRenderBlocks = ConcurrentHashMap.newKeySet<Int>()
 
     // System dnia i nocy
     var gameTime = 12.0
@@ -149,11 +148,15 @@ class gridMap : JPanel() {
         BLOCK_ID_LAVA to Color(0xFF8C00).rgb,
         BLOCK_ID_WATER to Color(0.37f, 0.69f, 0.78f, 0.5f).rgb
     )
-    var fluidProperties = mapOf(
+    var fluidProperties = mutableMapOf(
         BLOCK_ID_LAVA to FluidProperties(tickRate = 30), // 1 aktualizacja na sekundę
         BLOCK_ID_WATER to FluidProperties(tickRate = 15)  // 2 aktualizacje na sekundę
     )
     val fluidBlocks = fluidProperties.keys
+
+    var blockLightLevels = mutableMapOf(
+        BLOCK_ID_LIGHT to 15,
+    )
     var minLightFactor = 0.15
     
     // Domyślna implementacja oświetlenia (Vanilla)
@@ -242,7 +245,7 @@ class gridMap : JPanel() {
     var lastChunkZ = Int.MAX_VALUE
 
     // System zapisu
-    var chunkIO = ChunkIO("world1")
+    lateinit var chunkIO: ChunkIO
     var lastAutoSaveTime = System.currentTimeMillis()
 
     // Zbiór aktualnie wciśniętych klawiszy
@@ -265,6 +268,7 @@ class gridMap : JPanel() {
     lateinit var inputManager: InputManager
     var inventory = arrayOfNulls<ItemStack>(9)
     var selectedSlot = 0
+    private val pendingItems = ConcurrentLinkedQueue<Pair<String, Int>>()
 
     // --- Threading & Optimization ---
     private val chunkExecutor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors())
@@ -272,24 +276,21 @@ class gridMap : JPanel() {
     private val chunksToMeshQueue = ConcurrentLinkedQueue<Point>()
 
     // --- Modding System ---
-    private val modLoader = ModLoader(this)
+    private var modLoader = ModLoader(this, gameDir)
 
     // --- Game State & Menu System ---
-    private var gameState = GameState.MAIN_MENU
-    private val mainMenuButtons = mutableListOf<MenuButton>()
-    private val worldSelectionButtons = mutableListOf<MenuButton>()
-    private val worldListButtons = mutableListOf<MenuButton>()
-    private val pauseMenuButtons = mutableListOf<MenuButton>()
+    var gameState = GameState.MAIN_MENU
     private var worldList = listOf<String>()
-    private val createWorldMenuButtons = mutableListOf<MenuButton>()
     private var newWorldName = "New World"
     private var newWorldSeed = ""
-    private var activeTextField: Int? = null // 0 for name, 1 for seed
-    private val worldCreationTextFields = mutableMapOf<Int, Rectangle>()
-    private var createWorldError: String? = null
-    private var keyListenerForText: KeyAdapter? = null
+    
+    // UI References for logic
+    private var errorTextComponent: UIText? = null
+    private var nameFieldComponent: UITextField? = null
+    private var seedFieldComponent: UITextField? = null
 
-    private var hoveredWorld: String? = null
+    // --- UI System ---
+    val uiManager = UIManager(this)
 
     init {
         preferredSize = Dimension((baseCols + 1) * cellSize, (baseRows + 1) * cellSize)
@@ -302,127 +303,208 @@ class gridMap : JPanel() {
 
         // Dodajemy obsługę myszy dla menu
         val menuMouseAdapter = object : MouseAdapter() {
+            private fun transform(e: java.awt.event.MouseEvent): Point {
+                val sx = width.toDouble() / referenceWidth
+                val sy = height.toDouble() / referenceHeight
+                return Point((e.x / sx).toInt(), (e.y / sy).toInt())
+            }
+
             override fun mouseClicked(e: java.awt.event.MouseEvent) {
-                handleMenuClick(e.point)
+                handleMenuClick(transform(e))
             }
 
             override fun mouseMoved(e: java.awt.event.MouseEvent) {
-                handleMenuMouseMove(e.point)
+                handleMenuMouseMove(transform(e))
+            }
+            
+            override fun mousePressed(e: java.awt.event.MouseEvent) {
+                if (gameState != GameState.IN_GAME) {
+                    val p = transform(e)
+                    uiManager.handlePress(p.x, p.y)
+                }
+            }
+
+            override fun mouseReleased(e: java.awt.event.MouseEvent) {
+                if (gameState != GameState.IN_GAME) {
+                    val p = transform(e)
+                    uiManager.handleRelease(p.x, p.y)
+                }
+            }
+
+            override fun mouseDragged(e: java.awt.event.MouseEvent) {
+                if (gameState != GameState.IN_GAME) {
+                    val p = transform(e)
+                    uiManager.handleDrag(p.x, p.y)
+                }
             }
         }
         addMouseListener(menuMouseAdapter)
         addMouseMotionListener(menuMouseAdapter)
+        addMouseWheelListener { e ->
+            if (gameState != GameState.IN_GAME) {
+                uiManager.handleScroll(e.wheelRotation)
+            }
+        }
+        
+        // Dodajemy obsługę klawiatury dla UI
+        addKeyListener(object : KeyAdapter() {
+            override fun keyPressed(e: KeyEvent) {
+                uiManager.handleKey(e)
+            }
+            override fun keyTyped(e: KeyEvent) {
+                uiManager.handleKey(e)
+            }
+        })
+
+        // Ładujemy mody raz przy starcie aplikacji
+        modLoader.loadMods()
 
         loop()
     }
 
     private fun createMenus() {
-        // Main Menu
-        mainMenuButtons.add(MenuButton("Singleplayer", Rectangle(), true) {
+        // --- Main Menu ---
+        val mainMenu = uiManager.getPanel(GameState.MAIN_MENU)
+        mainMenu.add(UIBackground(Color(30, 30, 30)))
+        mainMenu.add(UIText(baseCols*2, 60, "KapeLuż", 96f, Color.YELLOW, true))
+        
+        mainMenu.add(UIButton(baseCols*2 - 200, 250, 400, 50, "Singleplayer") {
             gameState = GameState.WORLD_SELECTION
             updateWorldList()
-        })
-        mainMenuButtons.add(MenuButton("Multiplayer", Rectangle(), false) {})
-        mainMenuButtons.add(MenuButton("Options...", Rectangle(), false) {})
-        mainMenuButtons.add(MenuButton("Quit Game", Rectangle(), true) {
+        }) //280
+        mainMenu.add(UIButton(baseCols*2 - 200, 320, 400, 50, "Multiplayer") {
+        }.apply { isEnabled = false })
+        mainMenu.add(UIButton(baseCols*2 - 200, 390, 400, 50, "Options...") {
+        }.apply { isEnabled = false })
+        mainMenu.add(UIButton(baseCols*2 - 200, 460, 400, 50, "Quit Game") {
             running = false
             exitProcess(0)
         })
 
-        // World Selection Menu
-        worldSelectionButtons.add(MenuButton("Create New World", Rectangle(), true) {
-            showCreateWorldMenu()
-        })
-        worldSelectionButtons.add(MenuButton("Back", Rectangle(), true) {
-            gameState = GameState.MAIN_MENU
+        // Przycisk przeładowania modów
+        val iconStream = javaClass.getResourceAsStream("/iconsGUI/reload.png")
+        val iconRefresh = if (iconStream != null) ImageIO.read(iconStream) else null
+
+        mainMenu.add(UIButton(baseCols * 4 - 60, baseRows * 4 - 60, 50, 50, "", iconRefresh, tooltip = "Reload Mods") {
+            println("Reloading mods...")
+            modLoader = ModLoader(this, gameDir)
+            modLoader.loadMods()
         })
 
-
-        // Pause Menu
-        pauseMenuButtons.add(MenuButton("Back to game", Rectangle(), true) {
+        // --- World Selection Menu ---
+        // Initial setup, content populated in updateWorldList
+        val worldSelection = uiManager.getPanel(GameState.WORLD_SELECTION)
+        worldSelection.add(UIBackground(Color(30, 30, 30)))
+        
+        // --- Pause Menu ---
+        val pauseMenu = uiManager.getPanel(GameState.PAUSED)
+        // Overlay background handled in render (or add semi-transparent background here)
+        pauseMenu.add(UIBackground(Color(0, 0, 0, 150)))
+        pauseMenu.add(UIButton(baseCols*2 - 200, baseRows*2 - 60, 400, 50, "Back to game") {
             gameState = GameState.IN_GAME
             inputManager.captureMouse()
         })
-        pauseMenuButtons.add(MenuButton("Save and quit", Rectangle(), true) {
+        pauseMenu.add(UIButton(baseCols*2 - 200, baseRows*2 + 10, 400, 50, "Save and quit") {
             saveAndExitToMenu()
         })
 
-        // Create World Menu
-        createWorldMenuButtons.add(MenuButton("Create World", Rectangle(), true) {
+        // --- Create World Menu ---
+        val createWorld = uiManager.getPanel(GameState.CREATE_WORLD)
+        createWorld.add(UIBackground(Color(30, 30, 30)))
+        createWorld.add(UIText(baseCols*2, 6, "Create New World", 32f, Color.WHITE, true))
+        
+        createWorld.add(UIText(baseCols*2 - 200, 60, "World Name:", 12f, Color.LIGHT_GRAY))
+        nameFieldComponent = UITextField(baseCols*2 - 200, 80, 400, 40, "New World")
+        createWorld.add(nameFieldComponent!!)
+        
+        createWorld.add(UIText(baseCols*2 - 200, 130, "Seed (optional)", 12f, Color.LIGHT_GRAY))
+        seedFieldComponent = UITextField(baseCols*2 - 200, 150, 400, 40, "")
+        createWorld.add(seedFieldComponent!!)
+        
+        errorTextComponent = UIText(baseCols*2, 400, "", 24f, Color.RED, true)
+        createWorld.add(errorTextComponent!!)
+        
+        createWorld.add(UIButton(baseCols*2 - 415, 460, 400, 50, "Create World") {
+            newWorldName = nameFieldComponent?.text ?: "New World"
+            newWorldSeed = seedFieldComponent?.text ?: ""
             tryCreateWorld()
         })
-        createWorldMenuButtons.add(MenuButton("Cancel", Rectangle(), true) {
-            hideCreateWorldMenu()
-            gameState = GameState.WORLD_SELECTION
+        createWorld.add(UIButton(baseCols*2 + 15, 460, 400, 50, "Cancel") {
+            // Jeśli nie ma żadnych światów, "Cancel" cofa do Menu Głównego, a nie do pustej listy
+            if (listWorlds().isEmpty()) {
+                gameState = GameState.MAIN_MENU
+            } else {
+                gameState = GameState.WORLD_SELECTION
+            }
         })
+
+        // --- In Game HUD ---
+        val hud = uiManager.getPanel(GameState.IN_GAME)
+        hud.add(UICrosshair())
+        hud.add(UIFpsCounter())
+        hud.add(UIDebugInfo())
+        hud.add(UIInventory())
     }
 
     private fun updateWorldList() {
         worldList = listWorlds()
-        worldListButtons.clear()
+
+        // Jeśli nie ma żadnych światów, od razu przechodzimy do tworzenia nowego
+        if (worldList.isEmpty()) {
+            showCreateWorldMenu()
+            return
+        }
+
+        val panel = uiManager.getPanel(GameState.WORLD_SELECTION)
+        panel.clear()
+        
+        panel.add(UIBackground(Color(30, 30, 30)))
+        panel.add(UIText(baseCols*2, 6, "Select World", 32f, Color.WHITE, true))
+
+        // Tworzymy ScrollPanel dla listy światów
+        // Pozycja Y: 70, Wysokość: do 450 (zostawiamy miejsce na dolne przyciski)
+        val listHeight = 380
+        val scrollPanel = UIScrollPanel(baseCols*2 - 210, 70, 420, listHeight)
+        
+        var currentY = 0 // Relatywne Y wewnątrz scroll panelu
         worldList.forEach { worldName ->
-            worldListButtons.add(MenuButton(worldName, Rectangle(), true) {
+            // Dodajemy przyciski do scroll panelu (x=0 oznacza lewą krawędź scroll panelu)
+            scrollPanel.addChild(UIButton(10, currentY, 380, 40, worldName, textAlign = TextAlign.LEFT, padding = 10, tooltip = worldName) {
                 startGame(worldName)
             })
+            currentY += 50
         }
+        panel.add(scrollPanel)
+        
+        panel.add(UIButton(baseCols*2 - 415, 460, 400, 50, "Create New World") {
+            showCreateWorldMenu()
+        })
+        panel.add(UIButton(baseCols*2 + 15, 460, 400, 50, "Back") {
+            gameState = GameState.MAIN_MENU
+        })
     }
 
     private fun showCreateWorldMenu() {
         gameState = GameState.CREATE_WORLD
-        newWorldName = "New World"
-        newWorldSeed = ""
-        activeTextField = 0
-        createWorldError = null
-
-        keyListenerForText = object : KeyAdapter() {
-            override fun keyTyped(e: KeyEvent) {
-                if (activeTextField == null) return
-
-                val char = e.keyChar
-                if (char.code >= 32 && char.code != 127) { // Printable chars
-                    if (activeTextField == 0) {
-                        if (newWorldName.length < 30) newWorldName += char
-                    } else { // seed
-                        if (newWorldSeed.length < 30) newWorldSeed += char
-                    }
-                    repaint()
-                }
-            }
-
-            override fun keyPressed(e: KeyEvent) {
-                if (activeTextField == null) return
-                when (e.keyCode) {
-                    KeyEvent.VK_BACK_SPACE -> {
-                        if (activeTextField == 0 && newWorldName.isNotEmpty()) {
-                            newWorldName = newWorldName.dropLast(1)
-                        } else if (activeTextField == 1 && newWorldSeed.isNotEmpty()) {
-                            newWorldSeed = newWorldSeed.dropLast(1)
-                        }
-                    }
-                    KeyEvent.VK_TAB -> activeTextField = if (activeTextField == 0) 1 else 0
-                }
-                repaint()
-            }
-        }
-        addKeyListener(keyListenerForText)
+        errorTextComponent?.text = ""
+        // Reset fields if needed
+        nameFieldComponent?.text = "New World"
+        seedFieldComponent?.text = ""
     }
 
     private fun hideCreateWorldMenu() {
-        keyListenerForText?.let { removeKeyListener(it) }
-        keyListenerForText = null
-        activeTextField = null
-        createWorldError = null
+        errorTextComponent?.text = ""
     }
 
     private fun tryCreateWorld() {
         val name = newWorldName.trim()
         if (name.isBlank() || name.contains("/") || name.contains("\\") || name == "." || name == "..") {
-            createWorldError = "Invalid world name."
+            errorTextComponent?.text = "Invalid world name."
             repaint()
             return
         }
         if (listWorlds().any { it.equals(name, ignoreCase = true) }) {
-            createWorldError = "World '$name' already exists."
+            errorTextComponent?.text = "World '$name' already exists."
             repaint()
             return
         }
@@ -511,8 +593,6 @@ class gridMap : JPanel() {
         noise = PerlinNoise(seed)
         chunkGenerator = ChunkGenerator(seed, oreColors)
 
-        modLoader.loadMods()
-
         if (worldData == null) {
             val spawnH = chunkGenerator.getTerrainHeight(0, 0)
             camY = (spawnH + 3) * cubeSize - 10.0
@@ -535,8 +615,18 @@ class gridMap : JPanel() {
             }
         }
 
+        // Wymuszamy synchroniczne załadowanie chunka startowego.
+        val startCx = floor(camX / 32.0).toInt()
+        val startCz = floor(camZ / 32.0).toInt()
+        chunks[Point(startCx, startCz)] = generateChunk(startCx, startCz)
+
         gameState = GameState.IN_GAME
         inputManager.captureMouse()
+
+        while (!pendingItems.isEmpty()) {
+            val (itemValue, itemCount) = pendingItems.poll()
+            addItem(itemValue, itemCount)
+        }
     }
 
     private fun updateWorld() {
@@ -720,10 +810,10 @@ class gridMap : JPanel() {
                     if (blockId != 0) {
                         if (isOpaqueForCulling(blockId)) sunlight = false
 
-                        // Jeśli to blok światła, ustawiamy max jasność i dodajemy do kolejki propagacji
-                        if (blockId == BLOCK_ID_LIGHT || blockId in 6..8) {
-                            blockL = 15
-                        } else if (blockId == BLOCK_ID_LAVA) {
+                        // Pobieramy poziom światła z mapy (domyślnie 0)
+                        blockL = blockLightLevels.getOrDefault(blockId, 0)
+
+                        if (blockId == BLOCK_ID_LAVA) {
                             // Lawa emituje światło zależnie od poziomu (1-8 -> 8-15)
                             val level = chunk.getMeta(x, y, z) and 0xF
                             blockL = (level + 7).coerceIn(1, 15)
@@ -753,7 +843,7 @@ class gridMap : JPanel() {
             val blockId = chunk.blocks[idx]
             // Światło może wejść do każdego nie-nieprzezroczystego bloku
             if (!isOpaqueForCulling(blockId)) {
-                val absorption = 1 // TODO: Różne bloki mogą mieć różną absorpcję
+                val absorption = 1 // Różne bloki mogą mieć różną absorpcję
                 if (nSky > mySky + absorption) {
                     mySky = nSky - absorption
                     changed = true
@@ -812,7 +902,7 @@ class gridMap : JPanel() {
                     val nBlockId = chunk.blocks[nIdx]
                     // Światło może propagować do każdego nie-nieprzezroczystego bloku
                     if (!isOpaqueForCulling(nBlockId)) {
-                        val absorption = 1 // TODO: Różne bloki mogą mieć różną absorpcję
+                        val absorption = 1 // Różne bloki mogą mieć różną absorpcję
                         val nVal = newLight[nIdx].toInt() and 0xFF
                         var nSky = (nVal shr 4) and 0xF
                         var nBlock = nVal and 0xF
@@ -838,6 +928,11 @@ class gridMap : JPanel() {
 
     // Uniwersalna funkcja addItem przyjmująca String (ID lub HEX)
     fun addItem(value: String, count: Int = 1) {
+        if (gameState != GameState.IN_GAME) {
+            pendingItems.add(value to count)
+            return
+        }
+
         val id = try {
             if (value.startsWith("#")) {
                 val hex = value.substring(1).uppercase(getDefault())
@@ -914,7 +1009,7 @@ class gridMap : JPanel() {
         if (stack.count <= 0) inventory[selectedSlot] = null
     }
 
-    private fun setBlock(x: Int, y: Int, z: Int, rawBlock: Int) {
+    fun setBlock(x: Int, y: Int, z: Int, rawBlock: Int) {
         if (y < 0 || y >= 128) return // Zmieniono górną granicę wysokości
         val cx = if (x >= 0) x / 16 else (x + 1) / 16 - 1
         val cz = if (z >= 0) z / 16 else (z + 1) / 16 - 1
@@ -973,7 +1068,7 @@ class gridMap : JPanel() {
         return tMax >= tMin && tMax >= 0.0
     }
 
-    private fun getTargetBlock(): RayHit? {
+    fun getTargetBlock(): RayHit? {
         val startX = camX / cubeSize + 0.5
         val startY = (viewY + 10.0) / cubeSize + 0.5
         val startZ = camZ / cubeSize + 0.5
@@ -1181,7 +1276,7 @@ class gridMap : JPanel() {
     }
 
     // Pomocnicza funkcja do pobierania surowego ID/Koloru z chunka
-    private fun getRawBlockFromChunk(chunk: Chunk?, x: Int, y: Int, z: Int): Int {
+    fun getRawBlockFromChunk(chunk: Chunk?, x: Int, y: Int, z: Int): Int {
         if (chunk == null || y !in 0..127) return 0
         var lx = x % 16
         if (lx < 0) lx += 16
@@ -1190,7 +1285,7 @@ class gridMap : JPanel() {
         return chunk.getBlock(lx, y, lz)
     }
 
-    private fun getRawBlock(x: Int, y: Int, z: Int): Int {
+    fun getRawBlock(x: Int, y: Int, z: Int): Int {
         val cx = if (x >= 0) x / 16 else (x + 1) / 16 - 1
         val cz = if (z >= 0) z / 16 else (z + 1) / 16 - 1
         val chunk = chunks[Point(cx, cz)]
@@ -1198,7 +1293,7 @@ class gridMap : JPanel() {
     }
 
     // Pobiera blok z globalnych współrzędnych (obsługuje granice chunków)
-    private fun getBlock(x: Int, y: Int, z: Int): Color? {
+    fun getBlock(x: Int, y: Int, z: Int): Color? {
         if (y < 0 || y >= 128) return null // Zmieniono górną granicę wysokości
         // Obliczamy ID chunka
         val cx = if (x >= 0) x / 16 else (x + 1) / 16 - 1
@@ -1233,7 +1328,7 @@ class gridMap : JPanel() {
     }
 
     // Pobiera poziom światła z globalnych współrzędnych
-    private fun getLight(x: Int, y: Int, z: Int): Int {
+    fun getLight(x: Int, y: Int, z: Int): Int {
         if (y < 0 || y >= 128) return 0xF0 // Poza światem jasno (Sky=15, Block=0)
         val cx = if (x >= 0) x / 16 else (x + 1) / 16 - 1
         val cz = if (z >= 0) z / 16 else (z + 1) / 16 - 1
@@ -1266,7 +1361,8 @@ class gridMap : JPanel() {
                     val secZ = lz / 4
                     val index = secY * 16 + secZ * 4 + secX // Flattened index (Y * (4*4) + Z * 4 + X)
 
-                    if (rawBlock != 0) {
+                    // Jeśli blok nie jest powietrzem I nie jest blokiem specjalnym (rysowanym przez moda)
+                    if (rawBlock != 0 && !customRenderBlocks.contains(rawBlock)) {
                         blockCounts[index]++
                     } else {
                         continue
@@ -1504,7 +1600,7 @@ class gridMap : JPanel() {
             1 -> { // Back (Z+), quad 5,4,7,6
                 v[0][0] = isOccluding(wx + 1, wy, wz + 1); v[0][1] = isOccluding(wx, wy - 1, wz + 1); v[0][2] = isOccluding(wx + 1, wy - 1, wz + 1)
                 v[1][0] = isOccluding(wx - 1, wy, wz + 1); v[1][1] = isOccluding(wx, wy - 1, wz + 1); v[1][2] = isOccluding(wx - 1, wy - 1, wz + 1)
-                v[2][0] = isOccluding(wx - 1, wy, wz + 1); v[2][1] = isOccluding(wx, wy + 1, wz + 1); v[2][2] = isOccluding(wx - 1, wy + 1, wz + 1)
+                v[2][0] = isOccluding(wx - 1, wy, wz + 1); v[2][1] = isOccluding(wx, wy + 1, wz + 1); v[2][2] = isOccluding(wx + 1, wy + 1, wz + 1)
                 v[3][0] = isOccluding(wx + 1, wy, wz + 1); v[3][1] = isOccluding(wx, wy + 1, wz + 1); v[3][2] = isOccluding(wx + 1, wy + 1, wz + 1)
                 for (i in 0..3) aoValues[i] = vertexAO(v[i][0], v[i][1], v[i][2])
                 lightLevel = if (isDoubleSided) selfLight else getLight(wx, wy, wz + 1)
@@ -1720,7 +1816,7 @@ class gridMap : JPanel() {
         map.computeIfAbsent(pt) { ArrayList() }.add(Triple(BlockPos(lx, y, lz), id, level))
     }
 
-    private fun getFluidLevel(x: Int, y: Int, z: Int): Int {
+    fun getFluidLevel(x: Int, y: Int, z: Int): Int {
         val cx = if (x >= 0) x / 16 else (x + 1) / 16 - 1
         val cz = if (z >= 0) z / 16 else (z + 1) / 16 - 1
         val chunk = chunks[Point(cx, cz)] ?: return 0
@@ -1729,7 +1825,7 @@ class gridMap : JPanel() {
         return chunk.getMeta(lx, y, lz) and 0xF // Zwracamy tylko poziom (0-15)
     }
 
-    private fun getFluidMeta(x: Int, y: Int, z: Int): Int {
+    fun getFluidMeta(x: Int, y: Int, z: Int): Int {
         val cx = if (x >= 0) x / 16 else (x + 1) / 16 - 1
         val cz = if (z >= 0) z / 16 else (z + 1) / 16 - 1
         val chunk = chunks[Point(cx, cz)] ?: return 0
@@ -1758,6 +1854,9 @@ class gridMap : JPanel() {
                 val now = System.nanoTime()
                 val elapsedNs = now - lastTime
                 lastTime = now
+
+                // UI Tick - niezależny od stanu gry (działa w Menu, Pauzie i Grze)
+                modLoader.notifyTickUI()
 
                 if (gameState == GameState.IN_GAME) {
                     delta += elapsedNs / nsPerTick
@@ -1824,6 +1923,13 @@ class gridMap : JPanel() {
                     inputManager.resetFrameState() // Prevent mouse jump on unpause
                 }
 
+                frames++
+                if (System.currentTimeMillis() - lastFpsTime >= 1000) {
+                    fps = frames
+                    frames = 0
+                    lastFpsTime = System.currentTimeMillis()
+                }
+
                 repaint()
 
                 // --- FPS LIMITER ---
@@ -1842,45 +1948,12 @@ class gridMap : JPanel() {
     private fun handleMenuClick(p: Point) {
         if (gameState == GameState.IN_GAME) return
 
-        val buttonsToCheck = when (gameState) {
-            GameState.MAIN_MENU -> mainMenuButtons
-            GameState.PAUSED -> pauseMenuButtons
-            GameState.WORLD_SELECTION -> worldListButtons + worldSelectionButtons
-            GameState.CREATE_WORLD -> createWorldMenuButtons
-            else -> emptyList()
-        }
-
-        for (button in buttonsToCheck) {
-            if (button.enabled && button.rect.contains(p)) {
-                button.action()
-                return // Konsumuj kliknięcie
-            }
-        }
-
-        if (gameState == GameState.CREATE_WORLD) {
-            worldCreationTextFields.forEach { (id, rect) ->
-                if (rect.contains(p)) {
-                    activeTextField = id
-                    return
-                }
-            }
-        }
+        if (uiManager.handleClick(p.x, p.y)) return
     }
 
     private fun handleMenuMouseMove(p: Point) {
-        if (gameState == GameState.WORLD_SELECTION) {
-            val oldHover = hoveredWorld
-            hoveredWorld = null
-            for (button in worldListButtons) {
-                if (button.rect.contains(p)) {
-                    hoveredWorld = button.text
-                    break
-                }
-            }
-            if (oldHover != hoveredWorld) repaint()
-        }
+        uiManager.handleHover(p.x, p.y)
     }
-
 
     // Prekalkulowane wartości dla Frustum Culling
     val sectionRadius = sqrt(3.0) * 2.0 * cubeSize
@@ -2066,7 +2139,6 @@ class gridMap : JPanel() {
             lastPitch = pitch
             visibilityGraphDirty = false
         }
-
         // Iterujemy po wcześniej obliczonych widocznych segmentach
         for (i in 0 until visibleSegmentsCount) {
             val currX = visibleSegmentsFlat[i * 3]
@@ -2088,26 +2160,71 @@ class gridMap : JPanel() {
                     if (sectionTriangles.isNotEmpty()) {
                         // Sprawdzamy Frustum Culling (czy segment jest w kadrze kamery)
                         if (isSectionVisible(cx, secX, secY, secZ, cz)) {
+                            // Pre-kalkulacja stałej projekcji
+                            val focalLength = (baseCols / 2.0) / Math.tan(Math.toRadians(fov / 2.0))
+                            val halfCols = baseCols / 2.0
+                            val halfRows = baseRows / 2.0
+
                             for (tri in sectionTriangles) {
-                                val t1 = transform(tri.p1)
-                                val t2 = transform(tri.p2)
-                                val t3 = transform(tri.p3)
+                                // --- INLINE TRANSFORM (Zero Allocation) ---
+                                // P1
+                                var x1 = tri.p1.x - camX; var y1 = tri.p1.y - viewY; var z1 = tri.p1.z - camZ
+                                var temp = x1 * cosYaw - z1 * sinYaw; z1 = z1 * cosYaw + x1 * sinYaw; x1 = temp
+                                temp = y1 * cosPitch - z1 * sinPitch; z1 = z1 * cosPitch + y1 * sinPitch; y1 = temp
 
-                                val line1 = Vector3d(t2.x - t1.x, t2.y - t1.y, t2.z - t1.z)
-                                val line2 = Vector3d(t3.x - t1.x, t3.y - t1.y, t3.z - t1.z)
+                                // P2
+                                var x2 = tri.p2.x - camX; var y2 = tri.p2.y - viewY; var z2 = tri.p2.z - camZ
+                                temp = x2 * cosYaw - z2 * sinYaw; z2 = z2 * cosYaw + x2 * sinYaw; x2 = temp
+                                temp = y2 * cosPitch - z2 * sinPitch; z2 = z2 * cosPitch + y2 * sinPitch; y2 = temp
 
-                                val normal = Vector3d(
-                                    line1.y * line2.z - line1.z * line2.y,
-                                    line1.z * line2.x - line1.x * line2.z,
-                                    line1.x * line2.y - line1.y * line2.x
-                                )
+                                // P3
+                                var x3 = tri.p3.x - camX; var y3 = tri.p3.y - viewY; var z3 = tri.p3.z - camZ
+                                temp = x3 * cosYaw - z3 * sinYaw; z3 = z3 * cosYaw + x3 * sinYaw; x3 = temp
+                                temp = y3 * cosPitch - z3 * sinPitch; z3 = z3 * cosPitch + y3 * sinPitch; y3 = temp
 
-                                if (t1.x * normal.x + t1.y * normal.y + t1.z * normal.z > 0) {
-                                    val transformedTri = Triangle3d(t1, t2, t3, tri.color, tri.lightLevel)
-                                    if (transformedTri.color.alpha < 255) {
-                                        transparentTrianglesToRaster.add(transformedTri)
+                                // --- BACKFACE CULLING (Inline) ---
+                                val ax = x2 - x1; val ay = y2 - y1; val az = z2 - z1
+                                val bx = x3 - x1; val by = y3 - y1; val bz = z3 - z1
+                                val nx = ay * bz - az * by
+                                val ny = az * bx - ax * bz
+                                val nz = ax * by - ay * bx
+
+                                if (x1 * nx + y1 * ny + z1 * nz > 0) {
+                                    // Jeśli przezroczysty, musimy użyć starej ścieżki (sortowanie)
+                                    if (tri.color.alpha < 255) {
+                                        transparentTrianglesToRaster.add(Triangle3d(Vector3d(x1, y1, z1, tri.p1.ao), Vector3d(x2, y2, z2, tri.p2.ao), Vector3d(x3, y3, z3, tri.p3.ao), tri.color, tri.lightLevel))
                                     } else {
-                                        opaqueTrianglesToRaster.add(transformedTri)
+                                        // --- FAST PATH (Opaque) ---
+                                        // Jeśli wszystkie punkty są przed NearPlane, nie musimy przycinać (Clipping)
+                                        // To oszczędza tworzenie list i obiektów dla 99% trójkątów
+                                        if (z1 >= nearPlaneZ && z2 >= nearPlaneZ && z3 >= nearPlaneZ) {
+                                            // Inline Project
+                                            val sx1 = (x1 * focalLength) / z1 + halfCols
+                                            val sy1 = -(y1 * focalLength) / z1 + halfRows
+                                            val sx2 = (x2 * focalLength) / z2 + halfCols
+                                            val sy2 = -(y2 * focalLength) / z2 + halfRows
+                                            val sx3 = (x3 * focalLength) / z3 + halfCols
+                                            val sy3 = -(y3 * focalLength) / z3 + halfRows
+
+                                            // Lighting Calc
+                                            val packedLight = tri.lightLevel
+                                            val skyLight = (packedLight shr 4) and 0xF
+                                            val blockLight = packedLight and 0xF
+                                            val finalRGB = lightProcessor.process(
+                                                (tri.p1.x + camX).toInt(), (tri.p1.y + viewY).toInt(), (tri.p1.z + camZ).toInt(),
+                                                tri.color, skyLight, blockLight, globalSunIntensity, minLightFactor + FullbrightFactor
+                                            )
+
+                                            // Optimized Rasterization (No Vector3d creation)
+                                            fillTriangleOptimized(
+                                                sx1, sy1, sx2, sy2, sx3, sy3,
+                                                z1, tri.p1.ao, z2, tri.p2.ao, z3, tri.p3.ao,
+                                                finalRGB
+                                            )
+                                        } else {
+                                            // Slow Path (wymaga przycięcia)
+                                            opaqueTrianglesToRaster.add(Triangle3d(Vector3d(x1, y1, z1, tri.p1.ao), Vector3d(x2, y2, z2, tri.p2.ao), Vector3d(x3, y3, z3, tri.p3.ao), tri.color, tri.lightLevel))
+                                        }
                                     }
                                 }
                             }
@@ -2191,6 +2308,9 @@ class gridMap : JPanel() {
         if (debugXray) {
             renderXRay()
         }
+
+        // --- MOD HOOK: 3D Rendering ---
+        modLoader.notifyRender3D()
     }
 
     private fun renderSky() {
@@ -2715,7 +2835,8 @@ class gridMap : JPanel() {
         return true
     }
 
-    private fun transform(v: Vector3d): Vector3d {
+    // Zmiana na public, aby mody mogły transformować swoje punkty
+    fun transform(v: Vector3d): Vector3d {
         var x = v.x - camX
         var y = v.y - viewY
         var z = v.z - camZ
@@ -2736,7 +2857,8 @@ class gridMap : JPanel() {
     }
 
     // Algorytm Sutherland-Hodgman do przycinania trójkąta względem płaszczyzny Z (Near Plane)
-    private fun clipTriangleAgainstPlane(tri: Triangle3d): List<Triangle3d> {
+    // Zmiana na public
+    fun clipTriangleAgainstPlane(tri: Triangle3d): List<Triangle3d> {
         val input = listOf(tri.p1, tri.p2, tri.p3)
         val output = mutableListOf<Vector3d>()
 
@@ -2777,7 +2899,8 @@ class gridMap : JPanel() {
         return Vector3d(x, y, z, ao)
     }
 
-    private fun project(v: Vector3d): Vector3d {
+    // Zmiana na public, aby mody mogły rzutować punkty 3D na ekran 2D
+    fun project(v: Vector3d): Vector3d {
         val localLenght = (baseCols / 2.0) / Math.tan(Math.toRadians(fov / 2.0))
         val zSafe = if (v.z == 0.0) 0.001 else v.z // Unikamy dzielenia przez 0
 
@@ -2961,7 +3084,8 @@ class gridMap : JPanel() {
         drawLine3D(c2, c6, color, true); drawLine3D(c3, c7, color, true)
     }
 
-    private fun drawLine3D(p1: Vector3d, p2: Vector3d, color: Color, ignoreDepth: Boolean = false) {
+    // Zmiana na public - bardzo przydatne dla modów (rysowanie laserów, ścieżek)
+    fun drawLine3D(p1: Vector3d, p2: Vector3d, color: Color, ignoreDepth: Boolean = false) {
         val t1 = transform(p1)
         val t2 = transform(p2)
 
@@ -3044,8 +3168,72 @@ class gridMap : JPanel() {
         }
     }
 
+    // --- ZOPTOMALIZOWANY RASTERYZATOR (Zero Allocations) ---
+    // Przyjmuje typy proste (Double/Int) zamiast obiektów Vector3d/Color
+    private fun fillTriangleOptimized(
+        sx1: Double, sy1: Double, sx2: Double, sy2: Double, sx3: Double, sy3: Double,
+        z1: Double, ao1: Double, z2: Double, ao2: Double, z3: Double, ao3: Double,
+        color: Int
+    ) {
+        val minX = minOf(sx1, sx2, sx3).toInt().coerceIn(0, baseCols)
+        val maxX = maxOf(sx1, sx2, sx3).toInt().coerceIn(0, baseCols)
+        val minY = minOf(sy1, sy2, sy3).toInt().coerceIn(0, baseRows)
+        val maxY = maxOf(sy1, sy2, sy3).toInt().coerceIn(0, baseRows)
+
+        val v0x = sx2 - sx1; val v0y = sy2 - sy1
+        val v1x = sx3 - sx1; val v1y = sy3 - sy1
+        val d00 = v0x * v0x + v0y * v0y
+        val d01 = v0x * v1x + v0y * v1y
+        val d11 = v1x * v1x + v1y * v1y
+        val denom = d00 * d11 - d01 * d01
+        if (abs(denom) < 1e-9) return
+        val invDenom = 1.0 / denom
+
+        val z1Inv = 1.0 / z1; val z2Inv = 1.0 / z2; val z3Inv = 1.0 / z3
+        val ao1z = ao1 * z1Inv; val ao2z = ao2 * z2Inv; val ao3z = ao3 * z3Inv
+
+        // Pre-kalkulacja kolorów (unikamy dostępu do obiektu Color w pętli)
+        val rBase = (color shr 16) and 0xFF
+        val gBase = (color shr 8) and 0xFF
+        val bBase = color and 0xFF
+
+        // Gradienty barycentryczne (stałe dla trójkąta)
+        // Obliczamy dla punktu startowego (minX + 0.5, minY + 0.5)
+        val startX = minX + 0.5; val startY = minY + 0.5
+        val v2x_start = startX - sx1; val v2y_start = startY - sy1
+        val d20_start = v2x_start * v0x + v2y_start * v0y
+        val d21_start = v2x_start * v1x + v2y_start * v1y
+        var rowV = (d11 * d20_start - d01 * d21_start) * invDenom
+        var rowW = (d00 * d21_start - d01 * d20_start) * invDenom
+
+        val dvdx = (d11 * v0x - d01 * v1x) * invDenom; val dwdx = (d00 * v1x - d01 * v0x) * invDenom
+        val dvdy = (d11 * v0y - d01 * v1y) * invDenom; val dwdy = (d00 * v1y - d01 * v0y) * invDenom
+
+        for (y in minY..maxY) {
+            var v = rowV; var w = rowW
+            var pixelIndex = y * imageWidth + minX
+            for (x in minX..maxX) {
+                // Usunięto epsilon i coerceIn dla wydajności
+                if (v >= 0.0 && w >= 0.0 && (v + w) <= 1.0) {
+                    val u = 1.0 - v - w
+                    val zRecip = u * z1Inv + v * z2Inv + w * z3Inv
+                    val depth = 1.0 / zRecip
+                    if (depth < zBuffer[y][x]) {
+                        zBuffer[y][x] = depth
+                        val ao = (u * ao1z + v * ao2z + w * ao3z) * depth
+                        val r = (rBase * ao).toInt(); val g = (gBase * ao).toInt(); val b = (bBase * ao).toInt()
+                        backBuffer[pixelIndex] = (r shl 16) or (g shl 8) or b
+                    }
+                }
+                v += dvdx; w += dwdx; pixelIndex++
+            }
+            rowV += dvdy; rowW += dwdy
+        }
+    }
+
     // Rasteryzacja trójkąta bezpośrednio do gridMap
-    private fun fillTriangle(p1: Vector3d, p2: Vector3d, p3: Vector3d, v1: Vector3d, v2: Vector3d, v3: Vector3d, color: Color) {
+    // Zmiana na public - pozwala modom rysować własne bryły
+    fun fillTriangle(p1: Vector3d, p2: Vector3d, p3: Vector3d, v1: Vector3d, v2: Vector3d, v3: Vector3d, color: Color) {
         // Bounding box
         val minX = minOf(p1.x, p2.x, p3.x).toInt().coerceIn(0, baseCols)
         val maxX = maxOf(p1.x, p2.x, p3.x).toInt().coerceIn(0, baseCols)
@@ -3153,359 +3341,41 @@ class gridMap : JPanel() {
         val g2d = g as Graphics2D
         g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
         g2d.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON)
+        g2d.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR)
 
         when (gameState) {
             GameState.IN_GAME -> renderGame(g2d)
             GameState.PAUSED -> {
                 renderGame(g2d)
-                renderPauseOverlay(g2d)
+                // Overlay is handled by UIManager
             }
-            GameState.MAIN_MENU -> renderMainMenu(g2d)
-            GameState.WORLD_SELECTION -> renderWorldSelectionMenu(g2d)
-            GameState.CREATE_WORLD -> renderCreateWorldMenu(g2d)
+            else -> {
+                // Other states are fully handled by UIManager
+            }
         }
+        
+        // Obliczanie skali UI
+        val sx = width.toDouble() / referenceWidth
+        val sy = height.toDouble() / referenceHeight
+
+        // Render UI from UIManager
+        val mousePos = MouseInfo.getPointerInfo().location
+        SwingUtilities.convertPointFromScreen(mousePos, this)
+        
+        val uiMouseX = (mousePos.x / sx).toInt()
+        val uiMouseY = (mousePos.y / sy).toInt()
+
+        val oldTransform = g2d.transform
+        g2d.scale(sx, sy)
+        uiManager.render(g2d, uiMouseX, uiMouseY)
+        g2d.transform = oldTransform
+        
+        // Mod render hook (legacy)
+        modLoader.notifyRender(g2d, width, height)
     }
 
     private fun renderGame(g2d: Graphics2D) {
         g2d.drawImage(displayImage, 0, 0, width, height, null)
-
-        if (gameState == GameState.PAUSED) return // Nie rysuj HUD w pauzie
-
-        // Celownik
-        g2d.color = Color.WHITE
-        val crossSize = 5
-        val halfWidth = (baseCols*cellSize)/2
-        val halfHeight = (baseRows*cellSize)/2
-        g2d.stroke = BasicStroke(2f)
-        g2d.drawLine(halfWidth - crossSize, halfHeight, halfWidth + crossSize, halfHeight)
-        g2d.drawLine(halfWidth, halfHeight - crossSize, halfWidth, halfHeight + crossSize)
-
-        // FPS
-        frames++
-        if (System.currentTimeMillis() - lastFpsTime >= 1000) {
-            fps = frames
-            frames = 0
-            lastFpsTime = System.currentTimeMillis()
-        }
-        g2d.font = fpsFont
-        g2d.color = Color.YELLOW
-        val fpsText = "$fps"
-        val fm = g2d.fontMetrics
-        g2d.drawString(fpsText, width - fm.stringWidth(fpsText) - 10, fm.ascent + 10)
-
-        // Debug info
-        if (showChunkBorders) {
-            val currentChunkX = floor(camX / 32.0).toInt()
-            val currentChunkZ = floor(camZ / 32.0).toInt()
-            val chunkText = "Chunk: c_${currentChunkX}_${currentChunkZ}.dat"
-            val posText = "Position: (${floor((camX + (cubeSize/2))/2).toInt()}, ${floor((camY + (cubeSize/2))/2).toInt()+5}, ${floor((camZ + (cubeSize/2)) /2).toInt()})"
-            val timeText = String.format("Time: %.2fzł (Intensity: %.2f) (Day $dayCounter)", gameTime, globalSunIntensity)
-            val seedText = "Seed: ${seed}"
-
-            g2d.color = Color(0.82f, 0.82f, 0.82f, 0.75f)
-            g2d.fillRect(5, 15, fm.stringWidth(chunkText) + 5, fm.ascent)
-            g2d.fillRect(5, fm.ascent + 15, fm.stringWidth(posText) + 5, fm.ascent)
-            g2d.fillRect(5, fm.ascent*2 + 15, fm.stringWidth(timeText) + 5, fm.ascent)
-            g2d.fillRect(5, fm.ascent*3 + 15, fm.stringWidth(seedText) + 5, fm.ascent)
-
-            g2d.color = Color.WHITE
-            g2d.drawString(chunkText, 10, fm.ascent + 10)
-            g2d.drawString(posText, 10, fm.ascent*2 + 10)
-            g2d.drawString(timeText, 10, fm.ascent*3 + 10)
-            g2d.drawString(seedText, 10, fm.ascent*4 + 10)
-
-            // Informacje o bloku, na który patrzy gracz
-            val hit = getTargetBlock()
-            if (hit != null) {
-                val target = hit.blockPos
-                val blockColor = getBlock(target.x, target.y, target.z)
-
-                // Obliczamy pozycję sąsiada w zależności od ściany, na którą patrzymy
-                var nx = target.x; var ny = target.y; var nz = target.z
-                when(hit.faceIndex) {
-                    0 -> nz-- // Front (Z-) -> sąsiad Z-1
-                    1 -> nz++ // Back (Z+) -> sąsiad Z+1
-                    2 -> nx-- // Left (X-) -> sąsiad X-1
-                    3 -> nx++ // Right (X+) -> sąsiad X+1
-                    4 -> ny++ // Top (Y+) -> sąsiad Y+1
-                    5 -> ny-- // Bottom (Y-) -> sąsiad Y-1
-                }
-                val rawLight = getLight(nx, ny, nz)
-                val skyLight = (rawLight shr 4) and 0xF
-                val blockLight = rawLight and 0xF
-                val effectiveLight = maxOf(skyLight * globalSunIntensity, blockLight.toDouble()).toInt()
-
-                val colorHex = if (blockColor != null) String.format("#%06X", (0xFFFFFF and blockColor.rgb)) else "N/A"
-                val targetText = "Target: [${target.x}, ${target.y}, ${target.z}] Color: $colorHex Face: ${hit.faceIndex} Light: $effectiveLight"
-
-                g2d.color = Color(0.82f, 0.82f, 0.82f, 0.75f)
-                g2d.fillRect(5, fm.ascent*4 + 15, fm.stringWidth(targetText) + 5, fm.ascent)
-
-                g2d.color = Color.WHITE
-                g2d.drawString(targetText, 10, fm.ascent*5 + 10)
-            }
-        }
-
-        // Hotbar
-        renderInventory(g2d)
-
-        // Mod render hook
-        modLoader.notifyRender(g2d, width, height)
-    }
-
-    private fun renderMainMenu(g2d: Graphics2D) {
-        g2d.color = Color(30, 30, 30)
-        g2d.fillRect(0, 0, width, height)
-
-        val titleFont = fpsFont.deriveFont(96f)
-        g2d.font = titleFont
-        g2d.color = Color.YELLOW
-        val title = "KapeLuż"
-        val fm = g2d.fontMetrics
-        val titleWidth = fm.stringWidth(title)
-        g2d.drawString(title, (width - titleWidth) / 2, 150)
-
-        drawButtons(g2d, mainMenuButtons, 250)
-    }
-
-    private fun renderWorldSelectionMenu(g2d: Graphics2D) {
-        g2d.color = Color(30, 30, 30)
-        g2d.fillRect(0, 0, width, height)
-
-        val titleFont = fpsFont.deriveFont(64f)
-        g2d.font = titleFont
-        g2d.color = Color.WHITE
-        val title = "Select World"
-        val fm = g2d.fontMetrics
-        val titleWidth = fm.stringWidth(title)
-        g2d.drawString(title, (width - titleWidth) / 2, 100)
-
-        // Rysowanie listy światów
-        val buttonFont = fpsFont.deriveFont(40f)
-        g2d.font = buttonFont
-        val listFm = g2d.fontMetrics
-        val buttonWidth = 600
-        val buttonHeight = 45
-        var currentY = 180
-
-        for (button in worldListButtons) {
-            button.rect = Rectangle((width - buttonWidth) / 2, currentY, buttonWidth, buttonHeight)
-
-            g2d.color = Color(0x6d6d6d)
-            g2d.fillRect(button.rect.x, button.rect.y, button.rect.width, button.rect.height)
-
-            if (hoveredWorld == button.text) {
-                g2d.color = Color.YELLOW
-                val arrow = ">"
-                g2d.drawString(arrow, button.rect.x - listFm.stringWidth(arrow) - 10, currentY + listFm.ascent)
-            }
-
-            g2d.color = Color.WHITE
-            val textWidth = listFm.stringWidth(button.text)
-            g2d.drawString(button.text, button.rect.x + 15, currentY + listFm.ascent)
-
-            currentY += buttonHeight + 15
-        }
-
-        // Rysowanie przycisku "Back"
-        val buttonBackWidth = 300
-        val buttonBackPadding = 20
-        val totalBottomWidth = worldSelectionButtons.size * buttonBackWidth + (worldSelectionButtons.size - 1) * buttonBackPadding
-        var currentX = (width - totalBottomWidth) / 2
-
-        g2d.font = buttonFont
-
-        for (button in worldSelectionButtons) {
-            button.rect = Rectangle(currentX, height - 100, buttonBackWidth, 50)
-
-            g2d.color = if (button.enabled) Color(0x6d6d6d) else Color(0x2c2c2c)
-            g2d.fillRect(button.rect.x, button.rect.y, button.rect.width, button.rect.height)
-
-            g2d.color = if (button.enabled) Color.WHITE else Color(0x808080)
-            val textWidth = listFm.stringWidth(button.text)
-            g2d.drawString(button.text, button.rect.x + (buttonBackWidth - textWidth) / 2, button.rect.y + listFm.ascent)
-
-            currentX += buttonBackWidth + buttonBackPadding
-        }
-    }
-
-    private fun renderPauseOverlay(g2d: Graphics2D) {
-        g2d.color = Color(0, 0, 0, 150)
-        g2d.fillRect(0, 0, width, height)
-
-        // Center the buttons vertically
-        val buttonHeight = 50
-        val buttonPadding = 20
-        val totalButtonsHeight = pauseMenuButtons.size * buttonHeight + (pauseMenuButtons.size - 1) * buttonPadding
-        val startY = (height - totalButtonsHeight) / 2
-
-        drawButtons(g2d, pauseMenuButtons, startY)
-    }
-
-    private fun renderCreateWorldMenu(g2d: Graphics2D) {
-        g2d.color = Color(30, 30, 30)
-        g2d.fillRect(0, 0, width, height)
-
-        val titleFont = fpsFont.deriveFont(64f)
-        g2d.font = titleFont
-        g2d.color = Color.WHITE
-        val title = "Create New World"
-        val fm = g2d.fontMetrics
-        val titleWidth = fm.stringWidth(title)
-        g2d.drawString(title, (width - titleWidth) / 2, 100)
-
-        // --- Text Fields ---
-        val fieldFont = fpsFont.deriveFont(32f)
-        g2d.font = fieldFont
-        val fieldFm = g2d.fontMetrics
-        val fieldWidth = 600
-        val fieldHeight = 40
-
-        // World Name
-        var currentY = 200
-        g2d.color = Color.LIGHT_GRAY
-        g2d.drawString("World Name", (width - fieldWidth) / 2, currentY - 5)
-        val nameRect = Rectangle((width - fieldWidth) / 2, currentY, fieldWidth, fieldHeight)
-        worldCreationTextFields[0] = nameRect
-        g2d.color = Color.BLACK
-        g2d.fillRect(nameRect.x, nameRect.y, nameRect.width, nameRect.height)
-        g2d.color = if (activeTextField == 0) Color.YELLOW else Color.WHITE
-        g2d.drawRect(nameRect.x, nameRect.y, nameRect.width, nameRect.height)
-        g2d.color = Color.WHITE
-        g2d.drawString(newWorldName, nameRect.x + 10, nameRect.y + fieldFm.ascent)
-
-        // Seed
-        currentY += 100
-        g2d.color = Color.LIGHT_GRAY
-        g2d.drawString("Seed (optional)", (width - fieldWidth) / 2, currentY - 5)
-        val seedRect = Rectangle((width - fieldWidth) / 2, currentY, fieldWidth, fieldHeight)
-        worldCreationTextFields[1] = seedRect
-        g2d.color = Color.BLACK
-        g2d.fillRect(seedRect.x, seedRect.y, seedRect.width, seedRect.height)
-        g2d.color = if (activeTextField == 1) Color.YELLOW else Color.WHITE
-        g2d.drawRect(seedRect.x, seedRect.y, seedRect.width, seedRect.height)
-        g2d.color = Color.WHITE
-        g2d.drawString(newWorldSeed, seedRect.x + 10, seedRect.y + fieldFm.ascent)
-
-        // Blinking cursor
-        if (activeTextField != null && (System.currentTimeMillis() / 500) % 2 == 0L) {
-            val activeRect = worldCreationTextFields[activeTextField]!!
-            val textToShow = if (activeTextField == 0) newWorldName else newWorldSeed
-            val cursorX = activeRect.x + 10 + fieldFm.stringWidth(textToShow)
-            g2d.color = Color.WHITE
-            g2d.fillRect(cursorX, activeRect.y + 5, 2, fieldHeight - 10)
-        }
-
-        // Error message
-        createWorldError?.let {
-            g2d.color = Color.RED
-            g2d.drawString(it, (width - fieldFm.stringWidth(it)) / 2, currentY + fieldHeight + 40)
-        }
-
-        // Buttons
-        drawButtons(g2d, createWorldMenuButtons, height - 150)
-    }
-
-    private fun drawButtons(g2d: Graphics2D, buttons: List<MenuButton>, startY: Int) {
-        val buttonFont = fpsFont.deriveFont(40f)
-        g2d.font = buttonFont
-        val fm = g2d.fontMetrics
-        val buttonWidth = 400
-        val buttonHeight = 50
-        var currentY = startY
-
-        for (button in buttons) {
-            button.rect = Rectangle((width - buttonWidth) / 2, currentY, buttonWidth, buttonHeight)
-
-            g2d.color = if (button.enabled) Color(0x6d6d6d) else Color(0x2c2c2c)
-            g2d.fillRect(button.rect.x, button.rect.y, button.rect.width, button.rect.height)
-
-            g2d.color = if (button.enabled) Color.WHITE else Color(0x808080)
-            val textWidth = fm.stringWidth(button.text)
-            g2d.drawString(button.text, (width - textWidth) / 2, currentY + fm.ascent)
-
-            currentY += buttonHeight + 20
-        }
-    }
-
-    private fun renderInventory(g2d: Graphics2D) {
-        val slotSize = 50
-        val padding = 5
-        val totalWidth = 9 * (slotSize + padding) - padding
-        val startX = (width - totalWidth) / 2
-        val startY = height - slotSize - 20
-
-        for (i in 0 until 9) {
-            val x = startX + i * (slotSize + padding)
-            val y = startY
-
-            // Tło slotu
-            if (i == selectedSlot) {
-                g2d.color = Color(255, 255, 255, 180) // Podświetlenie
-                g2d.stroke = BasicStroke(3f)
-            } else {
-                g2d.color = Color(0, 0, 0, 150)
-                g2d.stroke = BasicStroke(1f)
-            }
-
-            g2d.fillRect(x, y, slotSize, slotSize)
-            g2d.color = if (i == selectedSlot) Color.YELLOW else Color.GRAY
-            g2d.drawRect(x, y, slotSize, slotSize)
-
-            // Rysowanie przedmiotu (Miniatura 3D)
-            val stack = inventory[i]
-            if (stack != null) {
-                // FIX: Mapowanie ID na kolor w ekwipunku
-                drawIsometricBlock(g2d, x + slotSize / 2, y + slotSize / 2 + 5, slotSize - 20, Color(getBlockDisplayColor(stack.color)))
-
-                // Licznik
-                g2d.color = Color.WHITE
-                g2d.font = hotbarFont
-                val countStr = stack.count.toString()
-                val strW = g2d.fontMetrics.stringWidth(countStr)
-                g2d.drawString(countStr, x + slotSize - strW - 3, y + slotSize - 3)
-            }
-        }
-    }
-
-    // Rysuje prostą kostkę izometryczną 2D udającą 3D
-    private fun drawIsometricBlock(g2d: Graphics2D, cx: Int, cy: Int, size: Int, color: Color) {
-        val scale = size * 0.4
-
-        val p = arrayOf(
-            Vector3d(-1.0, 1.0, -1.0), Vector3d(1.0, 1.0, -1.0),
-            Vector3d(1.0, 1.0, 1.0), Vector3d(-1.0, 1.0, 1.0),
-            Vector3d(-1.0, -1.0, -1.0), Vector3d(1.0, -1.0, -1.0),
-            Vector3d(1.0, -1.0, 1.0), Vector3d(-1.0, -1.0, 1.0)
-        )
-
-        val yaw = Math.toRadians(45.0)
-        val pitch = Math.asin(1.0 / Math.sqrt(3.0))
-
-        val cosYaw = cos(yaw); val sinYaw = sin(yaw)
-        val cosPitch = cos(pitch); val sinPitch = sin(pitch)
-
-        fun project(v: Vector3d): Point {
-            var x = v.x * cosYaw - v.z * sinYaw
-            var y = v.y
-            var z = v.z * cosYaw + v.x * sinYaw
-            val y2 = y * cosPitch - z * sinPitch
-            return Point((cx + x * scale).toInt(), (cy - y2 * scale).toInt())
-        }
-
-        val pts = p.map { project(it) }
-
-        // Top (Y+)
-        g2d.color = color.brighter()
-        g2d.fillPolygon(intArrayOf(pts[0].x, pts[1].x, pts[2].x, pts[3].x), intArrayOf(pts[0].y, pts[1].y, pts[2].y, pts[3].y), 4)
-
-        // Right (X+)
-        g2d.color = color.darker()
-        g2d.fillPolygon(intArrayOf(pts[1].x, pts[5].x, pts[6].x, pts[2].x), intArrayOf(pts[1].y, pts[5].y, pts[6].y, pts[2].y), 4)
-
-        // Left (Z+)
-        g2d.color = color
-        g2d.fillPolygon(intArrayOf(pts[3].x, pts[2].x, pts[6].x, pts[7].x), intArrayOf(pts[3].y, pts[2].y, pts[6].y, pts[7].y), 4)
     }
 
     private fun drawLine(x0: Int, y0: Int, x1: Int, y1: Int) {
@@ -3549,14 +3419,12 @@ class gridMap : JPanel() {
             }
 
             if (gameState == GameState.CREATE_WORLD) {
-                // Key processing is handled by a temporary KeyListener in this state
+                // Key processing is handled by UIManager
                 // but we still need to consume the event from the manager
                 // so it doesn't trigger game actions.
                 if (modLoader.notifyKeyPress(keyCode)) {
                     continue
                 }
-                // We consume all keys in this state except ESC which is handled above.
-                // The actual logic is in the temporary KeyListener.
                 continue
             }
 
@@ -3598,7 +3466,7 @@ class gridMap : JPanel() {
                     debugXray = !debugXray
                 }
                 if (keyCode == KeyEvent.VK_G) {
-                    println("camX: ${camX.toSmartString()}, camY: ${camY.toSmartString()}, camZ: ${camZ.toSmartString()}, yaw: ${yaw.toSmartString()}, pitch: ${pitch.toSmartString()}, speed: $currentSpeed")
+                    println("camX: ${(floor((camX + (cubeSize/2))/2)).toSmartString()}, camY: ${(floor((camY + (cubeSize/2))/2)+5).toSmartString()}, camZ: ${(floor((camZ + (cubeSize/2))/2)).toSmartString()}, yaw: ${yaw.toSmartString()}, pitch: ${pitch.toSmartString()}, speed: $currentSpeed")
                 }
                 if (keyCode >= KeyEvent.VK_1 && keyCode <= KeyEvent.VK_9) {
                     selectedSlot = keyCode - KeyEvent.VK_1
@@ -3896,7 +3764,7 @@ class gridMap : JPanel() {
     }
 
     fun Double.toSmartString(): String {
-        val rawValue = (this / 2.0) + 0.5
+        val rawValue = this
         val rounded = Math.round(rawValue * 10.0) / 10.0
 
         return if (rounded % 1.0 == 0.0) {
@@ -3909,10 +3777,10 @@ class gridMap : JPanel() {
 
 fun main() {
     SwingUtilities.invokeLater {
-        val frame = JFrame("LewapEngine // gridMap")
+        val frame = JFrame("gridMap")
         frame.iconImage = Toolkit.getDefaultToolkit().getImage(gridMap::class.java.getResource("/icons/GridMap.png"))
         frame.defaultCloseOperation = JFrame.EXIT_ON_CLOSE
-        frame.isResizable = false
+        frame.isResizable = true
         frame.add(gridMap())
         frame.pack()
         frame.setLocationRelativeTo(null)

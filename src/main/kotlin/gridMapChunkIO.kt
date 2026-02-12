@@ -17,13 +17,22 @@ import java.util.Locale.getDefault
  */
 internal val gameDir: File by lazy {
     val appName = "gridMap"
+    val dottedName = ".$appName"
+
     val userHome = System.getProperty("user.home")
-    val os = System.getProperty("os.name").lowercase(getDefault())
+    val os = System.getProperty("os.name").lowercase(java.util.Locale.ROOT)
 
     val path = when {
-        os.contains("win") -> System.getenv("APPDATA")?.let { File(it, appName) } ?: File(userHome, ".$appName")
-        os.contains("mac") -> File(userHome, "Library/Application Support/$appName")
-        else -> File(userHome, ".$appName") // Linux, etc.
+        os.contains("win") -> {
+            val appData = System.getenv("APPDATA")
+            if (appData != null) File(appData, dottedName) else File(userHome, dottedName)
+        }
+        os.contains("mac") -> {
+            File(userHome, "Library/Application Support/$dottedName")
+        }
+        else -> {
+            File(userHome, dottedName)
+        }
     }
     path.apply { mkdirs() }
 }

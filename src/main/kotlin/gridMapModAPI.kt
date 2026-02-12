@@ -23,8 +23,15 @@ interface LewapMod {
     /**
      * Wywoływane w każdej klatce renderowania 2D (GUI).
      * Pozwala modom rysować własne napisy, paski życia itp.
+     * @deprecated Użyj onUIInit i dodaj komponenty do UIManager
      */
     fun onRender(g: Graphics2D, width: Int, height: Int) {}
+
+    /**
+     * Wywoływane przy inicjalizacji interfejsu użytkownika.
+     * Tutaj mody powinny dodawać swoje przyciski i panele do UIManager.
+     */
+    fun onUIInit(uiManager: UIManager) {}
 
     /**
      * Wywoływane, gdy gracz naciśnie klawisz.
@@ -39,14 +46,26 @@ interface LewapMod {
      * Tutaj wrzucamy logikę ciągłą: latanie, regenerację życia, zmiany fizyki.
      */
     fun onTick(game: gridMap) {}
+
+    /**
+     * Wywoływane w każdej klatce renderowania, niezależnie od stanu gry (MENU, PAUSE, IN_GAME).
+     * Służy do aktualizacji logiki UI, animacji interfejsu itp.
+     */
+    fun onTickUI(game: gridMap) {}
+
+    /**
+     * Wywoływane po wyrenderowaniu świata, ale przed UI.
+     * Pozwala modom rysować własne obiekty 3D (np. linie, boxy).
+     */
+    fun onRender3D(game: gridMap) {}
 }
 
 /**
  * Zarządca modów.
  */
-class ModLoader(private val game: gridMap) {
+class ModLoader(private val game: gridMap, rootDir: File) {
     private val mods = mutableListOf<LewapMod>()
-    private val modsDir = File(gameDir, "mods")
+    private val modsDir = File(rootDir, "mods")
 
     fun loadMods() {
         if (!modsDir.exists()) {
@@ -83,6 +102,7 @@ class ModLoader(private val game: gridMap) {
     fun registerMod(mod: LewapMod) {
         mods.add(mod)
         mod.onEnable(game)
+        mod.onUIInit(game.uiManager)
     }
 
     fun notifyBlockPlace(x: Int, y: Int, z: Int, color: Int): Boolean {
@@ -100,5 +120,13 @@ class ModLoader(private val game: gridMap) {
 
     fun notifyTick() {
         mods.forEach { it.onTick(game) }
+    }
+
+    fun notifyTickUI() {
+        mods.forEach { it.onTickUI(game) }
+    }
+
+    fun notifyRender3D() {
+        mods.forEach { it.onRender3D(game) }
     }
 }
