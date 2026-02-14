@@ -9,9 +9,7 @@ import io.ktor.websocket.*
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.encodeToString
 import java.time.Duration
-import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicInteger
 import kotlin.random.Random
 
 // Struktura pokoju w pamięci serwera
