@@ -45,6 +45,7 @@ class UIButton(
     var texture: BufferedImage? = null,
     var textAlign: TextAlign = TextAlign.CENTER,
     var padding: Int = 0,
+    var fontSize: Float = 40f,
     tooltip: String? = null,
     var action: () -> Unit
 ) : UIComponent() {
@@ -74,7 +75,7 @@ class UIButton(
         g.clipRect(x, y, width, height)
 
         g.color = if (isEnabled) Color.WHITE else Color(0x808080)
-        g.font = game.fpsFont.deriveFont(40f)
+        g.font = game.fpsFont.deriveFont(fontSize)
 
         val fm = g.fontMetrics
         val textWidth = fm.stringWidth(text)

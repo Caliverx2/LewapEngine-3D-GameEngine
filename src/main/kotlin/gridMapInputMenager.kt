@@ -95,6 +95,11 @@ open class InputManager(private val component: Component) {
         isRightMouseDown = false
     }
 
+    fun clearMouseState() {
+        isLeftMouseDown = false
+        isRightMouseDown = false
+    }
+
     private inner class KeyboardListener : KeyAdapter() {
         override fun keyPressed(e: KeyEvent?) {
             e?.let {

@@ -1,5 +1,6 @@
 package org.lewapnoob.gridMap
 
+import SignalingMessage
 import java.awt.*
 import java.awt.event.KeyAdapter
 import java.awt.event.MouseAdapter
@@ -23,6 +24,10 @@ import kotlin.math.cos
 import kotlin.math.sin
 
 // --- 3D Structures (Moved out of gridMap class) ---
+import dev.onvoid.webrtc.RTCIceCandidate
+import java.io.File
+import java.nio.ByteBuffer
+
 data class Vector3d(var x: Double, var y: Double, var z: Double, var ao: Double = 1.0)
 data class BlockPos(val x: Int, val y: Int, val z: Int)
 data class RayHit(val blockPos: BlockPos, val faceIndex: Int)
@@ -31,9 +36,12 @@ data class Triangle3d(
 )
 data class ModelVoxel(val x: Int, val y: Int, val z: Int, val color: Color, val isVoid: Boolean = false)
 
+// Struktura dla innych graczy (Multiplayer)
+data class RemotePlayer(var x: Double, var y: Double, var z: Double, var yaw: Double, var pitch: Double, var lastUpdate: Long = 0)
+
 // --- Stany gry i elementy UI ---
 enum class GameState {
-    MAIN_MENU, WORLD_SELECTION, CREATE_WORLD, IN_GAME, PAUSED
+    MAIN_MENU, WORLD_SELECTION, MULTIPLAYER, CREATE_WORLD, IN_GAME, PAUSED
 }
 
 data class ItemStack(val color: Int, var count: Int)
@@ -271,12 +279,111 @@ class gridMap : JPanel() {
     private val pendingItems = ConcurrentLinkedQueue<Pair<String, Int>>()
 
     // --- Threading & Optimization ---
-    private val chunkExecutor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors())
+    // Zmiana: Zostawiamy 2 rdzenie wolne (dla renderowania i systemu) oraz ustawiamy niski priorytet
+    private val chunkExecutor = Executors.newFixedThreadPool(maxOf(1, Runtime.getRuntime().availableProcessors() - 2)) { r ->
+        val t = Thread(r)
+        t.priority = Thread.MIN_PRIORITY // Najniższy priorytet - renderowanie jest ważniejsze!
+        t.isDaemon = true
+        t
+    }
     private val chunksBeingGenerated = ConcurrentHashMap.newKeySet<Point>()
     private val chunksToMeshQueue = ConcurrentLinkedQueue<Point>()
 
     // --- Modding System ---
     private var modLoader = ModLoader(this, gameDir)
+
+    // --- Multiplayer System ---
+    // TUTAJ WPISZ IP SWOJEGO SERWERA SWATKI (z portem, np. 8080)
+    private val SIGNALING_SERVER_URL = "ws://lewapnoob.ddns.net:8080/signaling"//"ws://127.0.0.1:8080/signaling"
+    private var signalingClient: SignalingClient? = null
+    private var webRTCManager: WebRTCManager? = null
+    // Mapowanie Byte ID -> RemotePlayer. 
+    // W prawdziwej grze potrzebujesz mapy String(UUID) <-> Byte(NetID) uzgadnianej przy wejściu.
+    private val remotePlayers = ConcurrentHashMap<Byte, RemotePlayer>()
+    private var myPlayerId: Byte = 0 // Zmieniono na var, domyślnie 0
+    private var isHost = false // Flaga określająca rolę w sieci
+    private var isMultiplayerClient = false // Flaga dla klienta, aby blokować generowanie świata
+    
+    // --- Reconnection System ---
+    private var connectionAttempts = 0
+    private val maxConnectionAttempts = 5
+    private var isDisconnectingIntentional = false // Flaga: czy rozłączenie było celowe (przycisk Quit)
+
+    // --- Chunk Streamer (Host Logic) ---
+    private val chunkStreamer = ChunkStreamer()
+
+    // Mapa żądań klienta: Point(cx, cz) -> Timestamp ostatniego żądania
+    private val clientChunkRequests = ConcurrentHashMap<Point, Long>()
+
+    // Bufor na kandydatów ICE, którzy przyszli zanim zainicjowano WebRTC
+    private val pendingIceCandidates = ConcurrentLinkedQueue<RTCIceCandidate>()
+
+    // Kolejka akcji z wątku sieciowego do wykonania na głównym wątku gry
+    private val networkActionQueue = ConcurrentLinkedQueue<() -> Unit>()
+
+    inner class ChunkStreamer {
+        private val pendingChunks = ConcurrentLinkedQueue<Point>()
+        private val chunksSent = ConcurrentHashMap.newKeySet<Point>()
+
+        fun queueChunk(cx: Int, cz: Int, force: Boolean = false) {
+            val p = Point(cx, cz)
+            if (force) {
+                chunksSent.remove(p) // Pozwalamy na ponowne wysłanie, jeśli klient prosi
+            }
+            if (!chunksSent.contains(p) && !pendingChunks.contains(p)) {
+                pendingChunks.add(p)
+            }
+        }
+
+        // Skanuje graczy i kolejkuje chunki wokół nich
+        fun updateQueues() {
+            // Host nie musi już zgadywać co wysłać - reaguje na PACKET_CHUNK_REQUEST
+        }
+
+        fun tick() {
+            // USUNIĘTO: Sztywny limit "co 5 ticków". Teraz wysyłamy tak szybko, jak pozwala łącze.
+            // if (gameTicks % 5 != 0L) return
+
+            if (webRTCManager == null) return
+
+            // TARGET BUFFER: Celujemy w ~160KB danych w locie.
+            // Dlaczego?
+            // 1. To rozmiar ok. 1-2 chunków.
+            // 2. Przy uploadzie 5 Mbps (słabe łącze), 160KB opróżnia się w ~0.25s.
+            //    To akceptowalne opóźnienie dla ruchu gracza, który czeka w tej samej kolejce.
+            // 3. Zostawia margines bezpieczeństwa do limitu WebRTC (często 256KB-1MB).
+            val targetBufferFill = 160 * 1024 
+            
+            // Pobieramy aktualny stan bufora
+            var currentBuffered = webRTCManager?.bufferedAmount() ?: 0
+
+            // Pętla wysyłająca: Dopóki mamy co wysłać I mamy miejsce w rurze
+            while (!pendingChunks.isEmpty() && currentBuffered < targetBufferFill) {
+                val p = pendingChunks.poll()
+                
+                // FIX: Jeśli chunka nie ma w RAM (bo Host jest daleko), ładujemy go lub generujemy na żądanie.
+                // Dzięki temu klient dostanie chunk, nawet jeśli Host go nie widzi.
+                val chunk = chunks[p] ?: generateChunk(p.x, p.y)
+                
+                if (chunk != null) {
+                    try {
+                        // FIX: Wysyłamy również metadane!
+                        val packet = NetworkProtocol.encodeChunk(p.x, p.y, chunk.blocks, chunk.metadata)
+                        
+                        // Aktualizujemy lokalny licznik bufora, bo webRTCManager.bufferedAmount()
+                        // może nie zaktualizować się natychmiast po sendData w tej samej milisekundzie.
+                        currentBuffered += packet.remaining()
+                        
+                        webRTCManager?.sendData(packet)
+                        chunksSent.add(p)
+                    } catch (e: Exception) {
+                        println("Błąd wysyłania chunka ${p.x}, ${p.y}: ${e.message}")
+                        // Opcjonalnie: wrzuć z powrotem do kolejki lub zignoruj
+                    }
+                }
+            }
+        }
+    }
 
     // --- Game State & Menu System ---
     var gameState = GameState.MAIN_MENU
@@ -288,9 +395,16 @@ class gridMap : JPanel() {
     private var errorTextComponent: UIText? = null
     private var nameFieldComponent: UITextField? = null
     private var seedFieldComponent: UITextField? = null
+    private var adressIPFieldComponent: UITextField? = null
+    private var codeJoinFieldComponent: UITextField? = null
+    private var roomCodeComponent: UIText? = null
 
     // --- UI System ---
     val uiManager = UIManager(this)
+
+    // --- Rendering Optimization (Recykling list) ---
+    private val opaqueTrianglesToRaster = ArrayList<Triangle3d>(20000)
+    private val transparentTrianglesToRaster = ArrayList<Triangle3d>(5000)
 
     init {
         preferredSize = Dimension((baseCols + 1) * cellSize, (baseRows + 1) * cellSize)
@@ -321,6 +435,12 @@ class gridMap : JPanel() {
                 if (gameState != GameState.IN_GAME) {
                     val p = transform(e)
                     uiManager.handlePress(p.x, p.y)
+                } else {
+                    // FIX: Kliknięcie w okno przywraca myszkę po Alt-Tab
+                    if (!inputManager.isMouseCaptured) {
+                        inputManager.captureMouse()
+                        inputManager.clearMouseState() // Ignorujemy to kliknięcie (żeby nie strzelić od razu)
+                    }
                 }
             }
 
@@ -373,7 +493,8 @@ class gridMap : JPanel() {
             updateWorldList()
         }) //280
         mainMenu.add(UIButton(baseCols*2 - 200, 320, 400, 50, "Multiplayer") {
-        }.apply { isEnabled = false })
+            gameState = GameState.MULTIPLAYER
+        })
         mainMenu.add(UIButton(baseCols*2 - 200, 390, 400, 50, "Options...") {
         }.apply { isEnabled = false })
         mainMenu.add(UIButton(baseCols*2 - 200, 460, 400, 50, "Quit Game") {
@@ -400,11 +521,37 @@ class gridMap : JPanel() {
         val pauseMenu = uiManager.getPanel(GameState.PAUSED)
         // Overlay background handled in render (or add semi-transparent background here)
         pauseMenu.add(UIBackground(Color(0, 0, 0, 150)))
-        pauseMenu.add(UIButton(baseCols*2 - 200, baseRows*2 - 60, 400, 50, "Back to game") {
+        pauseMenu.add(UIButton(baseCols*2 - 200 - 10, baseRows*2 - 130, 420, 50, "Back to game") {
             gameState = GameState.IN_GAME
             inputManager.captureMouse()
         })
-        pauseMenu.add(UIButton(baseCols*2 - 200, baseRows*2 + 10, 400, 50, "Save and quit") {
+
+        // Komponent do wyświetlania kodu pokoju
+        roomCodeComponent = UIText(baseCols*2, baseRows*2 - 180, "", 48f, Color.GREEN, true)
+        pauseMenu.add(roomCodeComponent!!)
+
+        pauseMenu.add(UIButton(baseCols*2 - 200 - 10, baseRows*2 - 50 - 15, 200 - 7 + 10, 50, "Advancements", fontSize = 28f) {
+        }.apply { isEnabled = false })
+        pauseMenu.add(UIButton(baseCols*2 + 15 - 7, baseRows*2 - 50 - 15, 200 - 7 + 10, 50, "Statistics", fontSize = 28f) {
+        }.apply { isEnabled = false })
+        pauseMenu.add(UIButton(baseCols*2 - 200 - 10, baseRows*2 + 15, 200 - 7 + 10, 50, "Options...", fontSize = 28f) {
+        }.apply { isEnabled = false })
+        pauseMenu.add(UIButton(baseCols*2 + 15 - 7, baseRows*2 + 15, 200 - 7 + 10, 50, "Open Server", fontSize = 28f) {
+            // 1. Inicjalizacja klienta sygnalizacyjnego
+            signalingClient = SignalingClient(SIGNALING_SERVER_URL,
+                onConnect = {
+                    signalingClient?.send(SignalingMessage.CreateRoom)
+                },
+                onMessage = { msg -> handleSignalingMessage(msg) }
+            )
+            signalingClient?.connect()
+            println("Łączenie z serwerem w celu utworzenia pokoju...")
+        })
+
+        pauseMenu.add(UIButton(baseCols*2 - 200 - 10, baseRows*2 + 15 + 50 + 15, 420, 50, "Save and quit") {
+            isDisconnectingIntentional = true
+            isMultiplayerClient = false
+            isHost = false
             saveAndExitToMenu()
         })
 
@@ -438,12 +585,84 @@ class gridMap : JPanel() {
             }
         })
 
+        // --- Multiplayer Menu ---
+        val multiplayer = uiManager.getPanel(GameState.MULTIPLAYER)
+        multiplayer.add(UIBackground(Color(30, 30, 30)))
+        multiplayer.add(UIText(baseCols*2, 6, "Play Multiplayer", 32f, Color.WHITE, true))
+
+        multiplayer.add(UIText(baseCols*2 - 200, 60, "IP Address:", 12f, Color.LIGHT_GRAY))
+        adressIPFieldComponent = UITextField(baseCols*2 - 200, 80, 400, 40, "")
+        multiplayer.add(adressIPFieldComponent!!)
+
+        multiplayer.add(UIText(baseCols*2 - 200, 130, "JOIN CODE:", 12f, Color.LIGHT_GRAY))
+        codeJoinFieldComponent = UITextField(baseCols*2 - 200, 150, 400, 40, "")
+        multiplayer.add(codeJoinFieldComponent!!)
+
+        multiplayer.add(UIButton(baseCols*2 - 415, 460, 400, 50, "Join Server") {
+            var ipHere = false
+            var codeHere = false
+            if (adressIPFieldComponent?.text?.isNotEmpty() == true) ipHere = true
+            if (codeJoinFieldComponent?.text?.isNotEmpty() == true) codeHere = true
+
+            if (ipHere && !codeHere) {
+                println("join ip")
+                //kod który dołącza do serwera poprzez ip // narazie nie aktywne! nie dodawać!
+            }
+            if (!ipHere && codeHere) {
+                val code = codeJoinFieldComponent?.text ?: ""
+                
+                // Reset licznika i start łączenia z retry
+                connectionAttempts = 0
+                connectWithRetry(code)
+            }
+        })
+        multiplayer.add(UIButton(baseCols*2 + 15, 460, 400, 50, "Cancel") {
+            signalingClient?.close() // Zamykamy połączenie, jeśli anulujemy w menu
+            gameState = GameState.MAIN_MENU
+        })
+
         // --- In Game HUD ---
         val hud = uiManager.getPanel(GameState.IN_GAME)
         hud.add(UICrosshair())
         hud.add(UIFpsCounter())
         hud.add(UIDebugInfo())
         hud.add(UIInventory())
+    }
+
+    // Funkcja rekurencyjna do wznawiania połączenia
+    private fun connectWithRetry(code: String) {
+        connectionAttempts++
+        // Resetujemy flagę intencji przy każdej próbie połączenia (chyba że właśnie wychodzimy, ale wtedy ta funkcja nie powinna być wołana)
+        isDisconnectingIntentional = false
+
+        println("Próba połączenia $connectionAttempts/$maxConnectionAttempts...")
+
+        signalingClient = SignalingClient(SIGNALING_SERVER_URL,
+            onConnect = {
+                println("Połączono z serwerem sygnalizacyjnym.")
+                connectionAttempts = 0 // Resetujemy licznik po udanym połączeniu
+                signalingClient?.send(SignalingMessage.JoinRoom(code))
+            },
+            onMessage = { msg -> handleSignalingMessage(msg) },
+            onFailure = {
+                // FIX: Sprawdzamy, czy to gracz chciał wyjść. Jeśli tak, nie ponawiamy.
+                if (isDisconnectingIntentional) {
+                    println("Rozłączono celowo (User Quit). Nie ponawiam połączenia.")
+                } else if (connectionAttempts < maxConnectionAttempts) {
+                    println("Połączenie zerwane lub nieudane. Ponawianie za 1s... (Próba $connectionAttempts)")
+                    // Czekamy chwilę przed ponowną próbą (w tle)
+                    Thread.sleep(1000)
+                    connectWithRetry(code)
+                } else {
+                    println("Nie udało się połączyć po $maxConnectionAttempts próbach.")
+                    // Wracamy do menu Multiplayer
+                    SwingUtilities.invokeLater {
+                        gameState = GameState.MULTIPLAYER
+                    }
+                }
+            }
+        )
+        signalingClient?.connect()
     }
 
     private fun updateWorldList() {
@@ -534,6 +753,10 @@ class gridMap : JPanel() {
         chunkIO.saveWorldData(WorldData(seed, camX, camY, camZ, yaw, pitch, debugNoclip, debugFly, debugFullbright, showChunkBorders, debugXray, gameTime, dayCounter))
         println("All modified chunks saved.")
 
+        // FIX: Ustawiamy flagę, że to my zamykamy połączenie, aby connectWithRetry nie próbował łączyć ponownie
+        isDisconnectingIntentional = true
+        
+        signalingClient?.close() // Zamykamy połączenie dopiero przy wyjściu do menu
         resetGame()
         gameState = GameState.WORLD_SELECTION
         updateWorldList()
@@ -555,6 +778,13 @@ class gridMap : JPanel() {
         inputManager.releaseMouse()
         inputManager.resetInputState()
 
+        // Reset WebRTC
+        // Ważne: Czyścimy menedżera i bufor, aby przy ponownym dołączaniu
+        // kandydaci nie trafiali do starej instancji lub w próżnię.
+        // webRTCManager?.close() // Odkomentuj jeśli masz metodę close/dispose
+        webRTCManager = null
+        pendingIceCandidates.clear()
+
         // Reset debug flags
         debugNoclip = false
         debugFly = false
@@ -562,10 +792,21 @@ class gridMap : JPanel() {
         FullbrightFactor = 0.0
         showChunkBorders = false
         debugXray = false
+        remotePlayers.clear()
+        isMultiplayerClient = false
+        isDisconnectingIntentional = false // Reset flagi przy restarcie gry
+        roomCodeComponent?.text = "" // Reset kodu przy restarcie
+        // signalingClient?.close() // USUNIĘTO: Nie zamykamy tutaj, bo startGame() tego używa!
     }
 
-    private fun startGame(worldName: String) {
+    private fun startGame(worldName: String, isClient: Boolean = false) {
         resetGame()
+        
+        // FIX: Jeśli jesteśmy klientem, usuwamy stary zapis sesji multiplayer, aby uniknąć kolizji chunków
+        if (isClient) {
+            val sessionDir = File(gameDir, "saves/$worldName")
+            if (sessionDir.exists()) sessionDir.deleteRecursively()
+        }
 
         // Inicjalizacja specyficzna dla świata
         chunkIO = ChunkIO(worldName)
@@ -616,9 +857,13 @@ class gridMap : JPanel() {
         }
 
         // Wymuszamy synchroniczne załadowanie chunka startowego.
-        val startCx = floor(camX / 32.0).toInt()
-        val startCz = floor(camZ / 32.0).toInt()
-        chunks[Point(startCx, startCz)] = generateChunk(startCx, startCz)
+        // FIX: Jeśli to klient multiplayer, NIE generujemy startowego chunka lokalnie.
+        if (!isClient) {
+            val startCx = floor(camX / 32.0).toInt()
+            val startCz = floor(camZ / 32.0).toInt()
+            chunks[Point(startCx, startCz)] = generateChunk(startCx, startCz)
+        }
+        isMultiplayerClient = isClient
 
         gameState = GameState.IN_GAME
         inputManager.captureMouse()
@@ -629,12 +874,272 @@ class gridMap : JPanel() {
         }
     }
 
+    // Obsługa wiadomości z serwera sygnalizacyjnego
+    private fun handleSignalingMessage(msg: SignalingMessage) {
+        when (msg) {
+            is SignalingMessage.RoomCreated -> {
+                println("Pokój utworzony! KOD: ${msg.roomCode}")
+                roomCodeComponent?.text = "CODE: ${msg.roomCode}"
+            }
+            is SignalingMessage.PlayerJoined -> {
+                println("Gracz dołączył: ${msg.playerId}")
+                // Host inicjuje WebRTC po dołączeniu gracza
+                initWebRTC(isHost = true)
+            }
+            is SignalingMessage.SdpOffer -> {
+                println("Otrzymano ofertę SDP. Dołączanie do gry...")
+                // Klient startuje grę i WebRTC po otrzymaniu oferty
+                if (gameState != GameState.IN_GAME) {
+                    SwingUtilities.invokeLater {
+                        startGame("MultiplayerSession", isClient = true)
+                        initWebRTC(isHost = false)
+                        webRTCManager?.handleRemoteOffer(msg.sdp)
+
+                        // Aplikujemy zbuforowanych kandydatów, którzy przyszli przed ofertą
+                        while (!pendingIceCandidates.isEmpty()) {
+                            val candidate = pendingIceCandidates.poll()
+                            webRTCManager?.addIceCandidate(candidate)
+                        }
+                    }
+                }
+            }
+            is SignalingMessage.SdpAnswer -> {
+                println("Otrzymano odpowiedź SDP.")
+                webRTCManager?.handleRemoteAnswer(msg.sdp)
+            }
+            is SignalingMessage.IceCandidate -> {
+                val candidate = RTCIceCandidate(msg.sdpMid, msg.sdpMLineIndex ?: 0, msg.candidate, "")
+                if (webRTCManager != null) {
+                    println("SIGNALING RX: Otrzymano kandydata ICE: ${msg.sdpMid}")
+                    webRTCManager?.addIceCandidate(candidate)
+                } else {
+                    // Jeśli menedżer jeszcze nie istnieje (wyścig wątków), buforujemy kandydata
+                    println("SIGNALING RX: Buforowanie kandydata ICE (WebRTC niegotowe): ${msg.sdpMid}")
+                    pendingIceCandidates.add(candidate)
+                }
+            }
+            is SignalingMessage.Error -> {
+                println("Błąd sygnalizacji: ${msg.message}")
+            }
+            else -> {}
+        }
+    }
+
+    // Inicjalizacja WebRTC (wspólna dla Hosta i Klienta)
+    private fun initWebRTC(isHost: Boolean) {
+        // Przypisanie ID na sztywno dla testów (Host=1, Klient=2)
+        // Dzięki temu gracze nie będą mieli tego samego ID i będą się widzieć
+        myPlayerId = if (isHost) 1 else 2
+        this.isHost = isHost
+
+        webRTCManager = WebRTCManager(
+            onIceCandidate = { candidate ->
+                println("SIGNALING TX: Wysyłanie kandydata ICE: ${candidate.sdpMid}")
+                signalingClient?.send(SignalingMessage.IceCandidate(candidate.sdp, candidate.sdpMid, candidate.sdpMLineIndex))
+            },
+            onSdpOffer = { desc ->
+                signalingClient?.send(SignalingMessage.SdpOffer(desc.sdp))
+            },
+            onSdpAnswer = { desc ->
+                signalingClient?.send(SignalingMessage.SdpAnswer(desc.sdp))
+            },
+            onDataReceived = { buffer ->
+                try {
+                    // KRYTYCZNE: Natychmiast kopiujemy dane z bufora. Oryginalny bufor
+                    // może zostać ponownie użyty przez bibliotekę WebRTC po wyjściu z tej funkcji.
+                    val dataCopy = ByteArray(buffer.remaining())
+                    buffer.get(dataCopy)
+
+                    // Zakolejkuj przetwarzanie na głównym wątku gry, aby uniknąć problemów z współbieżnością.
+                    networkActionQueue.add {
+                        val bufferCopy = ByteBuffer.wrap(dataCopy)
+                        if (bufferCopy.remaining() == 0) return@add
+
+                        val type = bufferCopy.get(0) // Podgląd typu pakietu
+                        when (type) {
+                            NetworkProtocol.PACKET_PLAYER_POS -> {
+                                val data = NetworkProtocol.decodePlayerPosition(bufferCopy)
+                                remotePlayers[data.playerId] = RemotePlayer(data.x, data.y, data.z, data.yaw, data.pitch, System.currentTimeMillis())
+                            }
+                            NetworkProtocol.PACKET_BLOCK_SET -> {
+                                val data = NetworkProtocol.decodeBlockChange(bufferCopy)
+                                
+                                // Helper do ustawiania bloku Z metadanymi (bo setBlock resetuje meta do 0)
+                                fun setBlockWithMeta(x: Int, y: Int, z: Int, color: Int, meta: Byte) {
+                                    setBlock(x, y, z, color)
+                                    if (meta != 0.toByte()) {
+                                        val cx = if (x >= 0) x / 16 else (x + 1) / 16 - 1
+                                        val cz = if (z >= 0) z / 16 else (z + 1) / 16 - 1
+                                        chunks[Point(cx, cz)]?.let {
+                                            var lx = x % 16; if (lx < 0) lx += 16
+                                            var lz = z % 16; if (lz < 0) lz += 16
+                                            it.setMeta(lx, y, lz, meta.toInt())
+                                        }
+                                    }
+                                }
+
+                                if (isHost) {
+                                    val cx = if (data.x >= 0) data.x / 16 else (data.x + 1) / 16 - 1
+                                    val cz = if (data.z >= 0) data.z / 16 else (data.z + 1) / 16 - 1
+                                    val p = Point(cx, cz)
+
+                                    if (chunks.containsKey(p)) {
+                                        // SCENARIUSZ 1: Chunk jest załadowany u Hosta -> Normalna aktualizacja
+                                        println("MULTIPLAYER RX (HOST): Zmiana bloku w załadowanym chunku: $cx, $cz")
+                                        setBlockWithMeta(data.x, data.y, data.z, data.color, data.metadata)
+                                        refreshChunkData(cx, cz)
+                                    } else {
+                                        // SCENARIUSZ 2: Chunk jest poza zasięgiem Hosta -> Edycja pliku zapisu w tle
+                                        println("MULTIPLAYER RX (HOST): Zmiana bloku w ODLEGŁYM chunku: $cx, $cz (Save Edit)")
+                                        chunkExecutor.submit {
+                                            // 1. Wczytaj z dysku lub wygeneruj
+                                            var chunk = chunkIO.loadChunk(cx, cz)
+                                            if (chunk == null) {
+                                                chunk = chunkGenerator.generate(cx, cz)
+                                            }
+
+                                            // 2. Podmień blok (obliczamy lokalne koordynaty)
+                                            var lx = data.x % 16; if (lx < 0) lx += 16
+                                            var lz = data.z % 16; if (lz < 0) lz += 16
+                                            if (data.y in 0..127) {
+                                                chunk.setBlock(lx, data.y, lz, data.color)
+                                                chunk.setMeta(lx, data.y, lz, data.metadata.toInt()) // Używamy odebranych metadanych
+                                                
+                                                // 3. Zapisz z powrotem na dysk
+                                                chunkIO.saveChunk(chunk)
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // KLIENT: Zawsze aktualizuje to co widzi
+                                    setBlockWithMeta(data.x, data.y, data.z, data.color, data.metadata)
+                                    val cx = if (data.x >= 0) data.x / 16 else (data.x + 1) / 16 - 1
+                                    val cz = if (data.z >= 0) data.z / 16 else (data.z + 1) / 16 - 1
+                                    refreshChunkData(cx, cz)
+                                }
+                            }
+                            NetworkProtocol.PACKET_CHUNK_DATA -> {
+                                val data = NetworkProtocol.decodeChunk(bufferCopy)
+                                val p = Point(data.cx, data.cz)
+                                val newChunk = Chunk(data.cx, data.cz)
+                                System.arraycopy(data.blocks, 0, newChunk.blocks, 0, data.blocks.size)
+                                // Kopiujemy odebrane metadane
+                                System.arraycopy(data.metadata, 0, newChunk.metadata, 0, data.metadata.size)
+                                
+                                chunks[p] = newChunk
+                                
+                                // FIX: Zamiast tylko liczyć światło lokalnie, używamy refreshChunkData.
+                                // To zaktualizuje światło I meshe również u sąsiadów, usuwając "szwy" i granice.
+                                // OPTYMALIZACJA: Przenosimy to do wątku tła, aby uniknąć laga przy odbiorze wielu chunków naraz!
+                                chunkExecutor.submit {
+                                    refreshChunkData(data.cx, data.cz)
+                                }
+                            }
+                            NetworkProtocol.PACKET_WORLD_DATA -> {
+                                val data = NetworkProtocol.decodeWorldData(bufferCopy)
+                                if (seed != data.seed) {
+                                    seed = data.seed
+                                    chunkGenerator = ChunkGenerator(seed, oreColors)
+                                    chunks.clear()
+                                    chunkMeshes.clear()
+                                    chunkOcclusion.clear()
+                                }
+                                if (abs(gameTime - data.gameTime) > 0.5) gameTime = data.gameTime
+                                dayCounter = data.dayCounter
+                            }
+                            NetworkProtocol.PACKET_CHUNK_REQUEST -> {
+                                if (isHost) {
+                                    val req = NetworkProtocol.decodeChunkRequest(bufferCopy)
+                                    val p = Point(req.cx, req.cz)
+                                    chunkExecutor.submit {
+                                        // 1. Sprawdź czy jest w RAM
+                                        var chunk = chunks[p]
+                                        
+                                        // 2. Jeśli nie ma w RAM, sprawdź plik zapisu (c_x_z.dat)
+                                        if (chunk == null) {
+                                            chunk = chunkIO.loadChunk(req.cx, req.cz)
+                                        }
+
+                                        // 3. Jeśli nie ma pliku, wygeneruj i ZAPISZ
+                                        if (chunk == null) {
+                                            chunk = chunkGenerator.generate(req.cx, req.cz)
+                                            chunkIO.saveChunk(chunk) // Zapisz na dysk, aby plik istniał
+                                        }
+
+                                        // Dodaj do RAM (żeby ChunkStreamer go widział) i zakolejkuj
+                                        chunks.putIfAbsent(p, chunk)
+                                        chunkStreamer.queueChunk(req.cx, req.cz, force = true)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    println("!!! KRYTYCZNY BŁĄD w onDataReceived !!!")
+                    e.printStackTrace()
+                }
+            },
+        )
+        webRTCManager?.startConnection(isHost)
+
+        // FIX: Usunięto natychmiastowe wysyłanie danych świata.
+        // Kanał (DataChannel) nie jest jeszcze otwarty w tym momencie (jest w stanie CONNECTING).
+        // Dane świata zostaną wysłane automatycznie w pętli loop() (co 1s), gdy połączenie będzie stabilne.
+    }
+
     private fun updateWorld() {
         val currentChunkX = floor(camX / 32.0).toInt()
         val currentChunkZ = floor(camZ / 32.0).toInt()
 
         val maxChunkCoord = 134217727
         val minChunkCoord = -134217728
+
+        // --- LOGIKA KLIENTA: Żądanie chunków ---
+        if (isMultiplayerClient) {
+            val now = System.currentTimeMillis()
+            val missingChunks = ArrayList<Point>()
+
+            // Skanujemy obszar renderowania
+            for (cx in currentChunkX - renderDistance..currentChunkX + renderDistance) {
+                for (cz in currentChunkZ - renderDistance..currentChunkZ + renderDistance) {
+                    val p = Point(cx, cz)
+                    if (!chunks.containsKey(p)) {
+                        missingChunks.add(p)
+                    } else {
+                        // Mamy chunk, usuwamy z listy żądań
+                        clientChunkRequests.remove(p)
+                    }
+                }
+            }
+
+            // Sortujemy od najbliższego do najdalszego (Spiral Loading)
+            missingChunks.sortWith { p1, p2 ->
+                val d1 = (p1.x - currentChunkX) * (p1.x - currentChunkX) + (p1.y - currentChunkZ) * (p1.y - currentChunkZ)
+                val d2 = (p2.x - currentChunkX) * (p2.x - currentChunkX) + (p2.y - currentChunkZ) * (p2.y - currentChunkZ)
+                d1.compareTo(d2)
+            }
+
+            // Wysyłamy żądania w kolejności
+            var requestsSentThisTick = 0
+            for (p in missingChunks) {
+                val lastReq = clientChunkRequests[p] ?: 0L
+                // Jeśli nie żądaliśmy go wcale LUB minęła 1 sekunda (ponawianie zgubionych pakietów)
+                if (now - lastReq > 1000) {
+                    if (webRTCManager != null) {
+                        val packet = NetworkProtocol.encodeChunkRequest(p.x, p.y)
+                        webRTCManager?.sendData(packet)
+                        clientChunkRequests[p] = now
+                        
+                        // FIX: Limitujemy liczbę żądań na klatkę, aby nie "zalać" łącza wychodzącego
+                        // Jeśli wyślemy 200 żądań naraz, zapchamy bufor i ważne pakiety (np. pozycja gracza) będą czekać.
+                        requestsSentThisTick++
+                        // ZWIĘKSZONO: Skoro host jest wydajniejszy, klient może prosić o więcej naraz (małe pakiety po 9 bajtów)
+                        if (requestsSentThisTick > 40) break
+                    }
+                }
+            }
+            return // Klient nie generuje sam
+        }
 
         // 1. Zlecanie generowania chunków w tle (od środka na zewnątrz)
         val chunksToLoad = java.util.ArrayList<Point>()
@@ -657,40 +1162,24 @@ class gridMap : JPanel() {
 
         var chunksSubmitted = 0
         for (p in chunksToLoad) {
-            if (chunksSubmitted >= 1) break // Leniwe ładowanie: max 1 chunk na klatkę, by nie dławić systemu
+            if (chunksSubmitted >= 2) break // Zwiększono limit bezpiecznie dzięki priorytetom wątków
             chunksBeingGenerated.add(p)
             chunkExecutor.submit {
                 try {
-                    Thread.sleep(15) // Dajemy "odetchnąć" procesorowi, by nie zużywać 100% wątku
                     val newChunk = generateChunk(p.x, p.y)
                     chunks[p] = newChunk
 
-                    // FIX: Wymuszamy aktualizację światła w nowym chunku i sąsiadach,
-                    // aby światło poprawnie rozeszło się przez granice nowo załadowanego obszaru.
-                    calculateLighting(newChunk)
-                    getNeighborChunks(p.x, p.y).forEach { neighborPos ->
-                        chunks[neighborPos]?.let { neighbor ->
-                            calculateLighting(neighbor)
-                            chunksToMeshQueue.add(neighborPos)
-                        }
-                    }
+                    // Ujednolicenie logiki: Używamy tej samej, solidnej funkcji co multiplayer.
+                    // refreshChunkData zajmie się nowym chunkiem ORAZ jego sąsiadami,
+                    // zapewniając poprawne oświetlenie i usunięcie "szwów".
+                    // Ta funkcja jest kosztowna, ale już jest w wątku tła, więc nie powoduje lagów.
+                    refreshChunkData(p.x, p.y)
 
-                    chunksToMeshQueue.add(p)
                 } finally {
                     chunksBeingGenerated.remove(p)
                 }
             }
             chunksSubmitted++
-        }
-
-        // 2. Przetwarzanie kolejki meshy (Limitowane, aby nie zabić FPS przy dużej ilości zmian naraz)
-        var meshesProcessed = 0
-        while (!chunksToMeshQueue.isEmpty() && meshesProcessed < 4) { // Max 4 chunki na klatkę
-            val p = chunksToMeshQueue.poll()
-            if (chunks.containsKey(p)) {
-                updateChunkMesh(p.x, p.y)
-                meshesProcessed++
-            }
         }
 
         if (currentChunkX != lastChunkX || currentChunkZ != lastChunkZ) {
@@ -726,6 +1215,13 @@ class gridMap : JPanel() {
 
     // Dodano parametr changedBlocks dla operacji masowych (np. płyny)
     private fun refreshChunkData(cx: Int, cz: Int, lx: Int = -1, lz: Int = -1, changedBlocks: List<BlockPos>? = null) {
+        // OPTYMALIZACJA: Nie aktualizuj chunków, które są poza zasięgiem wzroku.
+        // Pozwala to uniknąć lagów przy teleportacji lub odbieraniu zaległych pakietów.
+        val currentChunkX = floor(camX / 32.0).toInt()
+        val currentChunkZ = floor(camZ / 32.0).toInt()
+        // Dajemy margines +1 względem renderDistance, aby "zszyć" granice widoczności
+        if (abs(cx - currentChunkX) > renderDistance + 1 || abs(cz - currentChunkZ) > renderDistance + 1) return
+
         val chunksToUpdate = java.util.HashSet<Point>() // HashSet zapobiega duplikatom przy wielu blokach
         chunksToUpdate.add(Point(cx, cz))
 
@@ -776,15 +1272,12 @@ class gridMap : JPanel() {
     private fun generateChunk(cx: Int, cz: Int): Chunk {
         // 0. Próba wczytania z dysku
         val loadedChunk = chunkIO.loadChunk(cx, cz)
-        if (loadedChunk != null) {
-            calculateLighting(loadedChunk) // Przeliczamy światło dla wczytanego chunka
-            return loadedChunk
-        }
+        if (loadedChunk != null) return loadedChunk
 
-        val chunk = chunkGenerator.generate(cx, cz)
-        calculateLighting(chunk)
-
-        return chunk
+        // 1. Jeśli nie ma na dysku, generujemy nowy.
+        // UWAGA: Oświetlenie jest liczone przez `refreshChunkData`, które jest wołane zaraz po tej funkcji.
+        // To zapobiega podwójnemu, niepotrzebnemu przeliczaniu światła.
+        return chunkGenerator.generate(cx, cz)
     }
 
     private fun calculateLighting(chunk: Chunk) {
@@ -1226,15 +1719,34 @@ class gridMap : JPanel() {
                                 return
                             }
                             
-                            setBlock(lastX, lastY, lastZ, stack.color)
-                            // Jeśli stawiamy płyn (np. lawę), ustawiamy go jako źródło
+                            // Obliczamy metadane PRZED wysłaniem
+                            var metaToSet: Byte = 0
                             if (fluidBlocks.contains(stack.color)) {
+                                metaToSet = 8 // Źródło płynu
+                            }
+
+                            setBlock(lastX, lastY, lastZ, stack.color)
+                            
+                            // --- MULTIPLAYER: Wyślij postawienie bloku ---
+                            // FIX: Usunięto sprawdzanie GameState.MULTIPLAYER, bo podczas gry jest IN_GAME
+                            if (webRTCManager != null) {
+                                try {
+                                    val packet = NetworkProtocol.encodeBlockChange(lastX, lastY, lastZ, stack.color, metaToSet)
+                                    webRTCManager?.sendData(packet)
+                                    println("MULTIPLAYER TX: Wysłano postawienie bloku: x=$lastX, y=$lastY, z=$lastZ")
+                                } catch (e: Exception) {
+                                    println("Błąd wysyłania bloku: ${e.message}")
+                                }
+                            }
+
+                            // Jeśli stawiamy płyn (np. lawę), ustawiamy go jako źródło
+                            if (metaToSet > 0) {
                                 val cx = if (lastX >= 0) lastX / 16 else (lastX + 1) / 16 - 1
                                 val cz = if (lastZ >= 0) lastZ / 16 else (lastZ + 1) / 16 - 1
                                 chunks[Point(cx, cz)]?.let {
                                     var lx = lastX % 16; if (lx < 0) lx += 16
                                     var lz = lastZ % 16; if (lz < 0) lz += 16
-                                    it.setMeta(lx, lastY, lz, 8)
+                                    it.setMeta(lx, lastY, lz, metaToSet.toInt())
                                 }
                             }
                             consumeCurrentItem()
@@ -1256,6 +1768,18 @@ class gridMap : JPanel() {
                     if (rawBlock != 0) addItem(rawBlock.toString())
 
                     setBlock(x, y, z, 0)
+                    
+                    // --- MULTIPLAYER: Wyślij zniszczenie bloku (kolor 0) ---
+                    // FIX: Usunięto sprawdzanie GameState.MULTIPLAYER
+                    if (webRTCManager != null) {
+                        try {
+                            val packet = NetworkProtocol.encodeBlockChange(x, y, z, 0, 0) // Meta 0 dla powietrza
+                            webRTCManager?.sendData(packet)
+                            println("MULTIPLAYER TX: Wysłano zniszczenie bloku: x=$x, y=$y, z=$z")
+                        } catch (e: Exception) {
+                            println("Błąd wysyłania zniszczenia bloku: ${e.message}")
+                        }
+                    }
                 }
 
                 // Aktualizujemy tylko chunk, w którym zaszła zmiana
@@ -1345,6 +1869,13 @@ class gridMap : JPanel() {
 
     // Generuje mesh tylko dla jednego chunka
     private fun updateChunkMesh(cx: Int, cz: Int) {
+        // OPTYMALIZACJA: Nie generuj mesha dla chunków, które są za daleko.
+        // Jeśli gracz szybko się przemieszcza, wątek tła może próbować meshować stare chunki - blokujemy to.
+        val currentChunkX = floor(camX / 32.0).toInt()
+        val currentChunkZ = floor(camZ / 32.0).toInt()
+        // Margines +1 dla płynnego ładowania krawędzi
+        if (abs(cx - currentChunkX) > renderDistance + 1 || abs(cz - currentChunkZ) > renderDistance + 1) return
+
         val chunk = chunks[Point(cx, cz)] ?: return
         // 4x4x4 = 4 sekcje X * 32 sekcje Y * 4 sekcje Z = 512 sekcji
         val sections = Array(512) { mutableListOf<Triangle3d>() }
@@ -1858,22 +2389,29 @@ class gridMap : JPanel() {
                 // UI Tick - niezależny od stanu gry (działa w Menu, Pauzie i Grze)
                 modLoader.notifyTickUI()
 
-                if (gameState == GameState.IN_GAME) {
+                val isMultiplayer = isHost || isMultiplayerClient
+
+                if (gameState == GameState.IN_GAME || (gameState == GameState.PAUSED && isMultiplayer)) {
                     delta += elapsedNs / nsPerTick
 
                     // --- AUTO SAVE (Co 15 sekund) ---
                     if (System.currentTimeMillis() - lastAutoSaveTime > 15000) {
-                        var savedCount = 0
-                        chunks.values.forEach { chunk ->
-                            if (chunk.modified) {
-                                chunkIO.saveChunk(chunk)
-                                chunk.modified = false // Resetujemy flagę, bo na dysku jest już aktualna wersja
-                                savedCount++
-                            }
-                        }
-                        chunkIO.saveWorldData(WorldData(seed, camX, camY, camZ, yaw, pitch, debugNoclip, debugFly, debugFullbright, showChunkBorders, debugXray, gameTime, dayCounter))
-                        if (savedCount > 0) println("Auto-saved $savedCount chunks.")
                         lastAutoSaveTime = System.currentTimeMillis()
+                        // FIX: Auto-save w tle, aby nie blokować wątku sieciowego i gry
+                        chunkExecutor.submit {
+                            var savedCount = 0
+                            // Tworzymy kopię wartości, aby uniknąć ConcurrentModificationException, 
+                            // choć ConcurrentHashMap jest bezpieczna, iteracja po niej może być kosztowna.
+                            chunks.values.forEach { chunk ->
+                                if (chunk.modified) {
+                                    chunkIO.saveChunk(chunk)
+                                    chunk.modified = false
+                                    savedCount++
+                                }
+                            }
+                            chunkIO.saveWorldData(WorldData(seed, camX, camY, camZ, yaw, pitch, debugNoclip, debugFly, debugFullbright, showChunkBorders, debugXray, gameTime, dayCounter))
+                            if (savedCount > 0) println("Auto-saved $savedCount chunks (Background).")
+                        }
                     }
 
                     // --- DAY/NIGHT CYCLE ---
@@ -1902,12 +2440,55 @@ class gridMap : JPanel() {
                     if (delta > 10) delta = 10.0
 
                     while (delta >= 1) {
+                        // Przetwarzamy wszystkie akcje sieciowe zakolejkowane od ostatniego ticka
+                        while(true) {
+                            val action = networkActionQueue.poll() ?: break
+                            try {
+                                action.invoke()
+                            } catch (e: Exception) {
+                                println("Błąd podczas przetwarzania pakietu sieciowego: ${e.message}")
+                                e.printStackTrace()
+                            }
+                        }
+
                         processInput()
                         processSingleInput()
                         updateWorld()
                         cloudOffset += 1.0 / 30.0
                         gameTicks++
                         simulateFluids(gameTicks)
+                        
+                        // --- MULTIPLAYER SEND ---
+                        // Wysyłamy pozycję co 2 ticki (15 razy na sek)
+                        if (gameTicks % 2 == 0L && webRTCManager != null) {
+                            try {
+                                // Używamy nowego protokołu (15 bajtów zamiast 24+)
+                                val packet = NetworkProtocol.encodePlayerPosition(myPlayerId, camX, camY, camZ, yaw, pitch)
+                                webRTCManager?.sendData(packet)
+                            } catch (e: Exception) {
+                                // Ignorujemy błędy pozycji, nie są krytyczne
+                            }
+                        }
+
+                        // --- HOST LOGIC ---
+                        if (isHost && webRTCManager != null) {
+                            // 1. Aktualizuj kolejkę chunków wokół graczy
+                            if (gameTicks % 30 == 0L) chunkStreamer.updateQueues() // Co sekundę sprawdzaj pozycje
+                            
+                            // 2. Wyślij dane świata (Time/Seed) co sekundę
+                            if (gameTicks % 30 == 0L) {
+                                try {
+                                    val worldPacket = NetworkProtocol.encodeWorldData(seed, gameTime, dayCounter)
+                                    webRTCManager?.sendData(worldPacket)
+                                } catch (e: Exception) {
+                                    println("Błąd wysyłania danych świata: ${e.message}")
+                                }
+                            }
+                        }
+                        
+                        // Obsługa wysyłania chunków (jeśli jesteśmy hostem i mamy coś w kolejce)
+                        chunkStreamer.tick()
+                        
                         modLoader.notifyTick()
                         delta--
                         inputManager.resetFrameState()
@@ -2111,8 +2692,9 @@ class gridMap : JPanel() {
     }
 
     private fun render3D() {
-        val opaqueTrianglesToRaster = mutableListOf<Triangle3d>()
-        val transparentTrianglesToRaster = mutableListOf<Triangle3d>()
+        // Optymalizacja: Czyścimy listy zamiast alokować nowe
+        opaqueTrianglesToRaster.clear()
+        transparentTrianglesToRaster.clear()
         // Obliczamy sin/cos raz na klatkę, zamiast dla każdego wierzchołka!
         cosYaw = cos(yaw)
         sinYaw = sin(yaw)
@@ -2307,6 +2889,26 @@ class gridMap : JPanel() {
 
         if (debugXray) {
             renderXRay()
+        }
+
+        // --- RENDER REMOTE PLAYERS ---
+        remotePlayers.forEach { (id, player) ->
+            if (id == myPlayerId) return@forEach // Nie rysuj siebie
+
+            // Proste renderowanie gracza jako pudełka (hitboxa)
+            // W przyszłości podmień to na model 3D
+            val pPos = BlockPos(
+                (floor((player.x + (cubeSize/2))/2)).toInt(),
+                (floor((player.y + (cubeSize/2))/2)+5).toInt(),
+                (floor((player.z + (cubeSize/2))/2)).toInt()
+            )
+            val pPos2 = BlockPos(
+                (floor((player.x + (cubeSize/2))/2)).toInt(),
+                (floor((player.y + (cubeSize/2))/2)+4).toInt(),
+                (floor((player.z + (cubeSize/2))/2)).toInt()
+            )
+            drawSelectionBox(pPos)
+            drawSelectionBox(pPos2)
         }
 
         // --- MOD HOOK: 3D Rendering ---
@@ -3459,7 +4061,7 @@ class gridMap : JPanel() {
                     if (debugFullbright) FullbrightFactor = 1.0 else FullbrightFactor = 0.0
                     println("DebugFullbright: $debugFullbright")
                 }
-                if (keyCode == KeyEvent.VK_V) {
+                if (keyCode == KeyEvent.VK_F3) {
                     showChunkBorders = !showChunkBorders
                 }
                 if (keyCode == KeyEvent.VK_X) {
@@ -3549,12 +4151,15 @@ class gridMap : JPanel() {
         // Obsługa ciągłego niszczenia/stawiania bloków
         val currentTime = System.currentTimeMillis()
         if (currentTime - lastActionTime > actionDelay) {
-            if (inputManager.isLeftMouseDown) {
-                raycastAction(false)
-                lastActionTime = currentTime
-            } else if (inputManager.isRightMouseDown) {
-                raycastAction(true)
-                lastActionTime = currentTime
+            // FIX: Pozwól na akcję tylko gdy myszka jest złapana (unikamy niszczenia przy braku fokusu)
+            if (inputManager.isMouseCaptured) {
+                if (inputManager.isLeftMouseDown) {
+                    raycastAction(false)
+                    lastActionTime = currentTime
+                } else if (inputManager.isRightMouseDown) {
+                    raycastAction(true)
+                    lastActionTime = currentTime
+                }
             }
         }
 
@@ -3623,6 +4228,17 @@ class gridMap : JPanel() {
             velocityY -= gravity
             // Ograniczenie prędkości spadania (terminal velocity)
             if (velocityY < -1.5) velocityY = -1.5
+
+            // --- FIX: Zabezpieczenie przed spadaniem w void (Multiplayer) ---
+            if (isMultiplayerClient) {
+                val chunkUnderFeet = chunks[Point(floor(camX / 32.0).toInt(), floor(camZ / 32.0).toInt())]
+                if (chunkUnderFeet == null) {
+                    // Jeśli chunka pod nami nie ma, wyłączamy grawitację (lewitacja)
+                    velocityY = 0.0
+                    // Opcjonalnie: Stopujemy też ruch poziomy, żeby nie wbiec w niezaładowany teren
+                    // dx = 0.0; dz = 0.0 
+                }
+            }
 
             // 5. Aplikowanie ruchu pionowego z fizyką
             val nextY = camY + velocityY
@@ -3775,7 +4391,35 @@ class gridMap : JPanel() {
     }
 }
 
-fun main() {
+fun main(args: Array<String>) {
+    // --- AUTO-RESTART MEMORY HACK ---
+    // Sprawdzamy, czy mamy przydzielone mniej niż 900MB (celujemy w 1024MB)
+    val maxMem = Runtime.getRuntime().maxMemory()
+    val isLowMemory = maxMem < 900L * 1024 * 1024
+
+    // Pobieramy ścieżkę do aktualnego pliku JAR
+    val location = gridMap::class.java.protectionDomain.codeSource.location
+    val currentFile = File(location.toURI())
+
+    // Jeśli to jest plik .jar (a nie uruchomienie z IDE) i mamy za mało pamięci -> Restartujemy
+    if (currentFile.isFile && currentFile.name.endsWith(".jar", ignoreCase = true) && isLowMemory) {
+        val javaBin = System.getProperty("java.home") + File.separator + "bin" + File.separator + "java"
+        
+        val command = ArrayList<String>()
+        command.add(javaBin)
+        command.add("-Xmx1024m")
+        command.add("-Xms512m")
+        command.add("-XX:+UseZGC")
+        command.add("-XX:+ZGenerational")
+        command.add("-jar")
+        command.add(currentFile.absolutePath)
+        command.addAll(args)
+
+        println("Wykryto niski limit pamięci (${maxMem / 1024 / 1024} MB). Restartowanie z parametrami: -Xmx1024m...")
+        ProcessBuilder(command).start()
+        System.exit(0)
+    }
+
     SwingUtilities.invokeLater {
         val frame = JFrame("gridMap")
         frame.iconImage = Toolkit.getDefaultToolkit().getImage(gridMap::class.java.getResource("/icons/GridMap.png"))
