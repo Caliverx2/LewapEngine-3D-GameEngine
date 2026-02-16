@@ -17,6 +17,9 @@ class SignalingClient(
 ) {
     private val client = HttpClient(CIO) {
         install(WebSockets)
+        install(WebSockets) {
+            pingInterval = 15_000 // 15 seconds keep-alive ping
+        }
     }
     // Osobny scope dla sieci, żeby nie blokować wątku gry
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())

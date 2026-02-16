@@ -15,7 +15,9 @@ import kotlin.random.Random
 // Struktura pokoju w pamięci serwera
 data class GameRoom(
     val hostSession: DefaultWebSocketServerSession,
-    var clientSession: DefaultWebSocketServerSession? = null
+    val hostId: String,
+    // Lista klientów (graczy) w pokoju. Klucz to unikalne ID sesji (np. hash).
+    val clients: ConcurrentHashMap<String, DefaultWebSocketServerSession> = ConcurrentHashMap()
 )
 
 // Mapa: Kod Pokoju -> Obiekt Pokoju
@@ -38,6 +40,8 @@ fun Application.module() {
         webSocket("/signaling") {
             // Zmienna przechowująca kod pokoju przypisany do tej konkretnej sesji WebSocket
             var currentRoomCode: String? = null
+            // ID tej sesji (używane do identyfikacji gracza)
+            val mySessionId = this.hashCode().toString()
 
             try {
                 for (frame in incoming) {
@@ -56,11 +60,11 @@ fun Application.module() {
                             // --- 1. Host tworzy pokój ---
                             is SignalingMessage.CreateRoom -> {
                                 val newCode = generateUniqueCode()
-                                val room = GameRoom(hostSession = this)
+                                val room = GameRoom(hostSession = this, hostId = mySessionId)
                                 rooms[newCode] = room
                                 currentRoomCode = newCode
 
-                                println("Utworzono pokój: $newCode")
+                                println("Utworzono pokój: $newCode (Host: $mySessionId)")
                                 sendSerialized(SignalingMessage.RoomCreated(newCode))
                             }
 
@@ -68,40 +72,79 @@ fun Application.module() {
                             is SignalingMessage.JoinRoom -> {
                                 val room = rooms[message.roomCode]
                                 if (room != null) {
-                                    if (room.clientSession == null) {
-                                        room.clientSession = this
-                                        currentRoomCode = message.roomCode
+                                    // Dodajemy klienta do listy
+                                    room.clients[mySessionId] = this
+                                    currentRoomCode = message.roomCode
 
-                                        println("Klient dołączył do pokoju: ${message.roomCode}")
+                                    println("Klient dołączył do pokoju: ${message.roomCode} (ID: $mySessionId)")
 
-                                        // Powiadom hosta, że ktoś wszedł (Host zacznie WebRTC Offer)
-                                        // Generujemy tymczasowe ID dla klienta (np. hash sesji)
-                                        val clientId = this.hashCode().toString()
-                                        room.hostSession.sendSerialized(SignalingMessage.PlayerJoined(clientId))
-                                    } else {
-                                        sendSerialized(SignalingMessage.Error("Pokój jest pełny."))
-                                    }
+                                    // Powiadom hosta, że ktoś wszedł (Host zacznie WebRTC Offer dla tego konkretnego gracza)
+                                    room.hostSession.sendSerialized(SignalingMessage.PlayerJoined(mySessionId))
                                 } else {
                                     sendSerialized(SignalingMessage.Error("Nie znaleziono pokoju o kodzie: ${message.roomCode}"))
                                 }
                             }
 
                             // --- 3. Przekazywanie WebRTC (SDP Offer/Answer/ICE) ---
-                            is SignalingMessage.SdpOffer,
-                            is SignalingMessage.SdpAnswer,
+                            // Teraz musimy wiedzieć DO KOGO wysłać wiadomość (targetId)
+                            is SignalingMessage.SdpOffer -> {
+                                val code = currentRoomCode
+                                if (code != null) {
+                                    val room = rooms[code]
+                                    if (room != null) {
+                                        // Jeśli Host wysyła ofertę -> wysyłamy do konkretnego klienta (targetId)
+                                        if (this == room.hostSession) {
+                                            val targetId = message.targetId
+                                            if (targetId != null) {
+                                                val clientSession = room.clients[targetId]
+                                                // Dodajemy senderId, żeby klient wiedział od kogo (od Hosta)
+                                                clientSession?.sendSerialized(message.copy(senderId = "HOST"))
+                                            }
+                                        } 
+                                        // Jeśli Klient wysyła ofertę (rzadkie, ale możliwe przy renegocjacji) -> do Hosta
+                                        else {
+                                            // Klient zawsze wysyła do Hosta
+                                            room.hostSession.sendSerialized(message.copy(senderId = mySessionId))
+                                        }
+                                    }
+                                }
+                            }
+
+                            is SignalingMessage.SdpAnswer -> {
+                                val code = currentRoomCode
+                                if (code != null) {
+                                    val room = rooms[code]
+                                    if (room != null) {
+                                        // Jeśli Host odpowiada -> do konkretnego klienta
+                                        if (this == room.hostSession) {
+                                            val targetId = message.targetId
+                                            if (targetId != null) {
+                                                val clientSession = room.clients[targetId]
+                                                clientSession?.sendSerialized(message.copy(senderId = "HOST"))
+                                            }
+                                        } 
+                                        // Jeśli Klient odpowiada -> do Hosta
+                                        else {
+                                            room.hostSession.sendSerialized(message.copy(senderId = mySessionId))
+                                        }
+                                    }
+                                }
+                            }
+
                             is SignalingMessage.IceCandidate -> {
                                 val code = currentRoomCode
                                 if (code != null) {
                                     val room = rooms[code]
                                     if (room != null) {
-                                        // Logika "Swatki": Przekaż do drugiego gracza
-                                        val targetSession = if (this == room.hostSession) {
-                                            room.clientSession
+                                        if (this == room.hostSession) {
+                                            val targetId = message.targetId
+                                            if (targetId != null) {
+                                                val clientSession = room.clients[targetId]
+                                                clientSession?.sendSerialized(message.copy(senderId = "HOST"))
+                                            }
                                         } else {
-                                            room.hostSession
+                                            room.hostSession.sendSerialized(message.copy(senderId = mySessionId))
                                         }
-
-                                        targetSession?.sendSerialized(message)
                                     }
                                 }
                             }
@@ -118,19 +161,23 @@ fun Application.module() {
                 if (code != null) {
                     val room = rooms[code]
                     if (room != null) {
-                        // Jeśli rozłączył się Host -> Usuń pokój i wywal klienta
-                        if (this == room.hostSession) {
+                        // Jeśli rozłączył się Host -> Usuń pokój i wywal wszystkich klientów
+                        if (mySessionId == room.hostId) {
                             println("Host wyszedł. Zamykanie pokoju $code")
-                            room.clientSession?.sendSerialized(SignalingMessage.Error("Host zakończył sesję."))
-                            room.clientSession?.close(CloseReason(CloseReason.Codes.NORMAL, "Host left"))
+                            room.clients.values.forEach { client ->
+                                client.sendSerialized(SignalingMessage.Error("Host zakończył sesję."))
+                                client.close(CloseReason(CloseReason.Codes.NORMAL, "Host left"))
+                            }
                             rooms.remove(code)
                         }
-                        // Jeśli rozłączył się Klient -> Powiadom Hosta, zwolnij slot
-                        else if (this == room.clientSession) {
-                            println("Klient wyszedł z pokoju $code")
-                            room.hostSession.sendSerialized(SignalingMessage.Error("Klient się rozłączył."))
-                            room.clientSession = null
-                            // Opcjonalnie: Host może czekać na nowego gracza, więc nie usuwamy pokoju
+                        // Jeśli rozłączył się Klient -> Usuń go z listy i powiadom Hosta
+                        else {
+                            if (room.clients.containsKey(mySessionId)) {
+                                println("Klient wyszedł z pokoju $code (ID: $mySessionId)")
+                                room.clients.remove(mySessionId)
+                                // Opcjonalnie: Można dodać wiadomość PlayerLeft, aby Host usunął gracza z gry
+                                room.hostSession.sendSerialized(SignalingMessage.Error("Gracz $mySessionId się rozłączył."))
+                            }
                         }
                     }
                 }

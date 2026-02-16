@@ -61,12 +61,14 @@ sealed class SignalingMessage {
      * Wysyłana zazwyczaj przez Hosta po otrzymaniu `PlayerJoined`.
      * @param sdp Treść SDP (ciąg znaków opisujący kodeki, media itp.).
      * @param targetId ID odbiorcy (opcjonalne w modelu 1v1, wymagane przy wielu graczach).
+     * @param senderId ID nadawcy (wypełniane przez serwer lub nadawcę).
      */
     @Serializable
     @SerialName("sdp_offer")
     data class SdpOffer(
         val sdp: String,
-        val targetId: String? = null
+        val targetId: String? = null,
+        val senderId: String? = null
     ) : SignalingMessage()
 
     /**
@@ -77,7 +79,8 @@ sealed class SignalingMessage {
     @SerialName("sdp_answer")
     data class SdpAnswer(
         val sdp: String,
-        val targetId: String? = null
+        val targetId: String? = null,
+        val senderId: String? = null
     ) : SignalingMessage()
 
     /**
@@ -90,6 +93,7 @@ sealed class SignalingMessage {
         val candidate: String,
         val sdpMid: String?,
         val sdpMLineIndex: Int?,
-        val targetId: String? = null
+        val targetId: String? = null,
+        val senderId: String? = null
     ) : SignalingMessage()
 }

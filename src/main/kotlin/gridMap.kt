@@ -12,6 +12,9 @@ import javax.swing.*
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
+import java.util.concurrent.PriorityBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 import java.util.Locale.getDefault
 import kotlin.math.sqrt
 import kotlin.math.floor
@@ -37,7 +40,7 @@ data class Triangle3d(
 data class ModelVoxel(val x: Int, val y: Int, val z: Int, val color: Color, val isVoid: Boolean = false)
 
 // Struktura dla innych graczy (Multiplayer)
-data class RemotePlayer(var x: Double, var y: Double, var z: Double, var yaw: Double, var pitch: Double, var lastUpdate: Long = 0)
+data class RemotePlayer(var x: Double, var y: Double, var z: Double, var yaw: Double, var pitch: Double, var lastUpdate: Long = 0, var lastKeepAlive: Long = 0)
 
 // --- Stany gry i elementy UI ---
 enum class GameState {
@@ -45,7 +48,7 @@ enum class GameState {
 }
 
 data class ItemStack(val color: Int, var count: Int)
-data class FluidProperties(val tickRate: Int) // Ile ticków na aktualizację. 30 ticków = 1 sekunda.
+data class FluidProperties(val tickRate: Int, val decayTickRate: Int = (tickRate / 1.5).toInt().coerceAtLeast(1))
 // --- Voxel World Data ---
 data class Chunk(val x: Int, val z: Int) {
     val width = 16
@@ -59,6 +62,7 @@ data class Chunk(val x: Int, val z: Int) {
     // Metadane (np. poziom płynu 0-8)
     val metadata = ByteArray(width * height * depth)
     var modified = false
+    var hasBlocks = false // Optymalizacja: Czy chunk zawiera jakiekolwiek bloki?
 
     fun getIndex(x: Int, y: Int, z: Int): Int = x + width * (z + depth * y)
     fun setBlock(x: Int, y: Int, z: Int, color: Int) {
@@ -72,6 +76,17 @@ data class Chunk(val x: Int, val z: Int) {
     fun getMeta(x: Int, y: Int, z: Int): Int = metadata[getIndex(x, y, z)].toInt()
 }
 
+fun Double.toSmartString(): String {
+    val rawValue = this
+    val rounded = Math.round(rawValue * 10.0) / 10.0
+
+    return if (rounded % 1.0 == 0.0) {
+        rounded.toInt().toString()
+    } else {
+        rounded.toString()
+    }
+}
+
 // --- STRATEGIA OŚWIETLENIA (API) ---
 // To pozwala modom przejąć kontrolę nad tym, jak światło wpływa na kolor piksela.
 interface LightProcessor {
@@ -83,9 +98,12 @@ class gridMap : JPanel() {
     val baseCols = 1920 / downscale
     val baseRows = 1080 / downscale
     val cellSize = downscale/2
-    val cubeSize = 2.0
     val referenceWidth = (baseCols + 1) * cellSize
     val referenceHeight = (baseRows + 1) * cellSize
+    val uiReferenceWidth = 960
+    val uiReferenceHeight = 540
+
+    val cubeSize = 2.0
     var reachDistance = 5.0
     val radiusCollision = 0.3
     val playerHeight = 1.8
@@ -117,6 +135,7 @@ class gridMap : JPanel() {
     var debugFly = false
     var debugFullbright = false
     var showChunkBorders = false
+    var showPlayerList = false
     var velocityY = 0.0
     var isOnGround = false
     var gravity = 0.1
@@ -124,7 +143,10 @@ class gridMap : JPanel() {
 
     var debugXray = false
     val oreColors = ConcurrentHashMap.newKeySet<Int>()
-    
+
+    // Debugowanie płynów - lista wykrytych spadków
+    val debugActiveDrops = ConcurrentHashMap.newKeySet<BlockPos>()
+
     // Zbiór bloków, które mają być ignorowane przez standardowy renderer (bo mod je rysuje sam)
     val customRenderBlocks = ConcurrentHashMap.newKeySet<Int>()
 
@@ -166,24 +188,24 @@ class gridMap : JPanel() {
         BLOCK_ID_LIGHT to 15,
     )
     var minLightFactor = 0.15
-    
+
     // Domyślna implementacja oświetlenia (Vanilla)
     var lightProcessor: LightProcessor = object : LightProcessor {
         override fun process(x: Int, y: Int, z: Int, baseColor: Color, skyLevel: Int, blockLevel: Int, sunIntensity: Double, minLight: Double): Int {
             // Normalizacja poziomów światła (0-15 -> 0.0-1.0)
             val skyIntensity = (skyLevel / 15.0) * sunIntensity
             val blockIntensity = (blockLevel / 15.0)
-            
+
             // Obliczamy jasność (max z nieba i bloku)
             // Tutaj światło bloku jest zawsze białe (mnożnik 1.0)
             val lightStrength = 0.75
             val brightness = (minLight + maxOf(skyIntensity, blockIntensity) * lightStrength).coerceIn(0.0, 1.0)
-            
+
             // Aplikujemy jasność do kanałów RGB
             val r = (baseColor.red * brightness).toInt()
             val g = (baseColor.green * brightness).toInt()
             val b = (baseColor.blue * brightness).toInt()
-            
+
             return (r shl 16) or (g shl 8) or b
         }
     }
@@ -263,6 +285,7 @@ class gridMap : JPanel() {
     val actionDelay = 150 // Opóźnienie w ms (szybkość niszczenia)
     @Volatile var running = true
 
+    var gameFrozen = false
     var gameTicks = 0L
     // Cache dla obliczeń trygonometrycznych
     var cosYaw = 0.0
@@ -289,21 +312,57 @@ class gridMap : JPanel() {
     private val chunksBeingGenerated = ConcurrentHashMap.newKeySet<Point>()
     private val chunksToMeshQueue = ConcurrentLinkedQueue<Point>()
 
+    // Helper class for the priority queue
+    private class PriorityTask(
+        val priority: Int,
+        private val task: Runnable
+    ) : Runnable, Comparable<PriorityTask> {
+        override fun compareTo(other: PriorityTask): Int = other.priority.compareTo(this.priority) // Higher priority value first
+        override fun run() = task.run()
+    }
+
+    // --- Refresh Queue System ---
+    // Zmiana na ThreadPoolExecutor z kolejką priorytetową
+    private val refreshExecutor = ThreadPoolExecutor(
+        1, 1, // core and max pool size
+        0L, TimeUnit.MILLISECONDS, // keepAliveTime
+        PriorityBlockingQueue<Runnable>(), // Używamy kolejki priorytetowej
+        { r -> // ThreadFactory
+            val t = Thread(r, "Chunk-Refresher")
+            t.priority = Thread.MIN_PRIORITY
+            t.isDaemon = true
+            t
+        }
+    )
+    // Zbiór chunków, które już czekają w kolejce (zapobiega duplikatom zadań)
+    private val chunksInRefreshQueue = ConcurrentHashMap.newKeySet<Point>()
+
     // --- Modding System ---
     private var modLoader = ModLoader(this, gameDir)
 
     // --- Multiplayer System ---
     // TUTAJ WPISZ IP SWOJEGO SERWERA SWATKI (z portem, np. 8080)
-    private val SIGNALING_SERVER_URL = "ws://lewapnoob.ddns.net:8080/signaling"//"ws://127.0.0.1:8080/signaling"
+    private val SIGNALING_SERVER_URL = "ws://lewapnoob.ddns.net:8080/signaling"
     private var signalingClient: SignalingClient? = null
-    private var webRTCManager: WebRTCManager? = null
-    // Mapowanie Byte ID -> RemotePlayer. 
-    // W prawdziwej grze potrzebujesz mapy String(UUID) <-> Byte(NetID) uzgadnianej przy wejściu.
-    private val remotePlayers = ConcurrentHashMap<Byte, RemotePlayer>()
-    private var myPlayerId: Byte = 0 // Zmieniono na var, domyślnie 0
-    private var isHost = false // Flaga określająca rolę w sieci
-    private var isMultiplayerClient = false // Flaga dla klienta, aby blokować generowanie świata
-    
+
+    // Mapa: ID Gracza (String) -> WebRTCManager (połączenie P2P)
+    // Host trzyma wiele połączeń (1 per klient). Klient trzyma jedno (do Hosta).
+    private val peerConnections = ConcurrentHashMap<String, WebRTCManager>()
+
+    // Mapowanie NetID (Byte) -> RemotePlayer (pozycja)
+    val remotePlayers = ConcurrentHashMap<Byte, RemotePlayer>()
+
+    // --- FIX: Unique NetID assignment ---
+    // Mapowanie SessionID (String) -> NetID (Byte) (dla Hosta)
+    private val playerNetIds = ConcurrentHashMap<String, Byte>()
+    private var nextNetId: Byte = 2 // Host=1, Start clients from 2
+
+    var myPlayerId: String = "" // Unikalne ID sesji (otrzymane od serwera)
+    var isHost = false // Flaga określająca rolę w sieci
+    var isMultiplayerClient = false // Flaga dla klienta, aby blokować generowanie świata
+    val isMultiplayer: Boolean
+        get() = isHost || isMultiplayerClient
+
     // --- Reconnection System ---
     private var connectionAttempts = 0
     private val maxConnectionAttempts = 5
@@ -316,69 +375,102 @@ class gridMap : JPanel() {
     private val clientChunkRequests = ConcurrentHashMap<Point, Long>()
 
     // Bufor na kandydatów ICE, którzy przyszli zanim zainicjowano WebRTC
-    private val pendingIceCandidates = ConcurrentLinkedQueue<RTCIceCandidate>()
+    // Mapa: ID Gracza -> Kolejka kandydatów
+    private val pendingIceCandidates = ConcurrentHashMap<String, ConcurrentLinkedQueue<RTCIceCandidate>>()
 
     // Kolejka akcji z wątku sieciowego do wykonania na głównym wątku gry
     private val networkActionQueue = ConcurrentLinkedQueue<() -> Unit>()
 
-    inner class ChunkStreamer {
-        private val pendingChunks = ConcurrentLinkedQueue<Point>()
-        private val chunksSent = ConcurrentHashMap.newKeySet<Point>()
+    // Timer do wysyłania listy graczy i keep-alive
+    private var lastPlayerListBroadcast = 0L
+    private var lastKeepAliveSent = 0L
 
-        fun queueChunk(cx: Int, cz: Int, force: Boolean = false) {
+    data class ChunkSectionTask(val cx: Int, val cz: Int, val sectionY: Int)
+
+    inner class ChunkStreamer {
+        // Kolejka sekcji do wysłania dla każdego gracza
+        private val pendingSectionsPerPlayer = ConcurrentHashMap<String, ConcurrentLinkedQueue<ChunkSectionTask>>()
+        // Zbiór wysłanych chunków dla każdego gracza (żeby nie wysyłać duplikatów)
+        private val chunksSentPerPlayer = ConcurrentHashMap<String, ConcurrentHashMap.KeySetView<Point, Boolean>>()
+
+        fun queueChunk(playerId: String, cx: Int, cz: Int, force: Boolean = false) {
             val p = Point(cx, cz)
+            val sentSet = chunksSentPerPlayer.computeIfAbsent(playerId) { ConcurrentHashMap.newKeySet() }
+            val queue = pendingSectionsPerPlayer.computeIfAbsent(playerId) { ConcurrentLinkedQueue() }
+
             if (force) {
-                chunksSent.remove(p) // Pozwalamy na ponowne wysłanie, jeśli klient prosi
+                sentSet.remove(p) // Pozwalamy na ponowne wysłanie
             }
-            if (!chunksSent.contains(p) && !pendingChunks.contains(p)) {
-                pendingChunks.add(p)
+            if (!sentSet.contains(p)) {
+                // Dzielimy chunk na 8 sekcji (128 wysokości / 16) i kolejkujemy je
+                // FIX: Kolejkujemy od góry do dołu (7 downTo 0), aby powierzchnia ładowała się szybciej niż jaskinie.
+                for (y in 7 downTo 0) {
+                    queue.add(ChunkSectionTask(cx, cz, y))
+                }
+                sentSet.add(p) // Oznaczamy chunk jako "w trakcie wysyłania/wysłany"
             }
         }
 
-        // Skanuje graczy i kolejkuje chunki wokół nich
         fun updateQueues() {
             // Host nie musi już zgadywać co wysłać - reaguje na PACKET_CHUNK_REQUEST
         }
 
         fun tick() {
-            // USUNIĘTO: Sztywny limit "co 5 ticków". Teraz wysyłamy tak szybko, jak pozwala łącze.
-            // if (gameTicks % 5 != 0L) return
+            // Iterujemy po wszystkich połączonych graczach
+            peerConnections.forEach { (playerId, rtcManager) ->
+                val queue = pendingSectionsPerPlayer[playerId] ?: return@forEach
 
-            if (webRTCManager == null) return
+                // Pobieramy pozycję gracza do filtrowania kolejki
+                val netId = playerNetIds[playerId]
+                val player = if (netId != null) remotePlayers[netId] else null
 
-            // TARGET BUFFER: Celujemy w ~160KB danych w locie.
-            // Dlaczego?
-            // 1. To rozmiar ok. 1-2 chunków.
-            // 2. Przy uploadzie 5 Mbps (słabe łącze), 160KB opróżnia się w ~0.25s.
-            //    To akceptowalne opóźnienie dla ruchu gracza, który czeka w tej samej kolejce.
-            // 3. Zostawia margines bezpieczeństwa do limitu WebRTC (często 256KB-1MB).
-            val targetBufferFill = 160 * 1024 
-            
-            // Pobieramy aktualny stan bufora
-            var currentBuffered = webRTCManager?.bufferedAmount() ?: 0
+                // TARGET BUFFER: Zmniejszono do 64KB.
+                // 160KB było zbyt agresywne i powodowało zatykanie łącza (ICE Disconnected) przy wysyłaniu innych pakietów.
+                val targetBufferFill = 64 * 1024
+                var currentBuffered = rtcManager.bufferedAmount()
 
-            // Pętla wysyłająca: Dopóki mamy co wysłać I mamy miejsce w rurze
-            while (!pendingChunks.isEmpty() && currentBuffered < targetBufferFill) {
-                val p = pendingChunks.poll()
+                // Optymalizacja: Cache ostatniego chunka, żeby nie pobierać go z mapy/generować 8 razy dla każdej sekcji
+                var lastChunkPos: Point? = null
+                var lastChunk: Chunk? = null
                 
-                // FIX: Jeśli chunka nie ma w RAM (bo Host jest daleko), ładujemy go lub generujemy na żądanie.
-                // Dzięki temu klient dostanie chunk, nawet jeśli Host go nie widzi.
-                val chunk = chunks[p] ?: generateChunk(p.x, p.y)
-                
-                if (chunk != null) {
-                    try {
-                        // FIX: Wysyłamy również metadane!
-                        val packet = NetworkProtocol.encodeChunk(p.x, p.y, chunk.blocks, chunk.metadata)
-                        
-                        // Aktualizujemy lokalny licznik bufora, bo webRTCManager.bufferedAmount()
-                        // może nie zaktualizować się natychmiast po sendData w tej samej milisekundzie.
-                        currentBuffered += packet.remaining()
-                        
-                        webRTCManager?.sendData(packet)
-                        chunksSent.add(p)
-                    } catch (e: Exception) {
-                        println("Błąd wysyłania chunka ${p.x}, ${p.y}: ${e.message}")
-                        // Opcjonalnie: wrzuć z powrotem do kolejki lub zignoruj
+                var sectionsSent = 0
+                val maxSectionsPerTick = 4 // Limit wysyłania sekcji na tick (zapobiega pikom CPU i sieci)
+
+                while (!queue.isEmpty() && currentBuffered < targetBufferFill && sectionsSent < maxSectionsPerTick) {
+                    val task = queue.peek() // Podglądamy zadanie
+                    val p = Point(task.cx, task.cz)
+
+                    // FIX: Pruning kolejki (Teleport Fix).
+                    // Jeśli chunk jest za daleko od gracza (np. po teleporcie), porzucamy go, aby nie blokował nowych, bliższych chunków.
+                    if (player != null) {
+                        val pcx = floor(player.x / 32.0).toInt()
+                        val pcz = floor(player.z / 32.0).toInt()
+                        // Margines +5 dla bezpieczeństwa (żeby nie ucinać krawędzi przy szybkim ruchu)
+                        if (abs(task.cx - pcx) > renderDistance + 5 || abs(task.cz - pcz) > renderDistance + 5) {
+                            queue.poll() // Usuwamy stare zadanie
+                            continue
+                        }
+                    }
+
+                    // Pobieramy chunk (z cache lub z mapy/generatora)
+                    val chunk = if (lastChunkPos == p) lastChunk else (chunks[p] ?: generateChunk(p.x, p.y))
+
+                    if (chunk != null) {
+                        lastChunk = chunk
+                        lastChunkPos = p
+                        try {
+                            // Wysyłamy tylko jedną sekcję
+                            val packet = NetworkProtocol.encodeChunkSection(task.cx, task.cz, task.sectionY, chunk.blocks, chunk.metadata)
+                            currentBuffered += packet.remaining()
+                            rtcManager.sendData(packet)
+                            queue.poll() // Usuwamy zadanie dopiero po sukcesie
+                            sectionsSent++
+                        } catch (e: Exception) {
+                            println("Błąd wysyłania chunka ${p.x}, ${p.y} do $playerId: ${e.message}")
+                            queue.poll() // Usuwamy błędne zadanie, żeby nie blokować kolejki
+                        }
+                    } else {
+                        queue.poll() // Chunk nie istnieje/błąd generowania, pomijamy
                     }
                 }
             }
@@ -390,7 +482,7 @@ class gridMap : JPanel() {
     private var worldList = listOf<String>()
     private var newWorldName = "New World"
     private var newWorldSeed = ""
-    
+
     // UI References for logic
     private var errorTextComponent: UIText? = null
     private var nameFieldComponent: UITextField? = null
@@ -398,6 +490,7 @@ class gridMap : JPanel() {
     private var adressIPFieldComponent: UITextField? = null
     private var codeJoinFieldComponent: UITextField? = null
     private var roomCodeComponent: UIText? = null
+    private var openServerButtonComponent: UIButton? = null
 
     // --- UI System ---
     val uiManager = UIManager(this)
@@ -407,7 +500,7 @@ class gridMap : JPanel() {
     private val transparentTrianglesToRaster = ArrayList<Triangle3d>(5000)
 
     init {
-        preferredSize = Dimension((baseCols + 1) * cellSize, (baseRows + 1) * cellSize)
+        preferredSize = Dimension(uiReferenceWidth, uiReferenceHeight)
         setBackground(Color(113, 144, 225))
         isFocusable = true
 
@@ -418,8 +511,8 @@ class gridMap : JPanel() {
         // Dodajemy obsługę myszy dla menu
         val menuMouseAdapter = object : MouseAdapter() {
             private fun transform(e: java.awt.event.MouseEvent): Point {
-                val sx = width.toDouble() / referenceWidth
-                val sy = height.toDouble() / referenceHeight
+                val sx = width.toDouble() / uiReferenceWidth
+                val sy = height.toDouble() / uiReferenceHeight
                 return Point((e.x / sx).toInt(), (e.y / sy).toInt())
             }
 
@@ -430,7 +523,7 @@ class gridMap : JPanel() {
             override fun mouseMoved(e: java.awt.event.MouseEvent) {
                 handleMenuMouseMove(transform(e))
             }
-            
+
             override fun mousePressed(e: java.awt.event.MouseEvent) {
                 if (gameState != GameState.IN_GAME) {
                     val p = transform(e)
@@ -465,7 +558,7 @@ class gridMap : JPanel() {
                 uiManager.handleScroll(e.wheelRotation)
             }
         }
-        
+
         // Dodajemy obsługę klawiatury dla UI
         addKeyListener(object : KeyAdapter() {
             override fun keyPressed(e: KeyEvent) {
@@ -486,18 +579,18 @@ class gridMap : JPanel() {
         // --- Main Menu ---
         val mainMenu = uiManager.getPanel(GameState.MAIN_MENU)
         mainMenu.add(UIBackground(Color(30, 30, 30)))
-        mainMenu.add(UIText(baseCols*2, 60, "KapeLuż", 96f, Color.YELLOW, true))
-        
-        mainMenu.add(UIButton(baseCols*2 - 200, 250, 400, 50, "Singleplayer") {
+        mainMenu.add(UIText(uiReferenceWidth/2, 60, "KapeLuż", 96f, Color.YELLOW, true))
+
+        mainMenu.add(UIButton(uiReferenceWidth/2 - 200, 250, 400, 50, "Singleplayer") {
             gameState = GameState.WORLD_SELECTION
             updateWorldList()
         }) //280
-        mainMenu.add(UIButton(baseCols*2 - 200, 320, 400, 50, "Multiplayer") {
+        mainMenu.add(UIButton(uiReferenceWidth/2 - 200, 320, 400, 50, "Multiplayer") {
             gameState = GameState.MULTIPLAYER
         })
-        mainMenu.add(UIButton(baseCols*2 - 200, 390, 400, 50, "Options...") {
+        mainMenu.add(UIButton(uiReferenceWidth/2 - 200, 390, 400, 50, "Options...") {
         }.apply { isEnabled = false })
-        mainMenu.add(UIButton(baseCols*2 - 200, 460, 400, 50, "Quit Game") {
+        mainMenu.add(UIButton(uiReferenceWidth/2 - 200, 460, 400, 50, "Quit Game") {
             running = false
             exitProcess(0)
         })
@@ -506,7 +599,7 @@ class gridMap : JPanel() {
         val iconStream = javaClass.getResourceAsStream("/iconsGUI/reload.png")
         val iconRefresh = if (iconStream != null) ImageIO.read(iconStream) else null
 
-        mainMenu.add(UIButton(baseCols * 4 - 60, baseRows * 4 - 60, 50, 50, "", iconRefresh, tooltip = "Reload Mods") {
+        mainMenu.add(UIButton(uiReferenceWidth - 60, uiReferenceHeight - 60, 50, 50, "", iconRefresh, tooltip = "Reload Mods") {
             println("Reloading mods...")
             modLoader = ModLoader(this, gameDir)
             modLoader.loadMods()
@@ -516,67 +609,64 @@ class gridMap : JPanel() {
         // Initial setup, content populated in updateWorldList
         val worldSelection = uiManager.getPanel(GameState.WORLD_SELECTION)
         worldSelection.add(UIBackground(Color(30, 30, 30)))
-        
+
         // --- Pause Menu ---
         val pauseMenu = uiManager.getPanel(GameState.PAUSED)
         // Overlay background handled in render (or add semi-transparent background here)
         pauseMenu.add(UIBackground(Color(0, 0, 0, 150)))
-        pauseMenu.add(UIButton(baseCols*2 - 200 - 10, baseRows*2 - 130, 420, 50, "Back to game") {
+        pauseMenu.add(UIButton(uiReferenceWidth/2 - 200 - 10, uiReferenceHeight/2 - 130, 420, 50, "Back to game") {
             gameState = GameState.IN_GAME
             inputManager.captureMouse()
         })
 
         // Komponent do wyświetlania kodu pokoju
-        roomCodeComponent = UIText(baseCols*2, baseRows*2 - 180, "", 48f, Color.GREEN, true)
+        roomCodeComponent = UIText(uiReferenceWidth/2, uiReferenceHeight/2 - 180, "", 48f, Color.GREEN, true)
         pauseMenu.add(roomCodeComponent!!)
 
-        pauseMenu.add(UIButton(baseCols*2 - 200 - 10, baseRows*2 - 50 - 15, 200 - 7 + 10, 50, "Advancements", fontSize = 28f) {
+        pauseMenu.add(UIButton(uiReferenceWidth/2 - 200 - 10, uiReferenceHeight/2 - 50 - 15, 200 - 7 + 10, 50, "Advancements", fontSize = 28f) {
         }.apply { isEnabled = false })
-        pauseMenu.add(UIButton(baseCols*2 + 15 - 7, baseRows*2 - 50 - 15, 200 - 7 + 10, 50, "Statistics", fontSize = 28f) {
+        pauseMenu.add(UIButton(uiReferenceWidth/2 + 15 - 7, uiReferenceHeight/2 - 50 - 15, 200 - 7 + 10, 50, "Statistics", fontSize = 28f) {
         }.apply { isEnabled = false })
-        pauseMenu.add(UIButton(baseCols*2 - 200 - 10, baseRows*2 + 15, 200 - 7 + 10, 50, "Options...", fontSize = 28f) {
+        pauseMenu.add(UIButton(uiReferenceWidth/2 - 200 - 10, uiReferenceHeight/2 + 15, 200 - 7 + 10, 50, "Options...", fontSize = 28f) {
         }.apply { isEnabled = false })
-        pauseMenu.add(UIButton(baseCols*2 + 15 - 7, baseRows*2 + 15, 200 - 7 + 10, 50, "Open Server", fontSize = 28f) {
+
+        openServerButtonComponent = UIButton(uiReferenceWidth/2 + 15 - 7, uiReferenceHeight/2 + 15, 200 - 7 + 10, 50, "Open Server", fontSize = 28f) {
             // 1. Inicjalizacja klienta sygnalizacyjnego
             signalingClient = SignalingClient(SIGNALING_SERVER_URL,
-                onConnect = {
-                    signalingClient?.send(SignalingMessage.CreateRoom)
-                },
+                onConnect = { signalingClient?.send(SignalingMessage.CreateRoom) },
                 onMessage = { msg -> handleSignalingMessage(msg) }
             )
             signalingClient?.connect()
             println("Łączenie z serwerem w celu utworzenia pokoju...")
-        })
+        }
+        pauseMenu.add(openServerButtonComponent!!)
 
-        pauseMenu.add(UIButton(baseCols*2 - 200 - 10, baseRows*2 + 15 + 50 + 15, 420, 50, "Save and quit") {
-            isDisconnectingIntentional = true
-            isMultiplayerClient = false
-            isHost = false
+        pauseMenu.add(UIButton(uiReferenceWidth/2 - 200 - 10, uiReferenceHeight/2 + 15 + 50 + 15, 420, 50, "Save and quit") {
             saveAndExitToMenu()
         })
 
         // --- Create World Menu ---
         val createWorld = uiManager.getPanel(GameState.CREATE_WORLD)
         createWorld.add(UIBackground(Color(30, 30, 30)))
-        createWorld.add(UIText(baseCols*2, 6, "Create New World", 32f, Color.WHITE, true))
-        
-        createWorld.add(UIText(baseCols*2 - 200, 60, "World Name:", 12f, Color.LIGHT_GRAY))
-        nameFieldComponent = UITextField(baseCols*2 - 200, 80, 400, 40, "New World")
+        createWorld.add(UIText(uiReferenceWidth/2, 6, "Create New World", 32f, Color.WHITE, true))
+
+        createWorld.add(UIText(uiReferenceWidth/2 - 200, 60, "World Name:", 12f, Color.LIGHT_GRAY))
+        nameFieldComponent = UITextField(uiReferenceWidth/2 - 200, 80, 400, 40, "New World")
         createWorld.add(nameFieldComponent!!)
-        
-        createWorld.add(UIText(baseCols*2 - 200, 130, "Seed (optional)", 12f, Color.LIGHT_GRAY))
-        seedFieldComponent = UITextField(baseCols*2 - 200, 150, 400, 40, "")
+
+        createWorld.add(UIText(uiReferenceWidth/2 - 200, 130, "Seed (optional)", 12f, Color.LIGHT_GRAY))
+        seedFieldComponent = UITextField(uiReferenceWidth/2 - 200, 150, 400, 40, "")
         createWorld.add(seedFieldComponent!!)
-        
-        errorTextComponent = UIText(baseCols*2, 400, "", 24f, Color.RED, true)
+
+        errorTextComponent = UIText(uiReferenceWidth/2, 400, "", 24f, Color.RED, true)
         createWorld.add(errorTextComponent!!)
-        
-        createWorld.add(UIButton(baseCols*2 - 415, 460, 400, 50, "Create World") {
+
+        createWorld.add(UIButton(uiReferenceWidth/2 - 415, 460, 400, 50, "Create World") {
             newWorldName = nameFieldComponent?.text ?: "New World"
             newWorldSeed = seedFieldComponent?.text ?: ""
             tryCreateWorld()
         })
-        createWorld.add(UIButton(baseCols*2 + 15, 460, 400, 50, "Cancel") {
+        createWorld.add(UIButton(uiReferenceWidth/2 + 15, 460, 400, 50, "Cancel") {
             // Jeśli nie ma żadnych światów, "Cancel" cofa do Menu Głównego, a nie do pustej listy
             if (listWorlds().isEmpty()) {
                 gameState = GameState.MAIN_MENU
@@ -588,17 +678,17 @@ class gridMap : JPanel() {
         // --- Multiplayer Menu ---
         val multiplayer = uiManager.getPanel(GameState.MULTIPLAYER)
         multiplayer.add(UIBackground(Color(30, 30, 30)))
-        multiplayer.add(UIText(baseCols*2, 6, "Play Multiplayer", 32f, Color.WHITE, true))
+        multiplayer.add(UIText(uiReferenceWidth/2, 6, "Play Multiplayer", 32f, Color.WHITE, true))
 
-        multiplayer.add(UIText(baseCols*2 - 200, 60, "IP Address:", 12f, Color.LIGHT_GRAY))
-        adressIPFieldComponent = UITextField(baseCols*2 - 200, 80, 400, 40, "")
+        multiplayer.add(UIText(uiReferenceWidth/2 - 200, 60, "IP Address:", 12f, Color.LIGHT_GRAY))
+        adressIPFieldComponent = UITextField(uiReferenceWidth/2 - 200, 80, 400, 40, "")
         multiplayer.add(adressIPFieldComponent!!)
 
-        multiplayer.add(UIText(baseCols*2 - 200, 130, "JOIN CODE:", 12f, Color.LIGHT_GRAY))
-        codeJoinFieldComponent = UITextField(baseCols*2 - 200, 150, 400, 40, "")
+        multiplayer.add(UIText(uiReferenceWidth/2 - 200, 130, "JOIN CODE:", 12f, Color.LIGHT_GRAY))
+        codeJoinFieldComponent = UITextField(uiReferenceWidth/2 - 200, 150, 400, 40, "")
         multiplayer.add(codeJoinFieldComponent!!)
 
-        multiplayer.add(UIButton(baseCols*2 - 415, 460, 400, 50, "Join Server") {
+        multiplayer.add(UIButton(uiReferenceWidth/2 - 415, 460, 400, 50, "Join Server") {
             var ipHere = false
             var codeHere = false
             if (adressIPFieldComponent?.text?.isNotEmpty() == true) ipHere = true
@@ -610,13 +700,13 @@ class gridMap : JPanel() {
             }
             if (!ipHere && codeHere) {
                 val code = codeJoinFieldComponent?.text ?: ""
-                
+
                 // Reset licznika i start łączenia z retry
                 connectionAttempts = 0
                 connectWithRetry(code)
             }
         })
-        multiplayer.add(UIButton(baseCols*2 + 15, 460, 400, 50, "Cancel") {
+        multiplayer.add(UIButton(uiReferenceWidth/2 + 15, 460, 400, 50, "Cancel") {
             signalingClient?.close() // Zamykamy połączenie, jeśli anulujemy w menu
             gameState = GameState.MAIN_MENU
         })
@@ -626,6 +716,7 @@ class gridMap : JPanel() {
         hud.add(UICrosshair())
         hud.add(UIFpsCounter())
         hud.add(UIDebugInfo())
+        hud.add(UIPlayerList())
         hud.add(UIInventory())
     }
 
@@ -633,7 +724,6 @@ class gridMap : JPanel() {
     private fun connectWithRetry(code: String) {
         connectionAttempts++
         // Resetujemy flagę intencji przy każdej próbie połączenia (chyba że właśnie wychodzimy, ale wtedy ta funkcja nie powinna być wołana)
-        isDisconnectingIntentional = false
 
         println("Próba połączenia $connectionAttempts/$maxConnectionAttempts...")
 
@@ -676,15 +766,15 @@ class gridMap : JPanel() {
 
         val panel = uiManager.getPanel(GameState.WORLD_SELECTION)
         panel.clear()
-        
+
         panel.add(UIBackground(Color(30, 30, 30)))
-        panel.add(UIText(baseCols*2, 6, "Select World", 32f, Color.WHITE, true))
+        panel.add(UIText(uiReferenceWidth/2, 6, "Select World", 32f, Color.WHITE, true))
 
         // Tworzymy ScrollPanel dla listy światów
         // Pozycja Y: 70, Wysokość: do 450 (zostawiamy miejsce na dolne przyciski)
         val listHeight = 380
-        val scrollPanel = UIScrollPanel(baseCols*2 - 210, 70, 420, listHeight)
-        
+        val scrollPanel = UIScrollPanel(uiReferenceWidth/2 - 210, 70, 420, listHeight)
+
         var currentY = 0 // Relatywne Y wewnątrz scroll panelu
         worldList.forEach { worldName ->
             // Dodajemy przyciski do scroll panelu (x=0 oznacza lewą krawędź scroll panelu)
@@ -694,11 +784,11 @@ class gridMap : JPanel() {
             currentY += 50
         }
         panel.add(scrollPanel)
-        
-        panel.add(UIButton(baseCols*2 - 415, 460, 400, 50, "Create New World") {
+
+        panel.add(UIButton(uiReferenceWidth/2 - 415, 460, 400, 50, "Create New World") {
             showCreateWorldMenu()
         })
-        panel.add(UIButton(baseCols*2 + 15, 460, 400, 50, "Back") {
+        panel.add(UIButton(uiReferenceWidth/2 + 15, 460, 400, 50, "Back") {
             gameState = GameState.MAIN_MENU
         })
     }
@@ -744,6 +834,17 @@ class gridMap : JPanel() {
         startGame(name)
     }
 
+    private fun sendDisconnectPacket() {
+        if (peerConnections.isNotEmpty()) {
+            try {
+                val packet = NetworkProtocol.encodeDisconnect()
+                peerConnections.forEach { (_, rtc) -> rtc.sendData(packet) }
+            } catch (e: Exception) {
+                println("Błąd wysyłania pakietu rozłączenia: ${e.message}")
+            }
+        }
+    }
+
     private fun saveAndExitToMenu() {
         println("Saving modified chunks...")
         chunks.values.filter { it.modified }.forEach { chunk ->
@@ -755,10 +856,15 @@ class gridMap : JPanel() {
 
         // FIX: Ustawiamy flagę, że to my zamykamy połączenie, aby connectWithRetry nie próbował łączyć ponownie
         isDisconnectingIntentional = true
-        
+        sendDisconnectPacket() // Wyślij info o wyjściu
+
         signalingClient?.close() // Zamykamy połączenie dopiero przy wyjściu do menu
+        if (isMultiplayer) {
+            if (isHost) {
+                gameState = GameState.WORLD_SELECTION
+            } else gameState = GameState.MULTIPLAYER
+        } else gameState = GameState.WORLD_SELECTION
         resetGame()
-        gameState = GameState.WORLD_SELECTION
         updateWorldList()
     }
 
@@ -779,10 +885,8 @@ class gridMap : JPanel() {
         inputManager.resetInputState()
 
         // Reset WebRTC
-        // Ważne: Czyścimy menedżera i bufor, aby przy ponownym dołączaniu
-        // kandydaci nie trafiali do starej instancji lub w próżnię.
-        // webRTCManager?.close() // Odkomentuj jeśli masz metodę close/dispose
-        webRTCManager = null
+        peerConnections.values.forEach { it.close() }
+        peerConnections.clear()
         pendingIceCandidates.clear()
 
         // Reset debug flags
@@ -791,17 +895,23 @@ class gridMap : JPanel() {
         debugFullbright = false
         FullbrightFactor = 0.0
         showChunkBorders = false
+        showPlayerList = false
+        gameFrozen = false
         debugXray = false
+        oreColors.clear()
         remotePlayers.clear()
+        playerNetIds.clear()
+        nextNetId = 2 // Reset licznika ID przy restarcie gry
+        myPlayerId = ""
+        isHost = false
         isMultiplayerClient = false
         isDisconnectingIntentional = false // Reset flagi przy restarcie gry
         roomCodeComponent?.text = "" // Reset kodu przy restarcie
-        // signalingClient?.close() // USUNIĘTO: Nie zamykamy tutaj, bo startGame() tego używa!
     }
 
     private fun startGame(worldName: String, isClient: Boolean = false) {
         resetGame()
-        
+
         // FIX: Jeśli jesteśmy klientem, usuwamy stary zapis sesji multiplayer, aby uniknąć kolizji chunków
         if (isClient) {
             val sessionDir = File(gameDir, "saves/$worldName")
@@ -810,7 +920,7 @@ class gridMap : JPanel() {
 
         // Inicjalizacja specyficzna dla świata
         chunkIO = ChunkIO(worldName)
-        
+
         val worldData = chunkIO.loadWorldData()
         if (worldData != null) {
             seed = worldData.seed
@@ -833,6 +943,10 @@ class gridMap : JPanel() {
 
         noise = PerlinNoise(seed)
         chunkGenerator = ChunkGenerator(seed, oreColors)
+
+        if (!isClient) {
+            chunkGenerator.generate(0, 0) //na potrzeby oreColors
+        }
 
         if (worldData == null) {
             val spawnH = chunkGenerator.getTerrainHeight(0, 0)
@@ -880,42 +994,58 @@ class gridMap : JPanel() {
             is SignalingMessage.RoomCreated -> {
                 println("Pokój utworzony! KOD: ${msg.roomCode}")
                 roomCodeComponent?.text = "CODE: ${msg.roomCode}"
+                isHost = true
             }
             is SignalingMessage.PlayerJoined -> {
                 println("Gracz dołączył: ${msg.playerId}")
-                // Host inicjuje WebRTC po dołączeniu gracza
-                initWebRTC(isHost = true)
+                // Assign NetID
+                playerNetIds.computeIfAbsent(msg.playerId) { nextNetId++ }
+                // Host inicjuje WebRTC dla każdego nowego gracza
+                initWebRTC(targetId = msg.playerId, isHost = true)
             }
             is SignalingMessage.SdpOffer -> {
-                println("Otrzymano ofertę SDP. Dołączanie do gry...")
-                // Klient startuje grę i WebRTC po otrzymaniu oferty
+                println("Otrzymano ofertę SDP od ${msg.senderId}.")
+                // Klient startuje grę i WebRTC po otrzymaniu oferty od Hosta
                 if (gameState != GameState.IN_GAME) {
                     SwingUtilities.invokeLater {
                         startGame("MultiplayerSession", isClient = true)
-                        initWebRTC(isHost = false)
-                        webRTCManager?.handleRemoteOffer(msg.sdp)
+                        // Klient inicjuje WebRTC jako odbiorca (nie-host)
+                        // senderId to ID Hosta
+                        initWebRTC(targetId = msg.senderId ?: "HOST", isHost = false)
 
-                        // Aplikujemy zbuforowanych kandydatów, którzy przyszli przed ofertą
-                        while (!pendingIceCandidates.isEmpty()) {
-                            val candidate = pendingIceCandidates.poll()
-                            webRTCManager?.addIceCandidate(candidate)
+                        val rtc = peerConnections[msg.senderId ?: "HOST"]
+                        rtc?.handleRemoteOffer(msg.sdp)
+
+                        // Aplikujemy zbuforowanych kandydatów
+                        val queue = pendingIceCandidates[msg.senderId ?: "HOST"]
+                        while (queue != null && !queue.isEmpty()) {
+                            val candidate = queue.poll()
+                            rtc?.addIceCandidate(candidate)
                         }
                     }
+                } else {
+                    // Jeśli gra już trwa (np. renegocjacja), po prostu obsługujemy ofertę
+                    val rtc = peerConnections[msg.senderId ?: "HOST"]
+                    rtc?.handleRemoteOffer(msg.sdp)
                 }
             }
             is SignalingMessage.SdpAnswer -> {
-                println("Otrzymano odpowiedź SDP.")
-                webRTCManager?.handleRemoteAnswer(msg.sdp)
+                println("Otrzymano odpowiedź SDP od ${msg.senderId}.")
+                val rtc = peerConnections[msg.senderId ?: "UNKNOWN"]
+                rtc?.handleRemoteAnswer(msg.sdp)
             }
             is SignalingMessage.IceCandidate -> {
                 val candidate = RTCIceCandidate(msg.sdpMid, msg.sdpMLineIndex ?: 0, msg.candidate, "")
-                if (webRTCManager != null) {
-                    println("SIGNALING RX: Otrzymano kandydata ICE: ${msg.sdpMid}")
-                    webRTCManager?.addIceCandidate(candidate)
+                val senderId = msg.senderId ?: "UNKNOWN"
+                val rtc = peerConnections[senderId]
+
+                if (rtc != null) {
+                    println("SIGNALING RX: Otrzymano kandydata ICE od $senderId")
+                    rtc.addIceCandidate(candidate)
                 } else {
                     // Jeśli menedżer jeszcze nie istnieje (wyścig wątków), buforujemy kandydata
-                    println("SIGNALING RX: Buforowanie kandydata ICE (WebRTC niegotowe): ${msg.sdpMid}")
-                    pendingIceCandidates.add(candidate)
+                    println("SIGNALING RX: Buforowanie kandydata ICE od $senderId")
+                    pendingIceCandidates.computeIfAbsent(senderId) { ConcurrentLinkedQueue() }.add(candidate)
                 }
             }
             is SignalingMessage.Error -> {
@@ -925,32 +1055,36 @@ class gridMap : JPanel() {
         }
     }
 
-    // Inicjalizacja WebRTC (wspólna dla Hosta i Klienta)
-    private fun initWebRTC(isHost: Boolean) {
-        // Przypisanie ID na sztywno dla testów (Host=1, Klient=2)
-        // Dzięki temu gracze nie będą mieli tego samego ID i będą się widzieć
-        myPlayerId = if (isHost) 1 else 2
-        this.isHost = isHost
+    // Inicjalizacja WebRTC dla konkretnego połączenia (P2P)
+    private fun initWebRTC(targetId: String, isHost: Boolean) {
+        // Jeśli już mamy połączenie z tym graczem, nie twórz nowego (chyba że restart)
+        if (peerConnections.containsKey(targetId)) return
 
-        webRTCManager = WebRTCManager(
+        println("Inicjalizacja WebRTC z $targetId (Host=$isHost)")
+
+        val rtcManager = WebRTCManager(
             onIceCandidate = { candidate ->
-                println("SIGNALING TX: Wysyłanie kandydata ICE: ${candidate.sdpMid}")
-                signalingClient?.send(SignalingMessage.IceCandidate(candidate.sdp, candidate.sdpMid, candidate.sdpMLineIndex))
+                println("SIGNALING TX: Wysyłanie kandydata ICE do $targetId")
+                signalingClient?.send(SignalingMessage.IceCandidate(
+                    candidate = candidate.sdp,
+                    sdpMid = candidate.sdpMid,
+                    sdpMLineIndex = candidate.sdpMLineIndex,
+                    targetId = targetId // Ważne: wysyłamy do konkretnego gracza
+                ))
             },
             onSdpOffer = { desc ->
-                signalingClient?.send(SignalingMessage.SdpOffer(desc.sdp))
+                signalingClient?.send(SignalingMessage.SdpOffer(desc.sdp, targetId = targetId))
             },
             onSdpAnswer = { desc ->
-                signalingClient?.send(SignalingMessage.SdpAnswer(desc.sdp))
+                signalingClient?.send(SignalingMessage.SdpAnswer(desc.sdp, targetId = targetId))
             },
             onDataReceived = { buffer ->
                 try {
-                    // KRYTYCZNE: Natychmiast kopiujemy dane z bufora. Oryginalny bufor
-                    // może zostać ponownie użyty przez bibliotekę WebRTC po wyjściu z tej funkcji.
+                    // KRYTYCZNE: Natychmiast kopiujemy dane z bufora.
                     val dataCopy = ByteArray(buffer.remaining())
                     buffer.get(dataCopy)
 
-                    // Zakolejkuj przetwarzanie na głównym wątku gry, aby uniknąć problemów z współbieżnością.
+                    // Zakolejkuj przetwarzanie na głównym wątku gry
                     networkActionQueue.add {
                         val bufferCopy = ByteBuffer.wrap(dataCopy)
                         if (bufferCopy.remaining() == 0) return@add
@@ -959,12 +1093,36 @@ class gridMap : JPanel() {
                         when (type) {
                             NetworkProtocol.PACKET_PLAYER_POS -> {
                                 val data = NetworkProtocol.decodePlayerPosition(bufferCopy)
-                                remotePlayers[data.playerId] = RemotePlayer(data.x, data.y, data.z, data.yaw, data.pitch, System.currentTimeMillis())
+
+                                if (isHost) {
+                                    // Host: Podpisuje pakiet ID nadawcy (Security)
+                                    val netId = playerNetIds[targetId]
+                                    if (netId != null) {
+                                        // Aktualizujemy pozycję u Hosta
+                                        remotePlayers[netId] = RemotePlayer(data.x, data.y, data.z, data.yaw, data.pitch, System.currentTimeMillis(), System.currentTimeMillis())
+
+                                        // Relay: Host wysyła tę pozycję do innych, podmieniając ID w pakiecie na ID nadawcy
+                                        val relayedPacket = NetworkProtocol.encodePlayerPosition(netId, data.x, data.y, data.z, data.yaw, data.pitch)
+
+                                        // Wysyłamy do wszystkich OPRÓCZ nadawcy
+                                        peerConnections.forEach { (pid, rtc) ->
+                                            if (pid != targetId) {
+                                                rtc.sendData(relayedPacket)
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // Klient: Otrzymuje pakiet od Hosta z poprawnym ID
+                                    // Ignorujemy własne ID (jeśli relay wrócił)
+                                    if (data.playerId != myPlayerId.toByteOrNull()) {
+                                        remotePlayers[data.playerId] = RemotePlayer(data.x, data.y, data.z, data.yaw, data.pitch, System.currentTimeMillis(), System.currentTimeMillis())
+                                    }
+                                }
                             }
                             NetworkProtocol.PACKET_BLOCK_SET -> {
                                 val data = NetworkProtocol.decodeBlockChange(bufferCopy)
-                                
-                                // Helper do ustawiania bloku Z metadanymi (bo setBlock resetuje meta do 0)
+
+                                // Helper do ustawiania bloku Z metadanymi
                                 fun setBlockWithMeta(x: Int, y: Int, z: Int, color: Int, meta: Byte) {
                                     setBlock(x, y, z, color)
                                     if (meta != 0.toByte()) {
@@ -985,31 +1143,26 @@ class gridMap : JPanel() {
 
                                     if (chunks.containsKey(p)) {
                                         // SCENARIUSZ 1: Chunk jest załadowany u Hosta -> Normalna aktualizacja
-                                        println("MULTIPLAYER RX (HOST): Zmiana bloku w załadowanym chunku: $cx, $cz")
                                         setBlockWithMeta(data.x, data.y, data.z, data.color, data.metadata)
                                         refreshChunkData(cx, cz)
                                     } else {
                                         // SCENARIUSZ 2: Chunk jest poza zasięgiem Hosta -> Edycja pliku zapisu w tle
-                                        println("MULTIPLAYER RX (HOST): Zmiana bloku w ODLEGŁYM chunku: $cx, $cz (Save Edit)")
                                         chunkExecutor.submit {
-                                            // 1. Wczytaj z dysku lub wygeneruj
                                             var chunk = chunkIO.loadChunk(cx, cz)
                                             if (chunk == null) {
                                                 chunk = chunkGenerator.generate(cx, cz)
                                             }
-
-                                            // 2. Podmień blok (obliczamy lokalne koordynaty)
                                             var lx = data.x % 16; if (lx < 0) lx += 16
                                             var lz = data.z % 16; if (lz < 0) lz += 16
                                             if (data.y in 0..127) {
                                                 chunk.setBlock(lx, data.y, lz, data.color)
-                                                chunk.setMeta(lx, data.y, lz, data.metadata.toInt()) // Używamy odebranych metadanych
-                                                
-                                                // 3. Zapisz z powrotem na dysk
+                                                chunk.setMeta(lx, data.y, lz, data.metadata.toInt())
                                                 chunkIO.saveChunk(chunk)
                                             }
                                         }
                                     }
+                                    // Host przekazuje zmianę bloku WSZYSTKIM innym graczom
+                                    relayPacketToOthers(dataCopy, senderId = targetId)
                                 } else {
                                     // KLIENT: Zawsze aktualizuje to co widzi
                                     setBlockWithMeta(data.x, data.y, data.z, data.color, data.metadata)
@@ -1018,58 +1171,109 @@ class gridMap : JPanel() {
                                     refreshChunkData(cx, cz)
                                 }
                             }
+                            NetworkProtocol.PACKET_CHUNK_SECTION -> {
+                                val data = NetworkProtocol.decodeChunkSection(bufferCopy)
+                                val p = Point(data.cx, data.cz)
+                                // Pobieramy lub tworzymy nowy chunk
+                                val chunk = chunks.computeIfAbsent(p) { Chunk(data.cx, data.cz) }
+
+                                // Kopiujemy dane sekcji w odpowiednie miejsce w tablicy chunka
+                                val offset = data.sectionY * 4096 // 16*16*16
+                                System.arraycopy(data.blocks, 0, chunk.blocks, offset, data.blocks.size)
+                                System.arraycopy(data.metadata, 0, chunk.metadata, offset, data.metadata.size)
+                                
+                                // Sprawdzamy czy sekcja ma bloki, aby ustawić flagę hasBlocks
+                                if (!chunk.hasBlocks) {
+                                    for (b in data.blocks) if (b != 0) { chunk.hasBlocks = true; break }
+                                }
+
+                                // Odświeżamy mesh (można to zoptymalizować, ale na razie odświeżamy cały chunk)
+                                chunkExecutor.submit {
+                                    try {
+                                        refreshChunkData(data.cx, data.cz)
+                                    } catch (e: Exception) {
+                                        e.printStackTrace()
+                                    }
+                                }
+                            }
                             NetworkProtocol.PACKET_CHUNK_DATA -> {
                                 val data = NetworkProtocol.decodeChunk(bufferCopy)
                                 val p = Point(data.cx, data.cz)
                                 val newChunk = Chunk(data.cx, data.cz)
                                 System.arraycopy(data.blocks, 0, newChunk.blocks, 0, data.blocks.size)
-                                // Kopiujemy odebrane metadane
                                 System.arraycopy(data.metadata, 0, newChunk.metadata, 0, data.metadata.size)
                                 
+                                // Sprawdzamy czy chunk ma bloki
+                                for (b in data.blocks) if (b != 0) { newChunk.hasBlocks = true; break }
+
                                 chunks[p] = newChunk
-                                
-                                // FIX: Zamiast tylko liczyć światło lokalnie, używamy refreshChunkData.
-                                // To zaktualizuje światło I meshe również u sąsiadów, usuwając "szwy" i granice.
-                                // OPTYMALIZACJA: Przenosimy to do wątku tła, aby uniknąć laga przy odbiorze wielu chunków naraz!
                                 chunkExecutor.submit {
-                                    refreshChunkData(data.cx, data.cz)
+                                    try {
+                                        refreshChunkData(data.cx, data.cz)
+                                    } catch (e: Exception) {
+                                        e.printStackTrace()
+                                    }
                                 }
                             }
                             NetworkProtocol.PACKET_WORLD_DATA -> {
-                                val data = NetworkProtocol.decodeWorldData(bufferCopy)
-                                if (seed != data.seed) {
-                                    seed = data.seed
-                                    chunkGenerator = ChunkGenerator(seed, oreColors)
-                                    chunks.clear()
-                                    chunkMeshes.clear()
-                                    chunkOcclusion.clear()
-                                }
-                                if (abs(gameTime - data.gameTime) > 0.5) gameTime = data.gameTime
-                                dayCounter = data.dayCounter
+                                // Proste wywołanie - cała logika jest teraz w NetworkProtocol
+                                NetworkProtocol.decodeWorldData(bufferCopy, this@gridMap)
                             }
                             NetworkProtocol.PACKET_CHUNK_REQUEST -> {
                                 if (isHost) {
                                     val req = NetworkProtocol.decodeChunkRequest(bufferCopy)
                                     val p = Point(req.cx, req.cz)
                                     chunkExecutor.submit {
-                                        // 1. Sprawdź czy jest w RAM
-                                        var chunk = chunks[p]
-                                        
-                                        // 2. Jeśli nie ma w RAM, sprawdź plik zapisu (c_x_z.dat)
-                                        if (chunk == null) {
-                                            chunk = chunkIO.loadChunk(req.cx, req.cz)
+                                        try {
+                                            var chunk = chunks[p]
+                                            if (chunk == null) chunk = chunkIO.loadChunk(req.cx, req.cz)
+                                            if (chunk == null) {
+                                                chunk = chunkGenerator.generate(req.cx, req.cz)
+                                                chunkIO.saveChunk(chunk)
+                                            }
+                                            chunks.putIfAbsent(p, chunk)
+                                            // Kolejkujemy chunk dla KONKRETNEGO gracza
+                                            chunkStreamer.queueChunk(targetId, req.cx, req.cz, force = true)
+                                        } catch (e: Exception) {
+                                            e.printStackTrace()
                                         }
-
-                                        // 3. Jeśli nie ma pliku, wygeneruj i ZAPISZ
-                                        if (chunk == null) {
-                                            chunk = chunkGenerator.generate(req.cx, req.cz)
-                                            chunkIO.saveChunk(chunk) // Zapisz na dysk, aby plik istniał
-                                        }
-
-                                        // Dodaj do RAM (żeby ChunkStreamer go widział) i zakolejkuj
-                                        chunks.putIfAbsent(p, chunk)
-                                        chunkStreamer.queueChunk(req.cx, req.cz, force = true)
                                     }
+                                }
+                            }
+                            NetworkProtocol.PACKET_PLAYER_LIST -> {
+                                // Tylko klient odbiera listę
+                                if (!isHost) {
+                                    val newList = NetworkProtocol.decodePlayerList(bufferCopy)
+                                    // Synchronizacja: Usuwamy graczy, których nie ma w nowej liście (oprócz siebie)
+                                    val myByteId = myPlayerId.toByteOrNull() ?: 0
+
+                                    // Usuwamy tych, których nie ma w nowej liście
+                                    remotePlayers.keys.retainAll(newList.keys)
+
+                                    // Aktualizujemy/Dodajemy nowych
+                                    newList.forEach { (id, p) ->
+                                        if (id != myByteId) {
+                                            remotePlayers[id] = p
+                                        }
+                                    }
+                                    // FIX: Upewniamy się, że nie mamy siebie na liście (usuwamy ducha)
+                                    if (myByteId != 0.toByte()) {
+                                        remotePlayers.remove(myByteId)
+                                    }
+                                }
+                            }
+                            NetworkProtocol.PACKET_KEEP_ALIVE -> {
+                                if (isHost) {
+                                    val netId = playerNetIds[targetId]
+                                    if (netId != null) {
+                                        remotePlayers[netId]?.lastKeepAlive = System.currentTimeMillis()
+                                    }
+                                }
+                            }
+                            NetworkProtocol.PACKET_DISCONNECT -> {
+                                if (isHost) {
+                                    println("Gracz $targetId rozłączył się intencjonalnie.")
+                                    removePlayer(targetId)
                                 }
                             }
                         }
@@ -1080,11 +1284,40 @@ class gridMap : JPanel() {
                 }
             },
         )
-        webRTCManager?.startConnection(isHost)
 
-        // FIX: Usunięto natychmiastowe wysyłanie danych świata.
-        // Kanał (DataChannel) nie jest jeszcze otwarty w tym momencie (jest w stanie CONNECTING).
-        // Dane świata zostaną wysłane automatycznie w pętli loop() (co 1s), gdy połączenie będzie stabilne.
+        peerConnections[targetId] = rtcManager
+        rtcManager.startConnection(isHost)
+    }
+
+    private fun removePlayer(signalingId: String) {
+        val netId = playerNetIds[signalingId]
+        if (netId != null) {
+            remotePlayers.remove(netId)
+            playerNetIds.remove(signalingId)
+            peerConnections[signalingId]?.close()
+            peerConnections.remove(signalingId)
+
+            // Broadcast nowej listy natychmiast
+            broadcastPlayerList()
+        }
+    }
+
+    private fun String.toByteOrNull(): Byte? {
+        return try { this.toByte() } catch (e: Exception) { null }
+    }
+
+    // Funkcja Hosta do przekazywania pakietów (Relaying)
+    private fun relayPacketToOthers(data: ByteArray, senderId: String) {
+        peerConnections.forEach { (pid, rtc) ->
+            if (pid != senderId) { // Nie odsyłamy do nadawcy
+                try {
+                    val buffer = ByteBuffer.wrap(data) // Wrap jest tani (nie kopiuje)
+                    rtc.sendData(buffer)
+                } catch (e: Exception) {
+                    println("Błąd relay do $pid: ${e.message}")
+                }
+            }
+        }
     }
 
     private fun updateWorld() {
@@ -1097,6 +1330,18 @@ class gridMap : JPanel() {
         // --- LOGIKA KLIENTA: Żądanie chunków ---
         if (isMultiplayerClient) {
             val now = System.currentTimeMillis()
+            
+            // 1. Czyszczenie starych żądań (dla chunków, które wyszły poza zasięg)
+            // Zapobiega to wyciekowi pamięci i blokowaniu limitu żądań przez stare chunki
+            val requestIterator = clientChunkRequests.iterator()
+            while (requestIterator.hasNext()) {
+                val entry = requestIterator.next()
+                val p = entry.key
+                if (abs(p.x - currentChunkX) > renderDistance + 2 || abs(p.y - currentChunkZ) > renderDistance + 2) {
+                    requestIterator.remove()
+                }
+            }
+
             val missingChunks = ArrayList<Point>()
 
             // Skanujemy obszar renderowania
@@ -1121,23 +1366,74 @@ class gridMap : JPanel() {
 
             // Wysyłamy żądania w kolejności
             var requestsSentThisTick = 0
-            for (p in missingChunks) {
-                val lastReq = clientChunkRequests[p] ?: 0L
-                // Jeśli nie żądaliśmy go wcale LUB minęła 1 sekunda (ponawianie zgubionych pakietów)
-                if (now - lastReq > 1000) {
-                    if (webRTCManager != null) {
+            // Klient ma tylko jedno połączenie (do Hosta), bierzemy pierwsze lepsze
+            val hostConnection = peerConnections.values.firstOrNull()
+
+            // FLOW CONTROL: Limitujemy liczbę oczekujących żądań.
+            // Jeśli czekamy na więcej niż 50 chunków, nie wysyłamy nowych, żeby nie zapchać kolejki Hosta.
+            val maxPendingRequests = 50
+
+            if (hostConnection != null) {
+                for (p in missingChunks) {
+                    // Jeśli limit przekroczony, wysyłamy tylko ponowienia (timeouty), a nie nowe
+                    val isRequested = clientChunkRequests.containsKey(p)
+                    if (!isRequested && clientChunkRequests.size >= maxPendingRequests) continue
+
+                    val lastReq = clientChunkRequests[p] ?: 0L
+                    // Zwiększono timeout z 1s do 5s. Dajemy czas Hostowi na przesłanie danych.
+                    if (now - lastReq > 5000) {
                         val packet = NetworkProtocol.encodeChunkRequest(p.x, p.y)
-                        webRTCManager?.sendData(packet)
+                        hostConnection.sendData(packet)
                         clientChunkRequests[p] = now
-                        
-                        // FIX: Limitujemy liczbę żądań na klatkę, aby nie "zalać" łącza wychodzącego
-                        // Jeśli wyślemy 200 żądań naraz, zapchamy bufor i ważne pakiety (np. pozycja gracza) będą czekać.
+
                         requestsSentThisTick++
-                        // ZWIĘKSZONO: Skoro host jest wydajniejszy, klient może prosić o więcej naraz (małe pakiety po 9 bajtów)
                         if (requestsSentThisTick > 40) break
                     }
                 }
             }
+            
+            // FIX: "Leczenie" niewidzialnych chunków.
+            // Jeśli chunk jest w pamięci (odebrany), ale nie ma mesha (bo np. przyszedł gdy był poza zasięgiem),
+            // wymuszamy jego odświeżenie.
+            if (gameTicks % 5 == 0L) { // Zwiększono częstotliwość: co 5 ticków (ok. 6 razy/sek)
+                var fixedThisFrame = 0
+                val maxFixesPerFrame = 5 // Limit napraw na klatkę, aby nie zaciąć gry
+
+                for (cx in currentChunkX - renderDistance..currentChunkX + renderDistance) {
+                    for (cz in currentChunkZ - renderDistance..currentChunkZ + renderDistance) {
+                        val p = Point(cx, cz)
+                        val chunk = chunks[p]
+                        // Sprawdzamy czy chunk istnieje i ma bloki (nie jest pustym powietrzem)
+                        if (chunk != null && chunk.hasBlocks) {
+                            val mesh = chunkMeshes[p]
+                            // Jeśli nie ma mesha LUB mesh jest pusty, a chunk ma bloki -> wymuś generowanie
+                            if (mesh == null || mesh.all { it.isEmpty() }) {
+                                // Wywołujemy bezpośrednio - funkcja jest już asynchroniczna i sama zarządza kolejką.
+                                refreshChunkData(cx, cz)
+                                fixedThisFrame++
+                                if (fixedThisFrame >= maxFixesPerFrame) break
+                            }
+                        }
+                    }
+                    if (fixedThisFrame >= maxFixesPerFrame) break
+                }
+            }
+
+            // --- CLIENT-SIDE CHUNK UNLOADING ---
+            // Uruchamiamy co 60 ticków (ok. 2 sekundy), aby nie obciążać pętli gry.
+            if (gameTicks % 60 == 0L) {
+                val safeZone = renderDistance + 4 // Większy margines bezpieczeństwa dla klienta
+                val chunkIterator = chunks.keys.iterator()
+                while (chunkIterator.hasNext()) {
+                    val p = chunkIterator.next()
+                    if (abs(p.x - currentChunkX) > safeZone || abs(p.y - currentChunkZ) > safeZone) {
+                        chunkIterator.remove()
+                        chunkMeshes.remove(p)
+                        chunkOcclusion.remove(p)
+                    }
+                }
+            }
+
             return // Klient nie generuje sam
         }
 
@@ -1167,6 +1463,10 @@ class gridMap : JPanel() {
             chunkExecutor.submit {
                 try {
                     val newChunk = generateChunk(p.x, p.y)
+                    // generateChunk (via ChunkGenerator) powinno ustawiać hasBlocks, ale dla pewności:
+                    // (Wymagałoby iteracji, ale generator zwykle zwraca niepusty teren).
+                    // Zakładamy, że generator terenu zawsze coś tworzy (np. bedrock), więc hasBlocks=true.
+                    newChunk.hasBlocks = true 
                     chunks[p] = newChunk
 
                     // Ujednolicenie logiki: Używamy tej samej, solidnej funkcji co multiplayer.
@@ -1189,8 +1489,18 @@ class gridMap : JPanel() {
 
         // Zmiana: Usuwanie starych chunków i ich meshy (Garbage Collection logiczny)
         val safeZone = renderDistance + 2
-        val toRemove = chunks.keys.filter {
-            abs(it.x - currentChunkX) > safeZone || abs(it.y - currentChunkZ) > safeZone
+        val toRemove = chunks.keys.filter { p ->
+            // 1. Sprawdź dystans do Hosta (kamery lokalnej)
+            if (abs(p.x - currentChunkX) <= safeZone && abs(p.y - currentChunkZ) <= safeZone) return@filter false
+            
+            // 2. FIX: Sprawdź dystans do WSZYSTKICH klientów.
+            // Nie usuwamy chunka, jeśli jakikolwiek gracz go widzi.
+            for (player in remotePlayers.values) {
+                val pcx = floor(player.x / 32.0).toInt()
+                val pcz = floor(player.z / 32.0).toInt()
+                if (abs(p.x - pcx) <= safeZone && abs(p.y - pcz) <= safeZone) return@filter false
+            }
+            true // Chunk jest daleko od wszystkich -> do usunięcia
         }
         toRemove.forEach {
             // Jeśli chunk był modyfikowany przez gracza, zapisz go na dysk przed usunięciem z RAM
@@ -1214,30 +1524,54 @@ class gridMap : JPanel() {
     }
 
     // Dodano parametr changedBlocks dla operacji masowych (np. płyny)
-    private fun refreshChunkData(cx: Int, cz: Int, lx: Int = -1, lz: Int = -1, changedBlocks: List<BlockPos>? = null) {
+    fun refreshChunkData(cx: Int, cz: Int, lx: Int = -1, lz: Int = -1, changedBlocks: List<BlockPos>? = null, isHighPriority: Boolean = false) {
         // OPTYMALIZACJA: Nie aktualizuj chunków, które są poza zasięgiem wzroku.
-        // Pozwala to uniknąć lagów przy teleportacji lub odbieraniu zaległych pakietów.
         val currentChunkX = floor(camX / 32.0).toInt()
         val currentChunkZ = floor(camZ / 32.0).toInt()
-        // Dajemy margines +1 względem renderDistance, aby "zszyć" granice widoczności
-        if (abs(cx - currentChunkX) > renderDistance + 1 || abs(cz - currentChunkZ) > renderDistance + 1) return
+        if (abs(cx - currentChunkX) > renderDistance + 3 || abs(cz - currentChunkZ) > renderDistance + 3) return
 
-        val chunksToUpdate = java.util.HashSet<Point>() // HashSet zapobiega duplikatom przy wielu blokach
+        val key = Point(cx, cz)
+
+        // Dodajemy do kolejki tylko, jeśli ten chunk nie czeka już na odświeżenie.
+        // Jeśli lx/lz są podane (edycja bloku), pozwalamy na dodanie, aby nie zgubić interakcji gracza.
+        // Jeśli to pełne odświeżenie (lx=-1), deduplikujemy agresywnie.
+        val isFullRefresh = (lx == -1 && lz == -1 && changedBlocks == null)
+        
+        if (!isFullRefresh || chunksInRefreshQueue.add(key)) {
+            // Definiujemy priorytet
+            val priority = if (isHighPriority) 10 else 0 // Prosty system: 10 dla 'Y', 0 dla reszty
+
+            val task = Runnable {
+                try {
+                    performChunkRefreshSync(cx, cz, lx, lz, changedBlocks)
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                } finally {
+                    if (isFullRefresh) chunksInRefreshQueue.remove(key)
+                }
+            }
+
+            // Owijamy zadanie w PriorityTask i przekazujemy do executora
+            // Używamy .execute() a nie .submit(), aby uniknąć opakowania w FutureTask, które nie jest Comparable.
+            refreshExecutor.execute(PriorityTask(priority, task))
+        }
+    }
+
+    // Stara logika przeniesiona do metody prywatnej, wykonywanej w tle
+    private fun performChunkRefreshSync(cx: Int, cz: Int, lx: Int, lz: Int, changedBlocks: List<BlockPos>?) {
+        // Ponowne sprawdzenie dystansu wewnątrz wątku (na wypadek gdyby gracz uciekł daleko zanim zadanie się wykonało)
+        val currentChunkX = floor(camX / 32.0).toInt()
+        val currentChunkZ = floor(camZ / 32.0).toInt()
+        if (abs(cx - currentChunkX) > renderDistance + 4 || abs(cz - currentChunkZ) > renderDistance + 4) return
+
+        val chunksToUpdate = java.util.HashSet<Point>()
         chunksToUpdate.add(Point(cx, cz))
 
-        // 1. ZAWSZE aktualizujemy bezpośrednich sąsiadów (Krzyż).
-        // Dlaczego? Ponieważ światło ma zasięg 15 bloków. Nawet blok postawiony na środku (8,8)
-        // może rzucić światło lub cień na sąsiada. Poprzedni "margin = 2" był zbyt agresywny i ucinał światło.
         chunksToUpdate.add(Point(cx - 1, cz))
         chunksToUpdate.add(Point(cx + 1, cz))
         chunksToUpdate.add(Point(cx, cz - 1))
         chunksToUpdate.add(Point(cx, cz + 1))
 
-        // 2. Sąsiedzi diagonalni (Rogi) - Inteligentne wykrywanie zasięgu (Manhattan Distance).
-        // Światło ma zasięg 15. Jeśli suma odległości do rogu chunka <= 15, światło tam dotrze.
-        // To naprawia błędy (np. blok na 3,3 nie oświetlał skosu), zachowując optymalizację dla środka.
-
-        // Funkcja pomocnicza do sprawdzania jednego punktu
         fun checkDiagonals(checkLx: Int, checkLz: Int) {
             if (checkLx + checkLz <= 15) chunksToUpdate.add(Point(cx - 1, cz - 1))
             if ((15 - checkLx) + checkLz <= 15) chunksToUpdate.add(Point(cx + 1, cz - 1))
@@ -1246,26 +1580,24 @@ class gridMap : JPanel() {
         }
 
         if (changedBlocks != null) {
-            // Tryb masowy (np. płyny) - sprawdzamy każdy zmieniony blok
             for (pos in changedBlocks) {
                 checkDiagonals(pos.x, pos.z)
             }
         } else if (lx != -1 && lz != -1) {
-            // Tryb pojedynczy (np. stawianie bloku)
             checkDiagonals(lx, lz)
+        } else {
+            chunksToUpdate.add(Point(cx - 1, cz - 1))
+            chunksToUpdate.add(Point(cx + 1, cz - 1))
+            chunksToUpdate.add(Point(cx - 1, cz + 1))
+            chunksToUpdate.add(Point(cx + 1, cz + 1))
         }
 
-        // 1. Reset światła (tylko w wybranych chunkach)
         chunksToUpdate.forEach { p -> chunks[p]?.let { Arrays.fill(it.light, 0.toByte()) } }
 
-        // 2. Przeliczanie (3 przebiegi są konieczne dla łańcucha: Źródło -> Sąsiad -> Cel)
-        // Jeśli kolejność w HashSet będzie odwrotna (Cel -> Sąsiad -> Źródło),
-        // światło potrzebuje 3 cykli, by dotrzeć z wyzerowanego źródła do celu.
         repeat(3) {
             chunksToUpdate.forEach { p -> chunks[p]?.let { calculateLighting(it) } }
         }
 
-        // 3. Aktualizacja meshy
         chunksToUpdate.forEach { p -> updateChunkMesh(p.x, p.y) }
     }
 
@@ -1481,7 +1813,7 @@ class gridMap : JPanel() {
     fun placeStructure(model: List<ModelVoxel>, x: Int, y: Int, z: Int) {
         // Znajdujemy środek modelu, aby postawić go w miejscu kliknięcia
         // (Opcjonalnie: można to pominąć i stawiać względem 0,0 modelu)
-        
+
         for (voxel in model) {
             if (voxel.isVoid) {
                 setBlock(x + voxel.x, y + voxel.y, z + voxel.z, 0)
@@ -1489,7 +1821,7 @@ class gridMap : JPanel() {
                 setBlock(x + voxel.x, y + voxel.y, z + voxel.z, voxel.color.rgb)
             }
         }
-        
+
         // Odświeżamy chunki w okolicy (uproszczone odświeżanie centralnego punktu)
         val cx = if (x >= 0) x / 16 else (x + 1) / 16 - 1
         val cz = if (z >= 0) z / 16 else (z + 1) / 16 - 1
@@ -1516,6 +1848,7 @@ class gridMap : JPanel() {
 
         chunk.setBlock(lx, y, lz, rawBlock)
         chunk.setMeta(lx, y, lz, 0) // Reset metadata when placing/breaking
+        if (rawBlock != 0) chunk.hasBlocks = true
     }
 
     // Sprawdza czy promień przecina faktyczną bryłę bloku (uwzględniając wysokość płynów)
@@ -1718,7 +2051,7 @@ class gridMap : JPanel() {
                                 consumeCurrentItem() // Zużywamy przedmiot, bo mod "coś zrobił"
                                 return
                             }
-                            
+
                             // Obliczamy metadane PRZED wysłaniem
                             var metaToSet: Byte = 0
                             if (fluidBlocks.contains(stack.color)) {
@@ -1726,14 +2059,14 @@ class gridMap : JPanel() {
                             }
 
                             setBlock(lastX, lastY, lastZ, stack.color)
-                            
+
                             // --- MULTIPLAYER: Wyślij postawienie bloku ---
                             // FIX: Usunięto sprawdzanie GameState.MULTIPLAYER, bo podczas gry jest IN_GAME
-                            if (webRTCManager != null) {
+                            // Wysyłamy do wszystkich połączonych peerów
+                            peerConnections.forEach { (_, rtc) ->
                                 try {
                                     val packet = NetworkProtocol.encodeBlockChange(lastX, lastY, lastZ, stack.color, metaToSet)
-                                    webRTCManager?.sendData(packet)
-                                    println("MULTIPLAYER TX: Wysłano postawienie bloku: x=$lastX, y=$lastY, z=$lastZ")
+                                    rtc.sendData(packet)
                                 } catch (e: Exception) {
                                     println("Błąd wysyłania bloku: ${e.message}")
                                 }
@@ -1768,14 +2101,13 @@ class gridMap : JPanel() {
                     if (rawBlock != 0) addItem(rawBlock.toString())
 
                     setBlock(x, y, z, 0)
-                    
+
                     // --- MULTIPLAYER: Wyślij zniszczenie bloku (kolor 0) ---
                     // FIX: Usunięto sprawdzanie GameState.MULTIPLAYER
-                    if (webRTCManager != null) {
+                    peerConnections.forEach { (_, rtc) ->
                         try {
                             val packet = NetworkProtocol.encodeBlockChange(x, y, z, 0, 0) // Meta 0 dla powietrza
-                            webRTCManager?.sendData(packet)
-                            println("MULTIPLAYER TX: Wysłano zniszczenie bloku: x=$x, y=$y, z=$z")
+                            rtc.sendData(packet)
                         } catch (e: Exception) {
                             println("Błąd wysyłania zniszczenia bloku: ${e.message}")
                         }
@@ -1873,8 +2205,9 @@ class gridMap : JPanel() {
         // Jeśli gracz szybko się przemieszcza, wątek tła może próbować meshować stare chunki - blokujemy to.
         val currentChunkX = floor(camX / 32.0).toInt()
         val currentChunkZ = floor(camZ / 32.0).toInt()
-        // Margines +1 dla płynnego ładowania krawędzi
-        if (abs(cx - currentChunkX) > renderDistance + 1 || abs(cz - currentChunkZ) > renderDistance + 1) return
+        // FIX: Zwiększono margines do +3 (spójnie z refreshChunkData)
+        // Zwiększono margines do +6, aby upewnić się, że chunki z sieci zawsze się wygenerują, nawet przy lagu/szybkim ruchu
+        if (abs(cx - currentChunkX) > renderDistance + 6 || abs(cz - currentChunkZ) > renderDistance + 6) return
 
         val chunk = chunks[Point(cx, cz)] ?: return
         // 4x4x4 = 4 sekcje X * 32 sekcje Y * 4 sekcje Z = 512 sekcji
@@ -1961,7 +2294,7 @@ class gridMap : JPanel() {
                     fun getNeighborHeight(nx: Int, ny: Int, nz: Int): Double {
                         val nId = getRawBlock(nx, ny, nz)
                         if (nId != rawBlock) return 0.0 // Jeśli to powietrze lub inny blok, rysujemy od dołu (0.0)
-                        
+
                         val nLevel = getFluidLevel(nx, ny, nz)
                         val nAbove = getRawBlock(nx, ny + 1, nz)
                         val nFull = (nAbove == rawBlock)
@@ -1972,9 +2305,12 @@ class gridMap : JPanel() {
                     fun shouldRenderCap(nx: Int, ny: Int, nz: Int, isTop: Boolean): Boolean {
                         val neighborId = getRawBlock(nx, ny, nz)
                         if (isFluid) { // Current block is a fluid
+                            // Jeśli sąsiad (góra lub dół) to ten sam płyn, nie rysujemy ścianki.
+                            if (neighborId == rawBlock) return false
+
                             if (isTop) {
-                                // Render top of fluid unless same fluid is above. Allows seeing surface under glass.
-                                return neighborId != rawBlock
+                                // Render top of fluid (neighborId != rawBlock is checked above).
+                                return true
                             }
                             // Render bottom of fluid if block below is not opaque.
                             return !isOpaqueForCulling(neighborId)
@@ -1993,13 +2329,18 @@ class gridMap : JPanel() {
                         return false // Neighbor is opaque.
                     }
 
+                    // Logika wyłączania AO:
+                    // 1. Dla płynów: Wyłączamy AO całkowicie.
+                    // 2. Dla bloków stałych: Wyłączamy AO jeśli sąsiadują z płynem (żeby uniknąć ciemnych rogów przy wodzie).
+                    fun shouldDisableAO(nx: Int, ny: Int, nz: Int) = isFluid || fluidBlocks.contains(getRawBlock(nx, ny, nz))
+
                     // Sprawdzamy sąsiadów
-                    if (shouldRenderSide(wx, y, wz - 1)) addFace(targetList, wx, y, wz, xPos, yPos, zPos, 0, color, isFluid, height, getNeighborHeight(wx, y, wz - 1))
-                    if (shouldRenderSide(wx, y, wz + 1)) addFace(targetList, wx, y, wz, xPos, yPos, zPos, 1, color, isFluid, height, getNeighborHeight(wx, y, wz + 1))
-                    if (shouldRenderSide(wx - 1, y, wz)) addFace(targetList, wx, y, wz, xPos, yPos, zPos, 2, color, isFluid, height, getNeighborHeight(wx - 1, y, wz))
-                    if (shouldRenderSide(wx + 1, y, wz)) addFace(targetList, wx, y, wz, xPos, yPos, zPos, 3, color, isFluid, height, getNeighborHeight(wx + 1, y, wz))
-                    if (shouldRenderCap(wx, y + 1, wz, true)) addFace(targetList, wx, y, wz, xPos, yPos, zPos, 4, color, isFluid, height, 0.0)
-                    if (shouldRenderCap(wx, y - 1, wz, false)) addFace(targetList, wx, y, wz, xPos, yPos, zPos, 5, color, false, height, 0.0)
+                    if (shouldRenderSide(wx, y, wz - 1)) addFace(targetList, wx, y, wz, xPos, yPos, zPos, 0, color, isFluid, height, getNeighborHeight(wx, y, wz - 1), shouldDisableAO(wx, y, wz - 1))
+                    if (shouldRenderSide(wx, y, wz + 1)) addFace(targetList, wx, y, wz, xPos, yPos, zPos, 1, color, isFluid, height, getNeighborHeight(wx, y, wz + 1), shouldDisableAO(wx, y, wz + 1))
+                    if (shouldRenderSide(wx - 1, y, wz)) addFace(targetList, wx, y, wz, xPos, yPos, zPos, 2, color, isFluid, height, getNeighborHeight(wx - 1, y, wz), shouldDisableAO(wx - 1, y, wz))
+                    if (shouldRenderSide(wx + 1, y, wz)) addFace(targetList, wx, y, wz, xPos, yPos, zPos, 3, color, isFluid, height, getNeighborHeight(wx + 1, y, wz), shouldDisableAO(wx + 1, y, wz))
+                    if (shouldRenderCap(wx, y + 1, wz, true)) addFace(targetList, wx, y, wz, xPos, yPos, zPos, 4, color, isFluid, height, 0.0, shouldDisableAO(wx, y + 1, wz))
+                    if (shouldRenderCap(wx, y - 1, wz, false)) addFace(targetList, wx, y, wz, xPos, yPos, zPos, 5, color, false, height, 0.0, shouldDisableAO(wx, y - 1, wz))
                 }
             }
         }
@@ -2064,7 +2405,7 @@ class gridMap : JPanel() {
         return occlusion
     }
 
-    private fun addFace(target: MutableList<Triangle3d>, wx: Int, wy: Int, wz: Int, x: Double, y: Double, z: Double, faceType: Int, c: Color, isDoubleSided: Boolean = false, topHeight: Double = 1.0, bottomHeight: Double = 0.0) {
+    private fun addFace(target: MutableList<Triangle3d>, wx: Int, wy: Int, wz: Int, x: Double, y: Double, z: Double, faceType: Int, c: Color, isDoubleSided: Boolean = false, topHeight: Double = 1.0, bottomHeight: Double = 0.0, disableAO: Boolean = false) {
         // Rozmiar kostki = cubeSize (od -cubeSize/2 do +cubeSize/2 względem środka)
         val d = cubeSize / 2.0
         // Obliczamy górną krawędź na podstawie wysokości płynu
@@ -2079,7 +2420,7 @@ class gridMap : JPanel() {
         )
 
         fun vertexAO(s1: Boolean, s2: Boolean, corner: Boolean): Double {
-            if (isDoubleSided) return 1.0 // FIX: Wyłączamy cieniowanie AO dla cieczy (lawa pod blokiem będzie jasna)
+            if (disableAO) return 1.0 // FIX: Wyłączamy cieniowanie AO tylko na wyraźne żądanie (pełna ciecz lub styk z cieczą)
             val level = if (s1 && s2) 3 else (if (s1) 1 else 0) + (if (s2) 1 else 0) + (if (corner) 1 else 0)
             return when (level) {
                 0 -> 1.0 // Najjaśniej
@@ -2108,10 +2449,10 @@ class gridMap : JPanel() {
         val aoValues = DoubleArray(4)
         val v = Array(4) { BooleanArray(3) }
         var lightLevel = 16
-        
+
         // Jeśli to płyn (isDoubleSided), bierzemy światło z wnętrza bloku. Jeśli stały - z sąsiada.
         val selfLight = getLight(wx, wy, wz)
-        
+
         // Helper do AO: Blok rzuca cień tylko jeśli jest w pełni nieprzezroczysty
         fun isOccluding(x: Int, y: Int, z: Int): Boolean {
             return isOpaqueForCulling(getRawBlock(x, y, z))
@@ -2178,28 +2519,76 @@ class gridMap : JPanel() {
 
     // --- System Symulacji Płynów ---
     private fun simulateFluids(currentTick: Long) {
-        val fluidsToSimulateThisTick = fluidProperties.filter { currentTick % it.value.tickRate == 0L }.keys
+        // FIX: Tylko Host (lub Singleplayer) symuluje płyny. Klienci są tylko odbiornikami.
+        if (isMultiplayerClient) return
+
+        val fluidsToSimulateThisTick = fluidProperties.filter {
+            val spreadRate = it.value.tickRate
+            val decayRate = it.value.decayTickRate
+            (currentTick % spreadRate == 0L) || (currentTick % decayRate == 0L)
+        }.keys
         if (fluidsToSimulateThisTick.isEmpty()) return
 
-        val currentChunkX = floor(camX / 32.0).toInt()
-        val currentChunkZ = floor(camZ / 32.0).toInt()
+        // FIX: Wyznaczamy aktywne chunki wokół wszystkich graczy (Host + Klienci)
+        val activeChunks = HashSet<Point>()
         val radius = simulateFluidsDistance
 
-        // Lista zmian do zaaplikowania (aby uniknąć problemów z modyfikacją podczas iteracji)
-        val updates = HashMap<Point, MutableList<Triple<BlockPos, Int, Int>>>() // Chunk -> List(Pos, BlockID, Level)
-
+        // 1. Wokół lokalnego gracza (Hosta/Singleplayer)
+        val currentChunkX = floor(camX / 32.0).toInt()
+        val currentChunkZ = floor(camZ / 32.0).toInt()
         for (cx in currentChunkX - radius..currentChunkX + radius) {
             for (cz in currentChunkZ - radius..currentChunkZ + radius) {
-                val chunk = chunks[Point(cx, cz)] ?: continue
+                activeChunks.add(Point(cx, cz))
+            }
+        }
+
+        // 2. Wokół klientów (jeśli Host)
+        if (isHost) {
+            remotePlayers.values.forEach { player ->
+                val pcx = floor(player.x / 32.0).toInt()
+                val pcz = floor(player.z / 32.0).toInt()
+                for (cx in pcx - radius..pcx + radius) {
+                    for (cz in pcz - radius..pcz + radius) {
+                        activeChunks.add(Point(cx, cz))
+                    }
+                }
+            }
+        }
+
+        // Lista zmian do zaaplikowania (aby uniknąć problemów z modyfikacją podczas iteracji)
+        // Czyścimy debugowanie spadków na początku ticku fizyki
+        debugActiveDrops.clear()
+
+        val updates = HashMap<Point, MutableList<Triple<BlockPos, Int, Int>>>() // Chunk -> List(Pos, BlockID, Level)
+
+        for (chunkPos in activeChunks) {
+            val cx = chunkPos.x
+            val cz = chunkPos.y
+            val chunk = chunks[chunkPos] ?: continue
 
                 for (lx in 0 until 16) {
                     for (lz in 0 until 16) {
                         for (y in 0 until 128) {
                             val blockId = chunk.getBlock(lx, y, lz)
                             if (fluidsToSimulateThisTick.contains(blockId)) {
-                                val meta = chunk.getMeta(lx, y, lz)
-                                val level = meta and 0xF
-                                val parentDir = (meta shr 4) and 0xF
+                                val props = fluidProperties[blockId]!!
+                                val spreadRate = props.tickRate
+                                val decayRate = props.decayTickRate
+                                val isSpreadTick = (currentTick % spreadRate == 0L)
+                                val isDecayTick = (currentTick % decayRate == 0L)
+
+                                var meta = chunk.getMeta(lx, y, lz)
+                                var level = meta and 0xF
+
+                                // Jeśli płyn ma poziom 0 (np. z generatora), traktujemy go jako źródło
+                                if (level == 0) {
+                                    level = 8
+                                    meta = 8
+                                    chunk.setMeta(lx, y, lz, 8)
+                                }
+
+                                val parentDir = (meta shr 4) and 0x7
+                                val isTargetedStream = (meta and 0x80) != 0 // Bit 7: Czy woda płynie w celowanym strumieniu
 
                                 if (level <= 0) continue
 
@@ -2226,9 +2615,14 @@ class gridMap : JPanel() {
 
                                 if (!parentExists) {
                                     // Rodzic zniknął -> my znikamy (zamiana w powietrze)
-                                    addFluidUpdate(updates, wx, y, wz, 0, 0)
+                                    if (isDecayTick) {
+                                        addFluidUpdate(updates, wx, y, wz, 0, 0)
+                                    }
                                     continue // Nie rozlewamy się dalej, skoro znikamy
                                 }
+
+                                // Jeśli to nie jest tick rozlewania (tylko zanikania), a rodzic istnieje, to nic nie robimy
+                                if (!isSpreadTick) continue
 
                                 // 1. Sprawdź dół (Priorytet)
                                 var flowedDown = false
@@ -2250,13 +2644,34 @@ class gridMap : JPanel() {
                                     }
                                 }
 
-                                // Jeśli lawa popłynęła w dół, nie rozlewa się na boki w tej turze
-                                if (!flowedDown && level > 1) {
+                                // Logika grawitacyjnego rozlewania:
+                                // Domyślnie: Jeśli płyn popłynął w dół, nie rozlewa się na boki (optymalizacja).
+                                // Wyjątek: Jeśli to BLOK ŹRÓDŁOWY (parentDir == 0) i nie jest otoczony, rozlewamy go też na boki (efekt plusa).
+                                var allowSideSpread = !flowedDown
+                                if (flowedDown && parentDir == 0) {
+                                    // Sprawdzamy czy jesteśmy otoczeni przez bloki stałe (rura)
+                                    var isSurrounded = true
+                                    val neighborsCheck = arrayOf(
+                                        getRawBlock(wx + 1, y, wz), getRawBlock(wx - 1, y, wz),
+                                        getRawBlock(wx, y, wz + 1), getRawBlock(wx, y, wz - 1)
+                                    )
+                                    for (nid in neighborsCheck) {
+                                        // Jeśli sąsiad to powietrze (0) lub płyn, to znaczy że mamy wolną przestrzeń -> rozlewamy
+                                        if (nid == 0 || fluidBlocks.contains(nid)) {
+                                            isSurrounded = false
+                                            break
+                                        }
+                                    }
+                                    if (!isSurrounded) allowSideSpread = true
+                                }
+
+                                if (allowSideSpread && level > 1) {
                                     // Sprawdzamy czy możemy się rozlać na boki.
                                     // Warunek: Rozlewamy się TYLKO gdy mamy "grunt".
                                     // Jeśli pod nami jest płyn, który spada (Parent=UP), to my też jesteśmy kolumną i nie rozlewamy się.
                                     var canSpread = true
-                                    if (y > 0) {
+                                    // FIX: Źródła (parentDir == 0) mogą się rozlewać nawet jeśli pod nimi jest spadająca kolumna
+                                    if (y > 0 && parentDir != 0) {
                                         val blockBelow = getRawBlock(wx, y - 1, wz)
                                         if (fluidBlocks.contains(blockBelow)) {
                                             val metaBelow = getFluidMeta(wx, y - 1, wz)
@@ -2270,6 +2685,48 @@ class gridMap : JPanel() {
 
                                     if (canSpread) {
                                         // 2. Rozlewanie na boki
+                                        // --- LOGIKA SZUKANIA SPADKU (Water Physics) ---
+                                        val range = 5
+                                        val costs = IntArray(4) { 1000 }
+                                        var minCost = 1000
+                                        var foundDrop = false
+                                        var nextIsTargeted = false
+
+                                        // Zmiana: Szukamy spadku TYLKO jeśli jesteśmy źródłem (level >= 8)
+                                        if (level >= 8) {
+                                            // Obliczamy koszt (dystans do spadku) dla każdego kierunku - TYLKO LINIOWO
+                                            costs[0] = calculateLinearFlowCost(wx + 1, y, wz, 1, 0, range, blockId) // East
+                                            costs[1] = calculateLinearFlowCost(wx - 1, y, wz, -1, 0, range, blockId) // West
+                                            costs[2] = calculateLinearFlowCost(wx, y, wz + 1, 0, 1, range, blockId) // South
+                                            costs[3] = calculateLinearFlowCost(wx, y, wz - 1, 0, -1, range, blockId) // North
+
+                                            minCost = costs.minOrNull() ?: 1000
+
+                                            // DWA STANY:
+                                            // 1. Spadek w zasięgu (foundDrop = true) -> Lej tylko tam (State 2)
+                                            // 2. Brak spadku (foundDrop = false) -> Lej wszędzie (State 1)
+                                            // FIX: Ścisłe rozróżnienie. Jeśli minCost < range, to znaczy że znaleźliśmy spadek w zasięgu 5 bloków.
+                                            foundDrop = minCost < range
+                                            if (foundDrop) nextIsTargeted = true
+                                        } else if (isTargetedStream) {
+                                            // Jeśli nie jesteśmy źródłem, ale jesteśmy w "celowanym strumieniu",
+                                            // to zachowujemy się jakbyśmy znaleźli spadek (wymuszamy kierunek).
+                                            foundDrop = true
+                                        }
+
+                                        // DEBUG: Jeśli znaleziono spadek, który wymusza kierunek, oznaczamy go na zielono
+                                        if (foundDrop && level >= 8) {
+                                            val dxs = intArrayOf(1, -1, 0, 0)
+                                            val dzs = intArrayOf(0, 0, 1, -1)
+                                            for (i in 0..3) {
+                                                if (costs[i] == minCost) {
+                                                    val dropX = wx + (dxs[i] * (minCost + 1))
+                                                    val dropZ = wz + (dzs[i] * (minCost + 1))
+                                                    debugActiveDrops.add(BlockPos(dropX, y - 1, dropZ))
+                                                }
+                                            }
+                                        }
+
                                         val neighbors = arrayOf(
                                             // Offset, Direction for Child (Inverse of offset)
                                             Triple(wx + 1, wz, 2), // East Neighbor -> Parent is West (2)
@@ -2277,9 +2734,26 @@ class gridMap : JPanel() {
                                             Triple(wx, wz + 1, 4), // South Neighbor -> Parent is North (4)
                                             Triple(wx, wz - 1, 5)  // North Neighbor -> Parent is South (5)
                                         )
-                                        for ((nx, nz, childParentDir) in neighbors) {
+                                        for (i in neighbors.indices) {
+                                            // Jeśli znaleziono spadek, ignorujemy kierunki, które do niego nie prowadzą
+                                            if (foundDrop) {
+                                                if (level >= 8) {
+                                                    // Źródło decyduje na podstawie kosztów
+                                                    if (costs[i] != minCost) continue
+                                                } else if (isTargetedStream) {
+                                                    // Strumień utrzymuje kierunek: płyniemy tylko tam, gdzie kontynuujemy linię prostą.
+                                                    // childParentDir to kierunek, z którego "przyjdzie" woda do sąsiada.
+                                                    // Jeśli jest taki sam jak nasz parentDir, to znaczy że idziemy prosto.
+                                                    if (neighbors[i].third != parentDir) continue
+                                                }
+                                            }
+
+                                            val (nx, nz, childParentDir) = neighbors[i]
                                             val nBlock = getRawBlock(nx, y, nz)
-                                            val newMeta = (level - 1) or (childParentDir shl 4)
+                                            var newMeta = (level - 1) or (childParentDir shl 4)
+                                            // Przekazujemy flagę strumienia dalej
+                                            if (nextIsTargeted || isTargetedStream) newMeta = newMeta or 0x80
+
 
                                             if (nBlock == 0) {
                                                 // Rozlej do pustego (poziom - 1)
@@ -2299,7 +2773,6 @@ class gridMap : JPanel() {
                     }
                 }
             }
-        }
 
         // Aplikowanie zmian
         updates.forEach { (chunkPos, list) ->
@@ -2321,6 +2794,19 @@ class gridMap : JPanel() {
                         chunk.setBlock(pos.x, pos.y, pos.z, id)
                         chunk.setMeta(pos.x, pos.y, pos.z, packedMeta)
                         changed = true
+                        
+                        // FIX: Broadcast zmian do klientów (jeśli Host)
+                        if (isHost) {
+                            val gx = chunkPos.x * 16 + pos.x
+                            val gy = pos.y
+                            val gz = chunkPos.y * 16 + pos.z
+                            try {
+                                val packet = NetworkProtocol.encodeBlockChange(gx, gy, gz, id, packedMeta.toByte())
+                                peerConnections.forEach { (_, rtc) -> rtc.sendData(packet) }
+                            } catch (e: Exception) {
+                                // ignore
+                            }
+                        }
                     }
                 }
                 if (changed) {
@@ -2332,6 +2818,52 @@ class gridMap : JPanel() {
                 }
             }
         }
+    }
+
+    // Proste sprawdzanie liniowe (Raycast) w jednym kierunku
+    private fun calculateLinearFlowCost(startX: Int, y: Int, startZ: Int, dx: Int, dz: Int, range: Int, fluidId: Int): Int {
+        // Sprawdzamy bloki w linii prostej od startX/startZ (który jest już sąsiadem źródła)
+        // FIX: Wracamy do '0 until range'. To jest sztywna granica.
+        // Jeśli spadek jest poza tym zakresem, woda ma go NIE widzieć i rozlewać się normalnie.
+        for (i in 0 until range) {
+            val cx = startX + (dx * i)
+            val cz = startZ + (dz * i)
+
+            // ZABEZPIECZENIE: Jeśli chunka nie ma (void/niezaładowany), traktujemy to jako ścianę, a nie spadek.
+            // Zapobiega to uciekaniu wody w nicość na krawędziach renderowania.
+            val chunkX = if (cx >= 0) cx / 16 else (cx + 1) / 16 - 1
+            val chunkZ = if (cz >= 0) cz / 16 else (cz + 1) / 16 - 1
+            if (!chunks.containsKey(Point(chunkX, chunkZ))) return 1000
+
+            val block = getRawBlock(cx, y, cz)
+
+            // Jeśli trafimy na ścianę (coś innego niż powietrze lub płyn), przerywamy - ślepa uliczka
+            if (block != 0 && block != fluidId && !fluidBlocks.contains(block)) return 1000
+
+            // Sprawdzamy co jest pod spodem
+            val below = getRawBlock(cx, y - 1, cz)
+
+            // Jeśli pod spodem jest dziura (powietrze) lub płyn (nawet ten sam - kontynuacja spadku) -> ZNALEZIONO SPADEK
+            if (below == 0) return i // Powietrze to zawsze spadek
+
+            if (fluidBlocks.contains(below)) {
+                if (below != fluidId) return i // Inny płyn to spadek (mieszanie)
+                
+                // Ten sam płyn: Sprawdzamy, czy to spadek.
+                val metaBelow = getFluidMeta(cx, y - 1, cz)
+                val levelBelow = metaBelow and 0xF
+                val parentDirBelow = (metaBelow shr 4) and 0x7
+
+                // Jest to spadek, jeśli:
+                // 1. Poniżej jest przepływ (poziom < 8), w który możemy się wlać.
+                // 2. Poniżej jest początek wodospadu (rodzic = UP), nawet jeśli ma level 8.
+                if (levelBelow < 8 || parentDirBelow == 1) {
+                    return i
+                }
+                // W przeciwnym razie, jest to stabilne dno jeziora (level=8, parent=0), więc to nie jest spadek.
+            }
+        }
+        return 1000
     }
 
     private fun addFluidUpdate(map: HashMap<Point, MutableList<Triple<BlockPos, Int, Int>>>, x: Int, y: Int, z: Int, id: Int, level: Int) {
@@ -2420,7 +2952,7 @@ class gridMap : JPanel() {
                     if (gameTime + gameHoursPassed >= 24.0) {
                         dayCounter += 1
                     }
-                    gameTime = (gameTime + gameHoursPassed) % 24.0
+                    if (!gameFrozen) gameTime = (gameTime + gameHoursPassed) % 24.0
 
                     val sunriseStart = 5.30; val dayFullStart = 7.00
                     val sunsetStart = 17.30; val nightFullStart = 19.00
@@ -2454,41 +2986,90 @@ class gridMap : JPanel() {
                         processInput()
                         processSingleInput()
                         updateWorld()
-                        cloudOffset += 1.0 / 30.0
+
                         gameTicks++
-                        simulateFluids(gameTicks)
-                        
+                        if (!gameFrozen) {
+                            cloudOffset += 1.0 / 30.0
+                            simulateFluids(gameTicks)
+                        }
+
+                        val now = System.currentTimeMillis()
+
+                        // --- CLIENT KEEP ALIVE ---
+                        if (!isHost && isMultiplayerClient) {
+                            if (now - lastKeepAliveSent > 5000) {
+                                lastKeepAliveSent = now
+                                try {
+                                    val packet = NetworkProtocol.encodeKeepAlive()
+                                    peerConnections.values.firstOrNull()?.sendData(packet)
+                                } catch (e: Exception) {
+                                    // ignore
+                                }
+                            }
+                        }
+
                         // --- MULTIPLAYER SEND ---
                         // Wysyłamy pozycję co 2 ticki (15 razy na sek)
-                        if (gameTicks % 2 == 0L && webRTCManager != null) {
+                        if (gameTicks % 2 == 0L && !peerConnections.isEmpty()) {
                             try {
                                 // Używamy nowego protokołu (15 bajtów zamiast 24+)
-                                val packet = NetworkProtocol.encodePlayerPosition(myPlayerId, camX, camY, camZ, yaw, pitch)
-                                webRTCManager?.sendData(packet)
+                                // ID gracza (Byte) jest teraz używane tylko lokalnie w pakiecie, 
+                                // ale prawdziwa identyfikacja odbywa się po kanale WebRTC.
+                                // FIX: Host wysyła swoje ID (1), Klient wysyła 0 (Host nadpisuje)
+                                val idToSend = if (isHost) 1.toByte() else 0.toByte()
+                                val packet = NetworkProtocol.encodePlayerPosition(idToSend, camX, camY, camZ, yaw, pitch)
+
+                                peerConnections.forEach { (_, rtc) ->
+                                    rtc.sendData(packet)
+                                }
                             } catch (e: Exception) {
                                 // Ignorujemy błędy pozycji, nie są krytyczne
                             }
                         }
 
                         // --- HOST LOGIC ---
-                        if (isHost && webRTCManager != null) {
+                        if (isHost) {
                             // 1. Aktualizuj kolejkę chunków wokół graczy
                             if (gameTicks % 30 == 0L) chunkStreamer.updateQueues() // Co sekundę sprawdzaj pozycje
-                            
+
                             // 2. Wyślij dane świata (Time/Seed) co sekundę
                             if (gameTicks % 30 == 0L) {
                                 try {
-                                    val worldPacket = NetworkProtocol.encodeWorldData(seed, gameTime, dayCounter)
-                                    webRTCManager?.sendData(worldPacket)
+                                    peerConnections.forEach { (pid, rtc) ->
+                                        val netId = playerNetIds[pid] ?: 0
+                                        // Proste wywołanie - przekazujemy grę i ID gracza
+                                        val worldPacket = NetworkProtocol.encodeWorldData(this, netId)
+                                        rtc.sendData(worldPacket)
+                                    }
                                 } catch (e: Exception) {
                                     println("Błąd wysyłania danych świata: ${e.message}")
                                 }
                             }
+
+                            // 3. Zarządzanie listą graczy (Timeout + Broadcast)
+                            if (now - lastPlayerListBroadcast > 5000) {
+                                lastPlayerListBroadcast = now
+
+                                // Sprawdź timeouty (np. 10 sekund braku KeepAlive)
+                                val timeoutThreshold = 10000
+                                val toRemove = ArrayList<String>()
+                                playerNetIds.forEach { (sigId, netId) ->
+                                    val p = remotePlayers[netId]
+                                    if (p != null && now - p.lastKeepAlive > timeoutThreshold) {
+                                        println("Gracz $netId ($sigId) przekroczył czas oczekiwania (Timeout).")
+                                        toRemove.add(sigId)
+                                    }
+                                }
+                                toRemove.forEach { removePlayer(it) }
+
+                                // Wyślij listę
+                                broadcastPlayerList()
+                            }
                         }
-                        
+
                         // Obsługa wysyłania chunków (jeśli jesteśmy hostem i mamy coś w kolejce)
                         chunkStreamer.tick()
-                        
+
                         modLoader.notifyTick()
                         delta--
                         inputManager.resetFrameState()
@@ -2524,6 +3105,23 @@ class gridMap : JPanel() {
                 }
             }
         }.start()
+    }
+
+    private fun broadcastPlayerList() {
+        if (!isHost) return
+        try {
+            // Budujemy listę wszystkich graczy (Host + Klienci)
+            val allPlayers = HashMap<Byte, RemotePlayer>()
+            // Dodaj Hosta (ID 1)
+            allPlayers[1] = RemotePlayer(camX, camY, camZ, yaw, pitch, System.currentTimeMillis(), System.currentTimeMillis())
+            // Dodaj Klientów
+            allPlayers.putAll(remotePlayers)
+
+            val packet = NetworkProtocol.encodePlayerList(allPlayers)
+            peerConnections.forEach { (_, rtc) -> rtc.sendData(packet) }
+        } catch (e: Exception) {
+            println("Błąd broadcastu listy graczy: ${e.message}")
+        }
     }
 
     private fun handleMenuClick(p: Point) {
@@ -2831,7 +3429,7 @@ class gridMap : JPanel() {
                 val packedLight = clipped.lightLevel
                 val skyLight = (packedLight shr 4) and 0xF
                 val blockLight = packedLight and 0xF
-                
+
                 // Używamy wymiennego procesora oświetlenia!
                 val finalRGB = lightProcessor.process(
                     (clipped.p1.x + camX).toInt(),
@@ -2839,7 +3437,7 @@ class gridMap : JPanel() {
                     (clipped.p1.z + camZ).toInt(),
                     clipped.color, skyLight, blockLight, globalSunIntensity, minLightFactor + FullbrightFactor
                 )
-                
+
                 fillTriangle(p1_2d, p2_2d, p3_2d, clipped.p1, clipped.p2, clipped.p3, Color(finalRGB))
             }
         }
@@ -2866,12 +3464,12 @@ class gridMap : JPanel() {
                     (clipped.p1.z + camZ).toInt(),
                     clipped.color, skyLight, blockLight, globalSunIntensity, minLightFactor + FullbrightFactor
                 )
-                
+
                 // Musimy zachować alpha z oryginalnego koloru
                 val r = (finalRGB shr 16) and 0xFF
                 val g = (finalRGB shr 8) and 0xFF
                 val b = finalRGB and 0xFF
-                
+
                 fillTransparentTriangle(p1_2d, p2_2d, p3_2d, clipped.p1, clipped.p2, clipped.p3, Color(r, g, b, clipped.color.alpha))
             }
         }
@@ -2891,10 +3489,15 @@ class gridMap : JPanel() {
             renderXRay()
         }
 
-        // --- RENDER REMOTE PLAYERS ---
-        remotePlayers.forEach { (id, player) ->
-            if (id == myPlayerId) return@forEach // Nie rysuj siebie
+        // --- DEBUG: Rysowanie wykrytych spadków cieczy ---
+        if (debugActiveDrops.isNotEmpty()) {
+            debugActiveDrops.forEach { pos -> drawSelectionBox(pos, Color.GREEN) }
+        }
 
+        // --- RENDER REMOTE PLAYERS ---
+        val myIdByte = myPlayerId.toByteOrNull()
+        remotePlayers.forEach { (id, player) ->
+            if (myIdByte != null && id == myIdByte) return@forEach
             // Proste renderowanie gracza jako pudełka (hitboxa)
             // W przyszłości podmień to na model 3D
             val pPos = BlockPos(
@@ -3618,7 +4221,7 @@ class gridMap : JPanel() {
         }
     }
 
-    private fun drawSelectionBox(block: BlockPos) {
+    private fun drawSelectionBox(block: BlockPos, color: Color = Color.BLACK) {
         val x = block.x * cubeSize
         val y = block.y * cubeSize - 10.0
         val z = block.z * cubeSize
@@ -3646,8 +4249,6 @@ class gridMap : JPanel() {
         val c5 = Vector3d(x + d, bottomY, z + d)
         val c6 = Vector3d(x + d, topY, z + d)
         val c7 = Vector3d(x - d, topY, z + d)
-
-        val color = Color.BLACK
 
         // Front
         drawLine3D(c0, c1, color); drawLine3D(c1, c2, color)
@@ -3896,8 +4497,7 @@ class gridMap : JPanel() {
         var rowW = wStart
 
         for (y in minY..maxY) {
-            var v = rowV
-            var w = rowW
+            var v = rowV; var w = rowW
 
             // Indeks w tablicy pikseli (optymalizacja dostępu do tablicy)
             var pixelIndex = y * imageWidth + minX
@@ -3955,15 +4555,15 @@ class gridMap : JPanel() {
                 // Other states are fully handled by UIManager
             }
         }
-        
+
         // Obliczanie skali UI
-        val sx = width.toDouble() / referenceWidth
-        val sy = height.toDouble() / referenceHeight
+        val sx = width.toDouble() / uiReferenceWidth
+        val sy = height.toDouble() / uiReferenceHeight
 
         // Render UI from UIManager
         val mousePos = MouseInfo.getPointerInfo().location
         SwingUtilities.convertPointFromScreen(mousePos, this)
-        
+
         val uiMouseX = (mousePos.x / sx).toInt()
         val uiMouseY = (mousePos.y / sy).toInt()
 
@@ -3971,7 +4571,7 @@ class gridMap : JPanel() {
         g2d.scale(sx, sy)
         uiManager.render(g2d, uiMouseX, uiMouseY)
         g2d.transform = oldTransform
-        
+
         // Mod render hook (legacy)
         modLoader.notifyRender(g2d, width, height)
     }
@@ -4012,6 +4612,7 @@ class gridMap : JPanel() {
                 if (gameState == GameState.IN_GAME) {
                     gameState = GameState.PAUSED
                     inputManager.releaseMouse()
+                    openServerButtonComponent?.isEnabled = !isMultiplayerClient
                     continue
                 } else if (gameState == GameState.PAUSED) {
                     gameState = GameState.IN_GAME
@@ -4020,6 +4621,19 @@ class gridMap : JPanel() {
                 }
             }
 
+            if (keyCode == KeyEvent.VK_Y) {
+                val currentChunkX = floor(camX / 32.0).toInt()
+                val currentChunkZ = floor(camZ / 32.0).toInt()
+                val radius = 2
+
+                println("Force refreshing chunks around player (Radius: $radius, High Priority)...")
+                for (dx in -radius..radius) {
+                    for (dz in -radius..radius) {
+                        // Ustawiamy flagę wysokiego priorytetu na true
+                        refreshChunkData(currentChunkX + dx, currentChunkZ + dz, isHighPriority = true)
+                    }
+                }
+            }
             if (gameState == GameState.CREATE_WORLD) {
                 // Key processing is handled by UIManager
                 // but we still need to consume the event from the manager
@@ -4066,6 +4680,11 @@ class gridMap : JPanel() {
                 }
                 if (keyCode == KeyEvent.VK_X) {
                     debugXray = !debugXray
+                    println("debugXray: $debugXray")
+                }
+                if (keyCode == KeyEvent.VK_F) {
+                    gameFrozen = !gameFrozen
+                    println("gameFrozen: $gameFrozen")
                 }
                 if (keyCode == KeyEvent.VK_G) {
                     println("camX: ${(floor((camX + (cubeSize/2))/2)).toSmartString()}, camY: ${(floor((camY + (cubeSize/2))/2)+5).toSmartString()}, camZ: ${(floor((camZ + (cubeSize/2))/2)).toSmartString()}, yaw: ${yaw.toSmartString()}, pitch: ${pitch.toSmartString()}, speed: $currentSpeed")
@@ -4147,6 +4766,10 @@ class gridMap : JPanel() {
             yaw += inputManager.mouseDeltaX * inputManager.sensitivity
             pitch -= inputManager.mouseDeltaY * inputManager.sensitivity
         }
+
+        if (inputManager.isKeyDown(KeyEvent.VK_TAB)) {
+            if (isMultiplayer) showPlayerList = true
+        } else showPlayerList = false
 
         // Obsługa ciągłego niszczenia/stawiania bloków
         val currentTime = System.currentTimeMillis()
@@ -4378,45 +5001,51 @@ class gridMap : JPanel() {
         }
         return false
     }
-
-    fun Double.toSmartString(): String {
-        val rawValue = this
-        val rounded = Math.round(rawValue * 10.0) / 10.0
-
-        return if (rounded % 1.0 == 0.0) {
-            rounded.toInt().toString()
-        } else {
-            rounded.toString()
-        }
-    }
 }
 
 fun main(args: Array<String>) {
-    // --- AUTO-RESTART MEMORY HACK ---
-    // Sprawdzamy, czy mamy przydzielone mniej niż 900MB (celujemy w 1024MB)
-    val maxMem = Runtime.getRuntime().maxMemory()
-    val isLowMemory = maxMem < 900L * 1024 * 1024
+    // --- FORCE RESTART WITH JVM FLAGS ---
+    // Sprawdzamy flagę, aby uniknąć pętli nieskończonej
+    val isRestarted = System.getProperty("app.restarted") == "true"
 
     // Pobieramy ścieżkę do aktualnego pliku JAR
     val location = gridMap::class.java.protectionDomain.codeSource.location
     val currentFile = File(location.toURI())
 
-    // Jeśli to jest plik .jar (a nie uruchomienie z IDE) i mamy za mało pamięci -> Restartujemy
-    if (currentFile.isFile && currentFile.name.endsWith(".jar", ignoreCase = true) && isLowMemory) {
-        val javaBin = System.getProperty("java.home") + File.separator + "bin" + File.separator + "java"
-        
+    // Jeśli nie był jeszcze restartowany -> BEZWARUNKOWY RESTART (Działa w IDE i JAR)
+    if (!isRestarted) {
+        var javaBin = System.getProperty("java.home") + File.separator + "bin" + File.separator + "java"
+        // Fix dla Windowsa: ProcessBuilder wymaga .exe przy pełnej ścieżce
+        if (System.getProperty("os.name").lowercase().contains("win")) {
+            javaBin += ".exe"
+        }
+
         val command = ArrayList<String>()
         command.add(javaBin)
+        // Wymuszone parametry pamięci i GC
         command.add("-Xmx1024m")
         command.add("-Xms512m")
         command.add("-XX:+UseZGC")
         command.add("-XX:+ZGenerational")
-        command.add("-jar")
-        command.add(currentFile.absolutePath)
-        command.addAll(args)
+        command.add("-Dapp.restarted=true")
 
-        println("Wykryto niski limit pamięci (${maxMem / 1024 / 1024} MB). Restartowanie z parametrami: -Xmx1024m...")
-        ProcessBuilder(command).start()
+        // Wykrywanie trybu uruchomienia: JAR czy IDE (Classpath)
+        if (currentFile.isFile && currentFile.name.endsWith(".jar", ignoreCase = true)) {
+            command.add("-jar")
+            command.add(currentFile.absolutePath)
+        } else {
+            // W IDE musimy podać classpath i klasę główną, bo nie mamy pliku .jar
+            command.add("-cp")
+            command.add(System.getProperty("java.class.path"))
+            command.add("org.lewapnoob.gridMap.GridMapKt")
+        }
+
+        command.addAll(args.toList())
+
+        println("Wymuszanie restartu z parametrami: -Xmx1024m -XX:+UseZGC...")
+        val pb = ProcessBuilder(command)
+        pb.inheritIO()
+        pb.start()
         System.exit(0)
     }
 

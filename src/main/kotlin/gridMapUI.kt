@@ -4,7 +4,14 @@ import java.awt.*
 import java.awt.event.KeyEvent
 import java.awt.event.MouseEvent
 import java.awt.image.BufferedImage
+import java.awt.datatransfer.DataFlavor
+import java.awt.datatransfer.StringSelection
+import kotlin.math.abs
+import kotlin.math.min
+import kotlin.math.max
 import java.util.concurrent.CopyOnWriteArrayList
+import kotlin.collections.component1
+import kotlin.collections.component2
 import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.math.floor
@@ -126,9 +133,24 @@ class UIText(
 
 class UITextField(
     x: Int, y: Int, width: Int, height: Int,
-    var text: String = "",
+    text: String = "",
     var placeholder: String = ""
 ) : UIComponent() {
+    var text: String = text
+        set(value) {
+            field = value
+            // Zabezpieczenie indeksów przy zmianie tekstu z zewnątrz
+            if (cursorIndex > field.length) cursorIndex = field.length
+            if (selectionStartIndex > field.length) selectionStartIndex = field.length
+        }
+
+    private var cursorIndex = this.text.length
+    private var selectionStartIndex = this.text.length
+    private val padding = 10
+    private var lastFontMetrics: FontMetrics? = null
+    private var targetScrollOffset = 0
+    private var currentScrollOffset = 0.0
+
     init {
         this.x = x
         this.y = y
@@ -136,9 +158,26 @@ class UITextField(
         this.height = height
     }
 
+    private fun getSelectionBounds(): Pair<Int, Int> {
+        val start = min(cursorIndex, selectionStartIndex)
+        val end = max(cursorIndex, selectionStartIndex)
+        return start to end
+    }
+
+    private fun deleteSelection() {
+        val (start, end) = getSelectionBounds()
+        if (start != end) {
+            text = text.removeRange(start, end)
+            cursorIndex = start
+            selectionStartIndex = cursorIndex
+        }
+    }
+
     override fun render(g: Graphics2D, game: gridMap, mouseX: Int, mouseY: Int) {
         if (!isVisible) return
 
+        // Rysowanie placeholdera (jeśli tekst pusty i brak focusa LUB jako etykieta nad polem)
+        // W oryginalnym kodzie placeholder był rysowany nad polem (y-5), więc zachowujemy to.
         if (placeholder.isNotEmpty()) {
             g.color = Color.LIGHT_GRAY
             g.font = game.fpsFont.deriveFont(32f)
@@ -153,13 +192,57 @@ class UITextField(
         val oldClip = g.clip
         g.clipRect(x, y, width, height)
 
-        g.color = Color.WHITE
         g.font = game.fpsFont.deriveFont(32f)
         val fm = g.fontMetrics
-        g.drawString(text, x + 10, y + fm.ascent)
+        lastFontMetrics = fm
+        
+        // --- LOGIKA PRZEWIJANIA (SCROLL) ---
+        val visibleWidth = width - (padding * 2)
+        val cursorPixelPos = fm.stringWidth(text.substring(0, cursorIndex))
+        val textWidth = fm.stringWidth(text)
 
+        if (textWidth <= visibleWidth) {
+            targetScrollOffset = 0
+        } else {
+            // Jeśli kursor wyjechał w prawo poza widok
+            if (cursorPixelPos > targetScrollOffset + visibleWidth) {
+                targetScrollOffset = cursorPixelPos - visibleWidth
+            }
+            // Jeśli kursor wyjechał w lewo poza widok
+            if (cursorPixelPos < targetScrollOffset) {
+                targetScrollOffset = cursorPixelPos
+            }
+        }
+        // Upewnij się, że target jest w prawidłowym zakresie
+        targetScrollOffset = targetScrollOffset.coerceIn(0, max(0, textWidth - visibleWidth))
+
+        // Płynna animacja do docelowego offsetu
+        val animationFactor = 0.3 // Im większa wartość (do 1.0), tym szybsza animacja
+        currentScrollOffset += (targetScrollOffset - currentScrollOffset) * animationFactor
+        if (abs(targetScrollOffset - currentScrollOffset) < 0.5) {
+            currentScrollOffset = targetScrollOffset.toDouble()
+        }
+        val renderScrollOffset = currentScrollOffset.toInt()
+
+        val drawY = y + fm.ascent
+
+        // Rysowanie zaznaczenia
+        if (isFocused) {
+            val (start, end) = getSelectionBounds()
+            if (start != end) {
+                val prefixWidth = fm.stringWidth(text.substring(0, start))
+                val selWidth = fm.stringWidth(text.substring(start, end))
+                g.color = Color(0, 0, 255, 128) // Niebieskie tło zaznaczenia
+                g.fillRect(x + padding + prefixWidth - renderScrollOffset, y + 5, selWidth, height - 10)
+            }
+        }
+
+        g.color = Color.WHITE
+        g.drawString(text, x + padding - renderScrollOffset, drawY)
+
+        // Rysowanie kursora
         if (isFocused && (System.currentTimeMillis() / 500) % 2 == 0L) {
-            val cursorX = x + 10 + fm.stringWidth(text)
+            val cursorX = x + padding + cursorPixelPos - renderScrollOffset
             g.fillRect(cursorX, y + 5, 2, height - 10)
         }
         g.clip = oldClip
@@ -168,21 +251,167 @@ class UITextField(
     override fun onClick(clickX: Int, clickY: Int): Boolean {
         if (!isVisible || !isEnabled) return false
         isFocused = isMouseOver(clickX, clickY)
+        
+        if (isFocused && lastFontMetrics != null) {
+            // Obliczanie pozycji kursora na podstawie kliknięcia
+            val fm = lastFontMetrics!!
+            // Uwzględniamy scrollOffset przy kliknięciu
+            val localX = clickX - (x + padding) + currentScrollOffset.toInt()
+            var bestIndex = 0
+            var minDiff = Int.MAX_VALUE
+            
+            for (i in 0..text.length) {
+                val w = fm.stringWidth(text.substring(0, i))
+                val diff = abs(w - localX)
+                if (diff < minDiff) {
+                    minDiff = diff
+                    bestIndex = i
+                } else {
+                    // Jeśli różnica zaczyna rosnąć, to znaczy, że minęliśmy najlepszy punkt
+                    break 
+                }
+            }
+            cursorIndex = bestIndex
+            selectionStartIndex = cursorIndex // Reset zaznaczenia przy kliknięciu
+        }
         return isFocused
+    }
+    
+    // Obsługa przeciągania myszką (zaznaczanie tekstu)
+    override fun onDrag(dragX: Int, dragY: Int) {
+        if (isFocused && lastFontMetrics != null) {
+            val fm = lastFontMetrics!!
+            // Uwzględniamy scrollOffset przy przeciąganiu
+            val localX = dragX - (x + padding) + currentScrollOffset.toInt()
+            var bestIndex = 0
+            var minDiff = Int.MAX_VALUE
+            
+            for (i in 0..text.length) {
+                val w = fm.stringWidth(text.substring(0, i))
+                val diff = abs(w - localX)
+                if (diff < minDiff) {
+                    minDiff = diff
+                    bestIndex = i
+                } else break
+            }
+            cursorIndex = bestIndex
+            // Nie resetujemy selectionStartIndex podczas przeciągania
+        }
     }
 
     override fun onKey(e: KeyEvent): Boolean {
         if (!isFocused) return false
 
-        if (e.id == KeyEvent.KEY_TYPED) {
-            val char = e.keyChar
-            if (char.code >= 32 && char.code != 127) {
-                if (text.length < 30) text += char
-                return true
+        val isCtrl = e.isControlDown
+        val isShift = e.isShiftDown
+
+        if (e.id == KeyEvent.KEY_PRESSED) {
+            when (e.keyCode) {
+                KeyEvent.VK_LEFT -> {
+                    if (cursorIndex > 0) cursorIndex--
+                    if (!isShift) selectionStartIndex = cursorIndex
+                    return true
+                }
+                KeyEvent.VK_RIGHT -> {
+                    if (cursorIndex < text.length) cursorIndex++
+                    if (!isShift) selectionStartIndex = cursorIndex
+                    return true
+                }
+                KeyEvent.VK_HOME -> {
+                    cursorIndex = 0
+                    if (!isShift) selectionStartIndex = cursorIndex
+                    return true
+                }
+                KeyEvent.VK_END -> {
+                    cursorIndex = text.length
+                    if (!isShift) selectionStartIndex = cursorIndex
+                    return true
+                }
+                KeyEvent.VK_BACK_SPACE -> {
+                    val (start, end) = getSelectionBounds()
+                    if (start != end) {
+                        deleteSelection()
+                    } else if (cursorIndex > 0) {
+                        cursorIndex--
+                        text = text.removeRange(cursorIndex, cursorIndex + 1)
+                        selectionStartIndex = cursorIndex
+                    }
+                    return true
+                }
+                KeyEvent.VK_DELETE -> {
+                    val (start, end) = getSelectionBounds()
+                    if (start != end) {
+                        deleteSelection()
+                    } else if (cursorIndex < text.length) {
+                        text = text.removeRange(cursorIndex, cursorIndex + 1)
+                        // kursor zostaje w miejscu
+                        selectionStartIndex = cursorIndex
+                    }
+                    return true
+                }
+                KeyEvent.VK_A -> {
+                    if (isCtrl) {
+                        selectionStartIndex = 0
+                        cursorIndex = text.length
+                        return true
+                    }
+                }
+                KeyEvent.VK_C -> {
+                    if (isCtrl) {
+                        val (start, end) = getSelectionBounds()
+                        if (start != end) {
+                            val selectedText = text.substring(start, end)
+                            val selection = StringSelection(selectedText)
+                            Toolkit.getDefaultToolkit().systemClipboard.setContents(selection, selection)
+                        }
+                        return true
+                    }
+                }
+                KeyEvent.VK_V -> {
+                    if (isCtrl) {
+                        try {
+                            val clipboard = Toolkit.getDefaultToolkit().systemClipboard
+                            if (clipboard.isDataFlavorAvailable(DataFlavor.stringFlavor)) {
+                                val pasteText = clipboard.getData(DataFlavor.stringFlavor) as String
+                                deleteSelection()
+                                // Limit długości tekstu (np. 30 znaków jak w oryginale)
+                                val spaceLeft = 32 - text.length
+                                val toInsert = if (pasteText.length > spaceLeft) pasteText.substring(0, spaceLeft) else pasteText
+                                
+                                if (toInsert.isNotEmpty()) {
+                                    text = text.substring(0, cursorIndex) + toInsert + text.substring(cursorIndex)
+                                    cursorIndex += toInsert.length
+                                    selectionStartIndex = cursorIndex
+                                }
+                            }
+                        } catch (ex: Exception) {
+                            ex.printStackTrace()
+                        }
+                        return true
+                    }
+                }
+                KeyEvent.VK_X -> {
+                    if (isCtrl) {
+                        val (start, end) = getSelectionBounds()
+                        if (start != end) {
+                            val selectedText = text.substring(start, end)
+                            val selection = StringSelection(selectedText)
+                            Toolkit.getDefaultToolkit().systemClipboard.setContents(selection, selection)
+                            deleteSelection()
+                        }
+                        return true
+                    }
+                }
             }
-        } else if (e.id == KeyEvent.KEY_PRESSED) {
-            if (e.keyCode == KeyEvent.VK_BACK_SPACE && text.isNotEmpty()) {
-                text = text.dropLast(1)
+        } else if (e.id == KeyEvent.KEY_TYPED) {
+            val char = e.keyChar
+            if (!isCtrl && char.code >= 32 && char.code != 127) {
+                deleteSelection()
+                if (text.length < 32) {
+                    text = text.substring(0, cursorIndex) + char + text.substring(cursorIndex)
+                    cursorIndex++
+                    selectionStartIndex = cursorIndex
+                }
                 return true
             }
         }
@@ -267,10 +496,12 @@ class UIScrollPanel(
         val relativeX = clickX - x
         val relativeY = clickY - y + scrollY
 
+        var handled = false
         for (child in children) {
-            if (child.onClick(relativeX, relativeY)) return true
+            // Iterujemy po wszystkich, aby zaktualizować focus (np. odznaczyć inne pola)
+            if (child.onClick(relativeX, relativeY)) handled = true
         }
-        return false
+        return handled
     }
 
     override fun onScroll(amount: Int) {
@@ -331,6 +562,50 @@ class UIFpsCounter : UIComponent() {
         val fpsText = "${game.fps}"
         val fm = g.fontMetrics
         g.drawString(fpsText, game.referenceWidth - fm.stringWidth(fpsText) - 10, fm.ascent + 10)
+    }
+}
+
+class UIPlayerList : UIComponent() {
+    override fun render(g: Graphics2D, game: gridMap, mouseX: Int, mouseY: Int) {
+        if (!game.showPlayerList) return
+
+        val fm = g.fontMetrics
+
+        var myId = ""
+        if (game.myPlayerId == "") myId = "host" else myId = game.myPlayerId
+
+        val PlayerCount = "Players (${game.remotePlayers.size+1}):"
+        val SessionID = ":  : ${myId} (${floor((game.camX + (game.cubeSize/2))/2).toInt()}, ${floor((game.camY + (game.cubeSize/2))/2).toInt()+5}, ${floor((game.camZ + (game.cubeSize/2)) /2).toInt()})"
+        // Obliczenia dla wyśrodkowania listy (-200 do +200 od środka)
+        val centerX = game.referenceWidth / 2
+        val listWidth = 400
+        val startX = centerX - 200
+        val textX = startX + 10 // Padding 10 od lewej krawędzi listy
+
+        val oldClip = g.clip
+        g.clipRect(startX, 0, listWidth, game.referenceHeight)
+
+        g.color = Color(0.82f, 0.82f, 0.82f, 0.25f)
+        g.fillRect(startX, 15, listWidth, fm.ascent)
+        g.fillRect(startX, fm.ascent + 15, listWidth, fm.ascent)
+        
+        g.color = Color.WHITE
+        g.drawString(PlayerCount, textX, fm.ascent + 10)
+        g.drawString(SessionID, textX, fm.ascent*2 + 10)
+
+        var i = 0
+        game.remotePlayers.forEach { (netId, player) ->
+            val playerText = ":  : $netId (${(floor((player.x + (game.cubeSize/2))/2)).toSmartString()}, ${(floor((player.y + (game.cubeSize/2))/2)+5).toSmartString()}, ${(floor((player.z + (game.cubeSize/2))/2)).toSmartString()})"
+
+            g.color = Color(0.82f, 0.82f, 0.82f, 0.25f)
+            g.fillRect(startX, fm.ascent * (2 + i) + 15, listWidth, fm.ascent)
+
+            g.color = Color.WHITE
+            g.drawString(playerText, textX, fm.ascent * (3 + i) + 10)
+            i++
+        }
+
+        g.clip = oldClip
     }
 }
 
@@ -575,10 +850,12 @@ class UIPanel {
     }
 
     fun handleClick(x: Int, y: Int): Boolean {
+        var handled = false
         for (component in components) {
-            if (component.onClick(x, y)) return true
+            // Iterujemy po wszystkich komponentach, aby każdy mógł zaktualizować swój stan focusa
+            if (component.onClick(x, y)) handled = true
         }
-        return false
+        return handled
     }
 
     fun handleHover(x: Int, y: Int) = components.forEach { it.onHover(x, y) }

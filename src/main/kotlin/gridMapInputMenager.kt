@@ -35,6 +35,7 @@ open class InputManager(private val component: Component) {
         private set
 
     init {
+        component.focusTraversalKeysEnabled = false
         component.addKeyListener(KeyboardListener())
         component.addMouseListener(MouseListener())
         component.addMouseMotionListener(MouseMotionListener())

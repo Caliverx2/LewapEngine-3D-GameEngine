@@ -63,19 +63,33 @@ sealed class SignalingMessage {
      */
     @Serializable
     @SerialName("sdp_offer")
-    data class SdpOffer(val sdp: String, val targetId: String? = null) : SignalingMessage()
+    data class SdpOffer(
+        val sdp: String,
+        val targetId: String? = null,
+        val senderId: String? = null
+    ) : SignalingMessage()
 
     /**
      * Session Description Protocol - Odpowiedź.
      */
     @Serializable
     @SerialName("sdp_answer")
-    data class SdpAnswer(val sdp: String, val targetId: String? = null) : SignalingMessage()
+    data class SdpAnswer(
+        val sdp: String,
+        val targetId: String? = null,
+        val senderId: String? = null
+    ) : SignalingMessage()
 
     /**
      * ICE Candidate (Interactive Connectivity Establishment).
      */
     @Serializable
     @SerialName("ice_candidate")
-    data class IceCandidate(val candidate: String, val sdpMid: String?, val sdpMLineIndex: Int?, val targetId: String? = null) : SignalingMessage()
+    data class IceCandidate(
+        val candidate: String,
+        val sdpMid: String?,
+        val sdpMLineIndex: Int?,
+        val targetId: String? = null,
+        val senderId: String? = null
+    ) : SignalingMessage()
 }
