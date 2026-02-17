@@ -145,7 +145,8 @@ class gridMap : JPanel() {
     val oreColors = ConcurrentHashMap.newKeySet<Int>()
 
     // Debugowanie płynów - lista wykrytych spadków
-    val debugActiveDrops = ConcurrentHashMap.newKeySet<BlockPos>()
+    var debugActiveDrops = false
+    val debugActiveDropsList = ConcurrentHashMap.newKeySet<BlockPos>()
 
     // Zbiór bloków, które mają być ignorowane przez standardowy renderer (bo mod je rysuje sam)
     val customRenderBlocks = ConcurrentHashMap.newKeySet<Int>()
@@ -157,7 +158,6 @@ class gridMap : JPanel() {
     var currentSkyColor = Color(113, 144, 225).rgb
     var stars = ArrayList<Vector3d>()
     var cloudOffset = 0.0
-    var FullbrightFactor = 0.0
 
     val imageWidth = baseCols + 1
     val displayImage = BufferedImage(imageWidth, baseRows + 1, BufferedImage.TYPE_INT_RGB)
@@ -893,7 +893,6 @@ class gridMap : JPanel() {
         debugNoclip = false
         debugFly = false
         debugFullbright = false
-        FullbrightFactor = 0.0
         showChunkBorders = false
         showPlayerList = false
         gameFrozen = false
@@ -932,7 +931,6 @@ class gridMap : JPanel() {
             debugNoclip = worldData.debugNoclip
             debugFly = worldData.debugFly
             debugFullbright = worldData.debugFullbright
-            FullbrightFactor = if (debugFullbright) 1.0 else 0.0
             showChunkBorders = worldData.showChunkBorders
             debugXray = worldData.debugXray
             gameTime = worldData.gameTime
@@ -1001,7 +999,7 @@ class gridMap : JPanel() {
                 // Assign NetID
                 playerNetIds.computeIfAbsent(msg.playerId) { nextNetId++ }
                 // Host inicjuje WebRTC dla każdego nowego gracza
-                initWebRTC(targetId = msg.playerId, isHost = true)
+                SwingUtilities.invokeLater { initWebRTC(targetId = msg.playerId, isHost = true)}
             }
             is SignalingMessage.SdpOffer -> {
                 println("Otrzymano ofertę SDP od ${msg.senderId}.")
@@ -2557,7 +2555,7 @@ class gridMap : JPanel() {
 
         // Lista zmian do zaaplikowania (aby uniknąć problemów z modyfikacją podczas iteracji)
         // Czyścimy debugowanie spadków na początku ticku fizyki
-        debugActiveDrops.clear()
+        debugActiveDropsList.clear()
 
         val updates = HashMap<Point, MutableList<Triple<BlockPos, Int, Int>>>() // Chunk -> List(Pos, BlockID, Level)
 
@@ -2722,7 +2720,7 @@ class gridMap : JPanel() {
                                                 if (costs[i] == minCost) {
                                                     val dropX = wx + (dxs[i] * (minCost + 1))
                                                     val dropZ = wz + (dzs[i] * (minCost + 1))
-                                                    debugActiveDrops.add(BlockPos(dropX, y - 1, dropZ))
+                                                    debugActiveDropsList.add(BlockPos(dropX, y - 1, dropZ))
                                                 }
                                             }
                                         }
@@ -3390,10 +3388,12 @@ class gridMap : JPanel() {
                                             val packedLight = tri.lightLevel
                                             val skyLight = (packedLight shr 4) and 0xF
                                             val blockLight = packedLight and 0xF
-                                            val finalRGB = lightProcessor.process(
-                                                (tri.p1.x + camX).toInt(), (tri.p1.y + viewY).toInt(), (tri.p1.z + camZ).toInt(),
-                                                tri.color, skyLight, blockLight, globalSunIntensity, minLightFactor + FullbrightFactor
-                                            )
+                                            val finalRGB = if (!debugFullbright) {lightProcessor.process(
+                                                (tri.p1.x + camX).toInt(),
+                                                (tri.p1.y + viewY).toInt(),
+                                                (tri.p1.z + camZ).toInt(),
+                                                tri.color, skyLight, blockLight, globalSunIntensity, minLightFactor
+                                            )} else {tri.color.rgb}
 
                                             // Optimized Rasterization (No Vector3d creation)
                                             fillTriangleOptimized(
@@ -3431,12 +3431,12 @@ class gridMap : JPanel() {
                 val blockLight = packedLight and 0xF
 
                 // Używamy wymiennego procesora oświetlenia!
-                val finalRGB = lightProcessor.process(
+                val finalRGB = if (!debugFullbright) {lightProcessor.process(
                     (clipped.p1.x + camX).toInt(),
                     (clipped.p1.y + viewY).toInt(),
                     (clipped.p1.z + camZ).toInt(),
-                    clipped.color, skyLight, blockLight, globalSunIntensity, minLightFactor + FullbrightFactor
-                )
+                    clipped.color, skyLight, blockLight, globalSunIntensity, minLightFactor
+                )} else {clipped.color.rgb}
 
                 fillTriangle(p1_2d, p2_2d, p3_2d, clipped.p1, clipped.p2, clipped.p3, Color(finalRGB))
             }
@@ -3458,12 +3458,12 @@ class gridMap : JPanel() {
                 val blockLight = packedLight and 0xF
 
                 // To samo dla przezroczystych
-                val finalRGB = lightProcessor.process(
+                val finalRGB = if(!debugFullbright) {lightProcessor.process(
                     (clipped.p1.x + camX).toInt(),
                     (clipped.p1.y + viewY).toInt(),
                     (clipped.p1.z + camZ).toInt(),
-                    clipped.color, skyLight, blockLight, globalSunIntensity, minLightFactor + FullbrightFactor
-                )
+                    clipped.color, skyLight, blockLight, globalSunIntensity, minLightFactor
+                )} else {clipped.color.rgb}
 
                 // Musimy zachować alpha z oryginalnego koloru
                 val r = (finalRGB shr 16) and 0xFF
@@ -3490,8 +3490,10 @@ class gridMap : JPanel() {
         }
 
         // --- DEBUG: Rysowanie wykrytych spadków cieczy ---
-        if (debugActiveDrops.isNotEmpty()) {
-            debugActiveDrops.forEach { pos -> drawSelectionBox(pos, Color.GREEN) }
+        if (debugActiveDrops) {
+            if (debugActiveDropsList.isNotEmpty()) {
+                debugActiveDropsList.forEach { pos -> drawSelectionBox(pos, Color.GREEN) }
+            }
         }
 
         // --- RENDER REMOTE PLAYERS ---
@@ -4672,8 +4674,11 @@ class gridMap : JPanel() {
                 }
                 if (keyCode == KeyEvent.VK_NUMPAD7) {
                     debugFullbright = !debugFullbright
-                    if (debugFullbright) FullbrightFactor = 1.0 else FullbrightFactor = 0.0
                     println("DebugFullbright: $debugFullbright")
+                }
+                if (keyCode == KeyEvent.VK_NUMPAD6) {
+                    debugActiveDrops = !debugActiveDrops
+                    println("DebugActiveDrops: $debugActiveDrops")
                 }
                 if (keyCode == KeyEvent.VK_F3) {
                     showChunkBorders = !showChunkBorders

@@ -11,16 +11,16 @@ class WebRTCManager(
     private val onSdpAnswer: (RTCSessionDescription) -> Unit,
     private val onDataReceived: (ByteBuffer) -> Unit
 ) {
-    private val factory: PeerConnectionFactory
+    companion object {
+        // Singleton: Fabryka tworzona tylko raz dla całej aplikacji
+        private val factory: PeerConnectionFactory by lazy { PeerConnectionFactory() }
+    }
+
     private var peerConnection: RTCPeerConnection? = null
     private var dataChannel: RTCDataChannel? = null
 
     // Kolejka kandydatów ICE, którzy pojawili się przed utworzeniem PC
     private val pendingIceCandidates = ConcurrentLinkedQueue<RTCIceCandidate>()
-
-    init {
-        factory = PeerConnectionFactory()
-    }
 
     fun startConnection(isHost: Boolean) {
         val iceServer = RTCIceServer()
@@ -172,6 +172,6 @@ class WebRTCManager(
     fun close() {
         dataChannel?.close()
         peerConnection?.close()
-        factory.dispose()
+        // Nie niszczymy fabryki (factory.dispose()), bo jest współdzielona!
     }
 }
