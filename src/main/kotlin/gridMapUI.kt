@@ -617,7 +617,7 @@ class UIDebugInfo : UIComponent() {
         val currentChunkX = floor(game.camX / 32.0).toInt()
         val currentChunkZ = floor(game.camZ / 32.0).toInt()
         val chunkText = "Chunk: c_${currentChunkX}_${currentChunkZ}.dat"
-        val posText = "Position: (${floor((game.camX + (game.cubeSize/2))/2).toInt()}, ${floor((game.camY + (game.cubeSize/2))/2).toInt()+5}, ${floor((game.camZ + (game.cubeSize/2)) /2).toInt()})"
+        val posText = "Position: (${floor((game.camX + (game.cubeSize/2))/2).toInt()}, ${floor((game.camY + (game.cubeSize/2))/2).toInt()+5}, ${floor((game.camZ + (game.cubeSize/2)) /2).toInt()}) [${game.localDimension}]"
         val timeText = String.format("Time: %.2fzł (Intensity: %.2f) (Day ${game.dayCounter})", game.gameTime, game.globalSunIntensity)
         val seedText = "Seed: ${game.seed}"
 

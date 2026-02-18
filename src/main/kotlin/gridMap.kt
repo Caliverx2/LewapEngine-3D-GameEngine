@@ -109,6 +109,7 @@ class gridMap : JPanel() {
     val playerHeight = 1.8
 
     // Kamera
+    var localDimension = "overworld"
     var fov = 90.0
     var camX = 0.0
     var camY = 0.0
@@ -848,10 +849,10 @@ class gridMap : JPanel() {
     private fun saveAndExitToMenu() {
         println("Saving modified chunks...")
         chunks.values.filter { it.modified }.forEach { chunk ->
-            chunkIO.saveChunk(chunk)
+            chunkIO.saveChunk(chunk, localDimension)
             chunk.modified = false
         }
-        chunkIO.saveWorldData(WorldData(seed, camX, camY, camZ, yaw, pitch, debugNoclip, debugFly, debugFullbright, showChunkBorders, debugXray, gameTime, dayCounter))
+        chunkIO.saveWorldData(WorldData(seed, camX, camY, camZ, yaw, pitch, debugNoclip, debugFly, debugFullbright, showChunkBorders, debugXray, gameTime, dayCounter, localDimension))
         println("All modified chunks saved.")
 
         // FIX: Ustawiamy flagę, że to my zamykamy połączenie, aby connectWithRetry nie próbował łączyć ponownie
@@ -879,6 +880,7 @@ class gridMap : JPanel() {
         lastChunkZ = Int.MAX_VALUE
         gameTime = 12.0
         dayCounter = 0
+        localDimension = ""
         camX = 0.0; camY = 0.0; camZ = 0.0
         yaw = 0.0; pitch = 0.0
         inputManager.releaseMouse()
@@ -935,6 +937,7 @@ class gridMap : JPanel() {
             debugXray = worldData.debugXray
             gameTime = worldData.gameTime
             dayCounter = worldData.dayCounter
+            localDimension = worldData.localDimension
         } else {
             seed = worldName.hashCode() // Domyślny seed dla nowego świata (unikalny per nazwa)
         }
@@ -1503,7 +1506,7 @@ class gridMap : JPanel() {
         toRemove.forEach {
             // Jeśli chunk był modyfikowany przez gracza, zapisz go na dysk przed usunięciem z RAM
             val chunk = chunks[it]
-            if (chunk != null && chunk.modified) chunkIO.saveChunk(chunk)
+            if (chunk != null && chunk.modified) chunkIO.saveChunk(chunk, localDimension)
 
             chunks.remove(it)
             chunkMeshes.remove(it)
@@ -1599,9 +1602,29 @@ class gridMap : JPanel() {
         chunksToUpdate.forEach { p -> updateChunkMesh(p.x, p.y) }
     }
 
+    fun changeDimension(dim: String) {
+        var savedCount = 0
+        chunks.values.forEach { chunk ->
+            if (chunk.modified) {
+                chunkIO.saveChunk(chunk, localDimension)
+                chunk.modified = false
+                savedCount++
+            }
+        }
+        chunkIO.saveWorldData(WorldData(seed, camX, camY, camZ, yaw, pitch, debugNoclip, debugFly, debugFullbright, showChunkBorders, debugXray, gameTime, dayCounter, localDimension))
+        if (savedCount > 0) println("Auto-saved $savedCount chunks in $localDimension.")
+
+        localDimension = dim
+        chunks.clear()
+        chunkMeshes.clear()
+        chunkOcclusion.clear()
+        chunksBeingGenerated.clear()
+        chunksToMeshQueue.clear()
+    }
+
     private fun generateChunk(cx: Int, cz: Int): Chunk {
         // 0. Próba wczytania z dysku
-        val loadedChunk = chunkIO.loadChunk(cx, cz)
+        val loadedChunk = chunkIO.loadChunk(cx, cz, localDimension)
         if (loadedChunk != null) return loadedChunk
 
         // 1. Jeśli nie ma na dysku, generujemy nowy.
@@ -2934,13 +2957,13 @@ class gridMap : JPanel() {
                             // choć ConcurrentHashMap jest bezpieczna, iteracja po niej może być kosztowna.
                             chunks.values.forEach { chunk ->
                                 if (chunk.modified) {
-                                    chunkIO.saveChunk(chunk)
+                                    chunkIO.saveChunk(chunk, localDimension)
                                     chunk.modified = false
                                     savedCount++
                                 }
                             }
-                            chunkIO.saveWorldData(WorldData(seed, camX, camY, camZ, yaw, pitch, debugNoclip, debugFly, debugFullbright, showChunkBorders, debugXray, gameTime, dayCounter))
-                            if (savedCount > 0) println("Auto-saved $savedCount chunks (Background).")
+                            chunkIO.saveWorldData(WorldData(seed, camX, camY, camZ, yaw, pitch, debugNoclip, debugFly, debugFullbright, showChunkBorders, debugXray, gameTime, dayCounter, localDimension))
+                            if (savedCount > 0) println("Auto-saved $savedCount chunks in $localDimension (Background).")
                         }
                     }
 
@@ -4623,6 +4646,9 @@ class gridMap : JPanel() {
                 }
             }
 
+            if (keyCode == KeyEvent.VK_F9) changeDimension("overworld")
+            if (keyCode == KeyEvent.VK_F10) changeDimension("the_nether")
+
             if (keyCode == KeyEvent.VK_Y) {
                 val currentChunkX = floor(camX / 32.0).toInt()
                 val currentChunkZ = floor(camZ / 32.0).toInt()
@@ -5009,51 +5035,6 @@ class gridMap : JPanel() {
 }
 
 fun main(args: Array<String>) {
-    // --- FORCE RESTART WITH JVM FLAGS ---
-    // Sprawdzamy flagę, aby uniknąć pętli nieskończonej
-    val isRestarted = System.getProperty("app.restarted") == "true"
-
-    // Pobieramy ścieżkę do aktualnego pliku JAR
-    val location = gridMap::class.java.protectionDomain.codeSource.location
-    val currentFile = File(location.toURI())
-
-    // Jeśli nie był jeszcze restartowany -> BEZWARUNKOWY RESTART (Działa w IDE i JAR)
-    if (!isRestarted) {
-        var javaBin = System.getProperty("java.home") + File.separator + "bin" + File.separator + "java"
-        // Fix dla Windowsa: ProcessBuilder wymaga .exe przy pełnej ścieżce
-        if (System.getProperty("os.name").lowercase().contains("win")) {
-            javaBin += ".exe"
-        }
-
-        val command = ArrayList<String>()
-        command.add(javaBin)
-        // Wymuszone parametry pamięci i GC
-        command.add("-Xmx1024m")
-        command.add("-Xms512m")
-        command.add("-XX:+UseZGC")
-        command.add("-XX:+ZGenerational")
-        command.add("-Dapp.restarted=true")
-
-        // Wykrywanie trybu uruchomienia: JAR czy IDE (Classpath)
-        if (currentFile.isFile && currentFile.name.endsWith(".jar", ignoreCase = true)) {
-            command.add("-jar")
-            command.add(currentFile.absolutePath)
-        } else {
-            // W IDE musimy podać classpath i klasę główną, bo nie mamy pliku .jar
-            command.add("-cp")
-            command.add(System.getProperty("java.class.path"))
-            command.add("org.lewapnoob.gridMap.GridMapKt")
-        }
-
-        command.addAll(args.toList())
-
-        println("Wymuszanie restartu z parametrami: -Xmx1024m -XX:+UseZGC...")
-        val pb = ProcessBuilder(command)
-        pb.inheritIO()
-        pb.start()
-        System.exit(0)
-    }
-
     SwingUtilities.invokeLater {
         val frame = JFrame("gridMap")
         frame.iconImage = Toolkit.getDefaultToolkit().getImage(gridMap::class.java.getResource("/icons/GridMap.png"))
