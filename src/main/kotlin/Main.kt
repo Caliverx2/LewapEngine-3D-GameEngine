@@ -1,4 +1,4 @@
-package org.lewapnoob.FileZero
+package org.lewapnoob.LewapEngine
 
 import javafx.application.Application
 import javafx.scene.Scene
@@ -559,7 +559,7 @@ class LightSource(
 
 class MainApp : Application() {
     override fun start(primaryStage: Stage) {
-        primaryStage.title = "FileZero.kt"
+        primaryStage.title = "LewapEngine.kt"
         val panel = DrawingPanel()
         val scene = Scene(panel, 1920.0/2, 1080.0/2)
 

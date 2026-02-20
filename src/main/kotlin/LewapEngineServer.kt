@@ -1,4 +1,4 @@
-package org.lewapnoob.FileZeroServer
+package org.lewapnoob.LewapEngineServer
 
 import javax.swing.*
 import java.awt.FlowLayout

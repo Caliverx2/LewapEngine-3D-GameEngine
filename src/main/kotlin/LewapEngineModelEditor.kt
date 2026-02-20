@@ -1,4 +1,4 @@
-package org.lewapnoob.FileZeroModelEditor3D
+package org.lewapnoob.LewapEngineModelEditor
 
 import javafx.application.Application
 import javafx.stage.FileChooser
